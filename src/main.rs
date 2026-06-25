@@ -499,14 +499,22 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
         .borders(Borders::ALL)
         .title(" > ")
         .border_style(style);
-    let input_widget = Paragraph::new(app.input.as_str()).style(style).block(block);
+    let inner_width = area.width.saturating_sub(2);
+    let char_count = app.input.chars().count() as u16;
+    let scroll_col = if char_count >= inner_width {
+        char_count - inner_width + 1
+    } else {
+        0
+    };
+    let input_widget = Paragraph::new(app.input.as_str())
+        .style(style)
+        .block(block)
+        .scroll((0, scroll_col));
     frame.render_widget(input_widget, area);
     if app.mode == Mode::Insert {
-        let cursor_x = area.x + 1 + app.input.chars().count() as u16;
+        let cursor_x = area.x + 1 + char_count - scroll_col;
         let cursor_y = area.y + 1;
-        if cursor_x < area.x + area.width.saturating_sub(1) {
-            frame.set_cursor_position((cursor_x, cursor_y));
-        }
+        frame.set_cursor_position((cursor_x, cursor_y));
     }
 }
 
