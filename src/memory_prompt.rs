@@ -82,6 +82,16 @@ Single tool call:
 Multiple tool calls:
 {"tools": [{"tool": "upsert_node", "arguments": {"name": "example", "type": "entity", "body": "", "date": ""}}, {"tool": "upsert_edge", "arguments": {"source": "a", "target": "b", "content": "<subject> verb <target>", "stability": 1.0, "confidence": 1.0, "importance": 0.0, "subject": false}}]}"#;
 
+pub const HISTORY_TOOL_DEFINITIONS: &str = r#"### read_history
+Returns a specific past turn from the current session.
+{"tool": "read_history", "arguments": {"offset": 0}}
+offset: 0 = most recent complete turn, 1 = one before that, etc.
+
+### search_history
+Substring search (OR) across all past sessions. Provide multiple short keywords to cast a wide net.
+{"tool": "search_history", "arguments": {"queries": ["keyword1", "keyword2", "keyword3"]}}
+Returns up to 5 matching lines with timestamps. Each entry matches at least one keyword."#;
+
 pub fn build_agent_prompt(
     explanation: &str,
     toon: &str,
@@ -130,6 +140,24 @@ Respond naturally and concisely. Never output graph data, JSON, edge lists, or m
         }
         prompt.push_str("</recent_context>");
     }
+    prompt
+}
+
+pub fn build_history_lookup_prompt(user_msg: &str) -> String {
+    let mut prompt = String::from(
+        "You are a memory lookup agent. Decide whether to search past session history before the main model answers.\n\
+\n\
+Search aggressively: if there is any chance past sessions contain relevant information, search. Default to searching over skipping.\n\
+For search_history, provide 3–5 short keywords that cover different phrasings of the concept — the match is a substring OR across all keywords.\n\
+\n\
+Output ONLY one of:\n\
+1. A raw JSON tool call (no prose, no markdown fences)\n\
+2. The single word: skip — only if the question is clearly about something that could not exist in past sessions",
+    );
+    prompt.push_str("\n\n<tools>\n");
+    prompt.push_str(HISTORY_TOOL_DEFINITIONS);
+    prompt.push_str("\n</tools>\n\nUser message: ");
+    prompt.push_str(user_msg);
     prompt
 }
 

@@ -12,12 +12,13 @@
 
 mod api;
 mod graph;
+mod history;
 mod memory_agent;
 mod memory_prompt;
 mod session;
 
 use std::io::Stdout;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
@@ -36,6 +37,25 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
 const DEFAULT_MODEL: &str = "deepseek/deepseek-v4-flash";
+const HISTORY_LOOKUP_KEYWORDS: &[&str] = &[
+    "remember",
+    "earlier",
+    "last time",
+    "last session",
+    "you said",
+    "we said",
+    "previous",
+    "history",
+    "search",
+    "when did",
+    "what did you",
+    "what did i",
+    "what did we",
+    "do you recall",
+    "can you recall",
+    "did we",
+    "did i",
+];
 const RECENT_TURNS: usize = 2;
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -194,7 +214,138 @@ fn start_stream(app: &mut App) {
     };
     let key = app.api_key.clone();
     let model = DEFAULT_MODEL.to_string();
-    std::thread::spawn(move || api::stream(key, model, prompt, system_opt, sender));
+    let session_path = app.session_path.clone();
+    std::thread::spawn(move || {
+        let stream_prompt = maybe_augment_prompt_with_history(&key, &model, &prompt, &session_path);
+        api::stream(key, model, stream_prompt, system_opt, sender);
+    });
+}
+
+enum HistoryResult {
+    Found(String),
+    NotFound(String),
+    Skip,
+}
+
+fn maybe_augment_prompt_with_history(
+    api_key: &str,
+    model: &str,
+    prompt: &str,
+    session_path: &Path,
+) -> String {
+    if !should_lookup_history(prompt) {
+        return prompt.to_string();
+    }
+    let lookup_prompt = memory_prompt::build_history_lookup_prompt(prompt);
+    let lookup_response = match api::collect(api_key, model, &lookup_prompt) {
+        Ok(lookup_response) => lookup_response,
+        Err(_) => return prompt.to_string(),
+    };
+    match parse_history_response(&lookup_response, session_path) {
+        HistoryResult::Skip => prompt.to_string(),
+        HistoryResult::Found(text) => {
+            let mut augmented = prompt.to_string();
+            augmented.push_str("\n\n[History lookup result]\n");
+            augmented.push_str(&text);
+            augmented
+        }
+        HistoryResult::NotFound(keywords) => {
+            let mut augmented = prompt.to_string();
+            augmented.push_str("\n\n[History search found no results for: ");
+            augmented.push_str(&keywords);
+            augmented.push_str("]\nIf you cannot answer from your memory graph either, say explicitly that you checked your memory and searched past sessions for these keywords but found nothing.");
+            augmented
+        }
+    }
+}
+
+fn should_lookup_history(prompt: &str) -> bool {
+    let prompt_lower = prompt.to_ascii_lowercase();
+    for keyword in HISTORY_LOOKUP_KEYWORDS {
+        if prompt_lower.contains(keyword) {
+            return true;
+        }
+    }
+    false
+}
+
+fn parse_history_response(response: &str, session_path: &Path) -> HistoryResult {
+    let trimmed = response.trim();
+    if trimmed == "skip" {
+        return HistoryResult::Skip;
+    }
+    let call_value = match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(call_value) => call_value,
+        Err(_) => return HistoryResult::Skip,
+    };
+    let tool_entry = match call_value.get("tool") {
+        Some(entry) => entry,
+        None => return HistoryResult::Skip,
+    };
+    let tool_name = match tool_entry.as_str() {
+        Some(name) => name,
+        None => return HistoryResult::Skip,
+    };
+    let arguments = match call_value.get("arguments") {
+        Some(args) => args,
+        None => return HistoryResult::Skip,
+    };
+    match tool_name {
+        "read_history" => execute_read_history(arguments, session_path),
+        "search_history" => execute_search_history(arguments),
+        _ => HistoryResult::Skip,
+    }
+}
+
+fn execute_read_history(arguments: &serde_json::Value, session_path: &Path) -> HistoryResult {
+    let offset_entry = match arguments.get("offset") {
+        Some(entry) => entry,
+        None => return HistoryResult::Skip,
+    };
+    let offset_value = match offset_entry.as_u64() {
+        Some(val) => val,
+        None => return HistoryResult::Skip,
+    };
+    let offset = match usize::try_from(offset_value) {
+        Ok(offset) => offset,
+        Err(_) => return HistoryResult::Skip,
+    };
+    let text = history::read_history(session_path, offset);
+    if text.is_empty() {
+        HistoryResult::NotFound(format!("turn offset {offset}"))
+    } else {
+        HistoryResult::Found(text)
+    }
+}
+
+fn execute_search_history(arguments: &serde_json::Value) -> HistoryResult {
+    let queries_entry = match arguments.get("queries") {
+        Some(entry) => entry,
+        None => return HistoryResult::Skip,
+    };
+    let queries_array = match queries_entry.as_array() {
+        Some(arr) => arr,
+        None => return HistoryResult::Skip,
+    };
+    let mut queries = Vec::new();
+    for item in queries_array {
+        if let Some(query) = item.as_str() {
+            let trimmed = query.trim();
+            if !trimmed.is_empty() {
+                queries.push(trimmed.to_string());
+            }
+        }
+    }
+    if queries.is_empty() {
+        return HistoryResult::Skip;
+    }
+    let keywords_display = queries.join(", ");
+    let text = history::search_history(&queries);
+    if text.is_empty() {
+        HistoryResult::NotFound(keywords_display)
+    } else {
+        HistoryResult::Found(text)
+    }
 }
 
 fn handle_key(key: KeyEvent, app: &mut App) -> bool {
