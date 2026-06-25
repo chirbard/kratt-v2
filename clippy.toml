@@ -1,0 +1,39 @@
+cognitive-complexity-threshold = 9
+too-many-lines-threshold = 40
+too-many-arguments-threshold = 5
+min-ident-chars-threshold = 2
+allowed-idents-below-min-chars = ["i", "j", "x", "y", "z"]
+
+disallowed-methods = [
+    # Iterator functional chains — use explicit for loops instead
+    { path = "core::iter::Iterator::map",        reason = "use a for loop instead" },
+    { path = "core::iter::Iterator::filter",     reason = "use a for loop with if instead" },
+    { path = "core::iter::Iterator::flat_map",   reason = "use nested for loops instead" },
+    { path = "core::iter::Iterator::filter_map", reason = "use a for loop with if let instead" },
+    { path = "core::iter::Iterator::fold",       reason = "use a for loop with an accumulator instead" },
+    { path = "core::iter::Iterator::reduce",     reason = "use a for loop with an accumulator instead" },
+    { path = "core::iter::Iterator::for_each",   reason = "use a for loop instead" },
+    { path = "core::iter::Iterator::find",       reason = "use a for loop with an early return instead" },
+    { path = "core::iter::Iterator::position",   reason = "use a for loop with an index counter instead" },
+    { path = "core::iter::Iterator::any",        reason = "use a for loop with an early return instead" },
+    { path = "core::iter::Iterator::all",        reason = "use a for loop with an early return instead" },
+    { path = "core::iter::Iterator::zip",        reason = "use an index-based for loop instead" },
+    { path = "core::iter::Iterator::take_while", reason = "use a for loop with break instead" },
+    { path = "core::iter::Iterator::skip_while", reason = "use a for loop with a flag instead" },
+
+    # Option combinators — use match or if let instead
+    { path = "core::option::Option::map",        reason = "use match or if let instead" },
+    { path = "core::option::Option::and_then",   reason = "use match or if let instead" },
+    { path = "core::option::Option::filter",     reason = "use match or if let instead" },
+    { path = "core::option::Option::map_or",     reason = "use match instead" },
+    { path = "core::option::Option::map_or_else", reason = "use match instead" },
+    { path = "core::option::Option::or_else",    reason = "use match instead" },
+
+    # Result combinators — use match instead
+    { path = "core::result::Result::map",        reason = "use match instead" },
+    { path = "core::result::Result::and_then",   reason = "use match instead" },
+    { path = "core::result::Result::map_err",    reason = "use match instead" },
+    { path = "core::result::Result::map_or",     reason = "use match instead" },
+    { path = "core::result::Result::map_or_else", reason = "use match instead" },
+    { path = "core::result::Result::or_else",    reason = "use match instead" },
+]
