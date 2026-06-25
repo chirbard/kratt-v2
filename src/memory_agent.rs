@@ -1,6 +1,7 @@
 use std::error::Error;
 
 use crate::api;
+use crate::git;
 use crate::graph::{
     Edge, Graph, Node, delete_node, graph_to_json, insert_edge, load_graph, normalize_id,
     remove_edges, save_graph,
@@ -17,6 +18,7 @@ struct AgentRun<'run> {
     model: &'run str,
     user_msg: &'run str,
     assistant_msg: &'run str,
+    session_label: &'run str,
     sender: &'run std::sync::mpsc::Sender<MemoryEvent>,
 }
 
@@ -45,11 +47,13 @@ enum ToolCall {
     },
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_memory_agent(
     api_key: &str,
     model: &str,
     user_msg: &str,
     assistant_msg: &str,
+    session_label: String,
     sender: std::sync::mpsc::Sender<MemoryEvent>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let agent_run = AgentRun {
@@ -57,6 +61,7 @@ pub fn run_memory_agent(
         model,
         user_msg,
         assistant_msg,
+        session_label: &session_label,
         sender: &sender,
     };
     let result = agent_run.run();
@@ -82,6 +87,10 @@ impl<'run> AgentRun<'run> {
         if let Err(err) = save_graph(&graph) {
             self.send_log("memory", format!("error: {err}"));
             return Err(err);
+        }
+        match git::git_commit(self.session_label) {
+            Ok(()) => self.send_log("debug", format!("git: committed {}", self.session_label)),
+            Err(err) => self.send_log("memory", format!("git: {err}")),
         }
         self.send_log(
             "memory",

@@ -11,6 +11,7 @@
 )]
 
 mod api;
+mod git;
 mod graph;
 mod history;
 mod memory_agent;
@@ -155,6 +156,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let graph = graph::load_graph();
     let memory_toon = toon::encode(&graph::graph_to_json(&graph), None);
     let session_path = session::new_session_path();
+    if let Err(err) = git::git_init_if_needed() {
+        eprintln!("warning: git init failed: {err}");
+    }
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     tui_enter(&mut stdout)?;
@@ -452,6 +456,7 @@ fn drain_stream(app: &mut App) {
 fn start_memory_update(app: &mut App) {
     let assistant_content = assistant_content(app);
     let user_content = user_content(app);
+    let session_label = session_label(&app.session_path);
     session::append_entry(&app.session_path, "assistant", &assistant_content);
     app.memory_log.clear();
     let (sender, receiver) = std::sync::mpsc::channel::<MemoryEvent>();
@@ -463,11 +468,23 @@ fn start_memory_update(app: &mut App) {
             &model,
             &user_content,
             &assistant_content,
+            session_label,
             sender,
         );
     });
     app.memory_rx = Some(receiver);
     app.memory_state = MemoryState::Updating;
+}
+
+fn session_label(session_path: &Path) -> String {
+    let stem_os = match session_path.file_stem() {
+        Some(stem_os) => stem_os,
+        None => return "unknown".to_string(),
+    };
+    match stem_os.to_str() {
+        Some(stem_text) => stem_text.to_string(),
+        None => "unknown".to_string(),
+    }
 }
 
 fn assistant_content(app: &App) -> String {
