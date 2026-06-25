@@ -1,3 +1,5 @@
+use crate::session::RecentEntry;
+
 pub const EXTRACT_EXPLANATION: &str = r#"You are an aggressive extraction agent for a memory graph. Extract every entity and relationship from the user message that is not yet in the graph.
 
 - Every named person, place, object, technology, or concept gets an entity node
@@ -106,16 +108,37 @@ pub fn build_agent_prompt(
     prompt
 }
 
-pub fn build_chat_system_prompt(memory_toon: &str) -> String {
-    if memory_toon.trim().is_empty() {
-        return "You are a helpful conversational assistant.".to_string();
-    }
-    format!(
+pub fn build_chat_system_prompt(memory_toon: &str, recent_entries: &[RecentEntry]) -> String {
+    let mut prompt = String::from(
         "You are a helpful conversational assistant. \
 Use the facts inside <memory> to recall what you know about the user. \
-Respond naturally and concisely. Never output graph data, JSON, edge lists, or memory update descriptions — just answer the user.\n\n\
-<memory>\n{memory_toon}\n</memory>"
-    )
+Use <recent_context> for short-term continuity. \
+Respond naturally and concisely. Never output graph data, JSON, edge lists, or memory update descriptions — just answer the user.",
+    );
+    if !memory_toon.trim().is_empty() {
+        prompt.push_str("\n\n<memory>\n");
+        prompt.push_str(memory_toon);
+        prompt.push_str("\n</memory>");
+    }
+    if !recent_entries.is_empty() {
+        prompt.push_str("\n\n<recent_context>\n");
+        for recent_entry in recent_entries {
+            prompt.push_str(recent_role_label(recent_entry));
+            prompt.push_str(": ");
+            prompt.push_str(&recent_entry.content);
+            prompt.push('\n');
+        }
+        prompt.push_str("</recent_context>");
+    }
+    prompt
+}
+
+fn recent_role_label(recent_entry: &RecentEntry) -> &str {
+    match recent_entry.role.as_str() {
+        "user" => "User",
+        "assistant" => "Assistant",
+        _ => "Message",
+    }
 }
 
 fn today_iso() -> String {

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -9,6 +9,12 @@ struct SessionEntry {
     content: String,
     #[serde(rename = "ts")]
     timestamp: String,
+}
+
+#[derive(Clone)]
+pub struct RecentEntry {
+    pub role: String,
+    pub content: String,
 }
 
 pub fn new_session_path() -> PathBuf {
@@ -47,6 +53,71 @@ pub fn append_entry(path: &Path, role: &str, content: &str) {
         return;
     }
     let _ = file.write_all(b"\n");
+}
+
+pub fn load_recent_entries(path: &Path, turn_count: usize) -> Vec<RecentEntry> {
+    if turn_count == 0 {
+        return Vec::new();
+    }
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return Vec::new(),
+    };
+    let reader = BufReader::new(file);
+    let mut entries = Vec::new();
+    for line_result in reader.lines() {
+        let line = match line_result {
+            Ok(line) => line,
+            Err(_) => continue,
+        };
+        let session_entry = match serde_json::from_str::<SessionEntry>(&line) {
+            Ok(session_entry) => session_entry,
+            Err(_) => continue,
+        };
+        entries.push(RecentEntry {
+            role: session_entry.role,
+            content: session_entry.content,
+        });
+    }
+    select_recent_turns(entries, turn_count)
+}
+
+fn select_recent_turns(entries: Vec<RecentEntry>, turn_count: usize) -> Vec<RecentEntry> {
+    if entries.len() < 2 {
+        return Vec::new();
+    }
+    let mut tail_end = entries.len();
+    while tail_end > 0 && !is_assistant_entry(&entries[tail_end - 1]) {
+        tail_end -= 1;
+    }
+    if tail_end < 2 {
+        return Vec::new();
+    }
+    let mut start_index = tail_end;
+    let mut scan_end = tail_end;
+    let mut pair_count = 0usize;
+    while scan_end >= 2 && pair_count < turn_count {
+        let user_index = scan_end - 2;
+        let assistant_index = scan_end - 1;
+        if !is_user_entry(&entries[user_index]) || !is_assistant_entry(&entries[assistant_index]) {
+            break;
+        }
+        start_index = user_index;
+        pair_count += 1;
+        scan_end -= 2;
+    }
+    if pair_count == 0 {
+        return Vec::new();
+    }
+    entries[start_index..tail_end].to_vec()
+}
+
+fn is_user_entry(entry: &RecentEntry) -> bool {
+    entry.role == "user"
+}
+
+fn is_assistant_entry(entry: &RecentEntry) -> bool {
+    entry.role == "assistant"
 }
 
 struct TimestampParts {

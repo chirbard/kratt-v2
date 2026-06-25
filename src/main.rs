@@ -36,6 +36,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
 const DEFAULT_MODEL: &str = "deepseek/deepseek-v4-flash";
+const RECENT_TURNS: usize = 2;
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 #[derive(PartialEq)]
@@ -168,6 +169,7 @@ fn run(
 
 fn start_stream(app: &mut App) {
     let prompt = std::mem::take(&mut app.input);
+    let recent_entries = session::load_recent_entries(&app.session_path, RECENT_TURNS);
     session::append_entry(&app.session_path, "user", &prompt);
     app.history.push(Message {
         role: Role::User,
@@ -184,7 +186,7 @@ fn start_stream(app: &mut App) {
     app.state = State::Streaming;
     let (sender, recvr) = std::sync::mpsc::channel();
     app.stream_rx = Some(recvr);
-    let system = memory_prompt::build_chat_system_prompt(&app.memory_toon);
+    let system = memory_prompt::build_chat_system_prompt(&app.memory_toon, &recent_entries);
     let system_opt = if system.is_empty() {
         None
     } else {
@@ -557,7 +559,11 @@ fn render_mode(frame: &mut Frame, area: Rect, app: &App) {
             } else {
                 "[R] reasoning"
             };
-            let dbg_hint = if app.show_debug { "[d] debug ✓" } else { "[d] debug" };
+            let dbg_hint = if app.show_debug {
+                "[d] debug ✓"
+            } else {
+                "[d] debug"
+            };
             format!("-- NORMAL --  {mem_hint}  {rea_hint}  {dbg_hint}")
         }
     };

@@ -160,7 +160,13 @@ pub fn collect(
     prompt: &str,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
     let (sender, receiver) = channel::<Chunk>();
-    stream(api_key.to_string(), model.to_string(), prompt.to_string(), None, sender);
+    stream(
+        api_key.to_string(),
+        model.to_string(),
+        prompt.to_string(),
+        None,
+        sender,
+    );
     let mut content = String::new();
     let mut reasoning = String::new();
     loop {

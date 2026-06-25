@@ -45,7 +45,6 @@ enum ToolCall {
     },
 }
 
-
 pub fn run_memory_agent(
     api_key: &str,
     model: &str,
