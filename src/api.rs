@@ -54,10 +54,24 @@ struct StreamState {
     cost_usd: Option<f64>,
 }
 
-fn make_request(api_key: &str, model: &str, prompt: &str) -> Result<reqwest::blocking::Response, String> {
+fn make_request(
+    api_key: &str,
+    model: &str,
+    prompt: &str,
+    system: Option<&str>,
+) -> Result<reqwest::blocking::Response, String> {
+    let messages = match system {
+        Some(system_prompt) => json!([
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ]),
+        None => json!([
+            {"role": "user", "content": prompt},
+        ]),
+    };
     let body = json!({
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
         "stream": true,
         "stream_options": {"include_usage": true},
     });
@@ -134,8 +148,14 @@ fn send_done(state: StreamState, sender: &Sender<Chunk>) {
     }));
 }
 
-pub fn stream(api_key: String, model: String, prompt: String, sender: Sender<Chunk>) {
-    let resp = match make_request(&api_key, &model, &prompt) {
+pub fn stream(
+    api_key: String,
+    model: String,
+    prompt: String,
+    system: Option<String>,
+    sender: Sender<Chunk>,
+) {
+    let resp = match make_request(&api_key, &model, &prompt, system.as_deref()) {
         Ok(resp) => resp,
         Err(err) => {
             let _ = sender.send(Chunk::Err(err));
