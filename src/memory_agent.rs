@@ -1,11 +1,24 @@
 use std::error::Error;
 
-use reqwest::blocking::Client;
-use serde::Deserialize;
-use serde_json::json;
-
-use crate::graph::{Edge, Graph, Node, delete_node, graph_to_json, insert_edge, load_graph, normalize_id, remove_edges, save_graph};
+use crate::api;
+use crate::graph::{
+    Edge, Graph, Node, delete_node, graph_to_json, insert_edge, load_graph, normalize_id,
+    remove_edges, save_graph,
+};
 use crate::memory_prompt::{CONSOLIDATE_EXPLANATION, EXTRACT_EXPLANATION, build_agent_prompt};
+
+pub enum MemoryEvent {
+    Log { phase: &'static str, text: String },
+    Done,
+}
+
+struct AgentRun<'run> {
+    api_key: &'run str,
+    model: &'run str,
+    user_msg: &'run str,
+    assistant_msg: &'run str,
+    sender: &'run std::sync::mpsc::Sender<MemoryEvent>,
+}
 
 enum ToolCall {
     UpsertNode {
@@ -32,77 +45,92 @@ enum ToolCall {
     },
 }
 
-#[derive(Deserialize)]
-struct LlmResponse {
-    choices: Vec<LlmChoice>,
-}
-
-#[derive(Deserialize)]
-struct LlmChoice {
-    message: LlmMessage,
-}
-
-#[derive(Deserialize)]
-struct LlmMessage {
-    content: String,
-}
 
 pub fn run_memory_agent(
     api_key: &str,
     model: &str,
     user_msg: &str,
     assistant_msg: &str,
+    sender: std::sync::mpsc::Sender<MemoryEvent>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let mut graph = load_graph();
-    let mut toon_text = toon::encode(&graph_to_json(&graph), None);
-
-    let extract_prompt =
-        build_agent_prompt(EXTRACT_EXPLANATION, &toon_text, user_msg, assistant_msg);
-    let extract_text = call_llm(api_key, model, &extract_prompt)?;
-    for call in parse_tool_calls(&extract_text) {
-        apply_tool(call, &mut graph);
-    }
-
-    toon_text = toon::encode(&graph_to_json(&graph), None);
-    let consolidate_prompt =
-        build_agent_prompt(CONSOLIDATE_EXPLANATION, &toon_text, user_msg, assistant_msg);
-    let consolidate_text = call_llm(api_key, model, &consolidate_prompt)?;
-    for call in parse_tool_calls(&consolidate_text) {
-        apply_tool(call, &mut graph);
-    }
-
-    save_graph(&graph)?;
-    Ok(())
+    let agent_run = AgentRun {
+        api_key,
+        model,
+        user_msg,
+        assistant_msg,
+        sender: &sender,
+    };
+    let result = agent_run.run();
+    let _ = sender.send(MemoryEvent::Done);
+    result
 }
 
-fn call_llm(
-    api_key: &str,
-    model: &str,
-    prompt: &str,
-) -> Result<String, Box<dyn Error + Send + Sync>> {
-    const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
+impl<'run> AgentRun<'run> {
+    fn run(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let mut graph = load_graph();
+        let mut toon_text = toon::encode(&graph_to_json(&graph), None);
 
-    let body = json!({
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "stream": false,
-    });
-    let response = Client::new()
-        .post(OPENROUTER_URL)
-        .bearer_auth(api_key)
-        .json(&body)
-        .send()?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body_text = response.text().unwrap_or_default();
-        return Err(format!("HTTP {status}: {body_text}").into());
+        self.run_pass(&mut graph, &toon_text, "extract", EXTRACT_EXPLANATION)?;
+
+        toon_text = toon::encode(&graph_to_json(&graph), None);
+        self.run_pass(
+            &mut graph,
+            &toon_text,
+            "consolidate",
+            CONSOLIDATE_EXPLANATION,
+        )?;
+
+        if let Err(err) = save_graph(&graph) {
+            self.send_log("memory", format!("error: {err}"));
+            return Err(err);
+        }
+        self.send_log(
+            "memory",
+            format!(
+                "saved — {} nodes, {} edges",
+                graph.nodes.len(),
+                graph.edges.len()
+            ),
+        );
+        Ok(())
     }
-    let parsed: LlmResponse = response.json()?;
-    let content = match parsed.choices.first() {
-        Some(choice) => choice.message.content.clone(),
-        None => String::new(),
-    };
-    Ok(content)
+
+    fn run_pass(
+        &self,
+        graph: &mut Graph,
+        toon_text: &str,
+        phase: &'static str,
+        explanation: &str,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.send_log(phase, "calling LLM…".to_string());
+        let prompt = build_agent_prompt(explanation, toon_text, self.user_msg, self.assistant_msg);
+        let call_text = match api::collect(self.api_key, self.model, &prompt) {
+            Ok(call_text) => call_text,
+            Err(err) => {
+                self.send_log(phase, format!("error: {err}"));
+                return Err(err);
+            }
+        };
+        for line in call_text.lines() {
+            self.send_log("debug", format!("  {line}"));
+        }
+        let tool_calls = parse_tool_calls(&call_text);
+        if tool_calls.is_empty() {
+            self.send_log(phase, "no tool calls".to_string());
+        } else {
+            self.send_log(phase, format!("{} tool calls", tool_calls.len()));
+        }
+        for call in tool_calls {
+            let description = apply_tool(call, graph);
+            self.send_log(phase, description);
+        }
+        self.send_log(phase, "done".to_string());
+        Ok(())
+    }
+
+    fn send_log(&self, phase: &'static str, text: String) {
+        let _ = self.sender.send(MemoryEvent::Log { phase, text });
+    }
 }
 
 fn parse_tool_calls(text: &str) -> Vec<ToolCall> {
@@ -228,16 +256,14 @@ fn json_f64(obj: &serde_json::Value, key: &str) -> f64 {
     value.as_f64().unwrap_or(0.0)
 }
 
-fn apply_tool(call: ToolCall, graph: &mut Graph) {
+fn apply_tool(call: ToolCall, graph: &mut Graph) -> String {
     match call {
         ToolCall::UpsertNode {
             name,
             node_type,
             body,
             date,
-        } => {
-            graph.nodes.insert(normalize_id(&name), Node { node_type, body, date });
-        }
+        } => apply_upsert_node(graph, name, node_type, body, date),
         ToolCall::UpsertEdge {
             source,
             target,
@@ -247,7 +273,7 @@ fn apply_tool(call: ToolCall, graph: &mut Graph) {
             importance,
             subject,
         } => {
-            insert_edge(graph, Edge {
+            let edge = Edge {
                 source: normalize_id(&source),
                 target: normalize_id(&target),
                 content,
@@ -255,13 +281,47 @@ fn apply_tool(call: ToolCall, graph: &mut Graph) {
                 confidence,
                 importance,
                 subject,
-            });
+            };
+            apply_upsert_edge(graph, source, target, edge)
         }
-        ToolCall::DeleteNode { name } => {
-            delete_node(graph, &normalize_id(&name));
-        }
-        ToolCall::DeleteEdge { source, target } => {
-            remove_edges(&mut graph.edges, &normalize_id(&source), &normalize_id(&target));
-        }
+        ToolCall::DeleteNode { name } => apply_delete_node(graph, name),
+        ToolCall::DeleteEdge { source, target } => apply_delete_edge(graph, source, target),
     }
+}
+
+fn apply_upsert_node(
+    graph: &mut Graph,
+    name: String,
+    node_type: String,
+    body: String,
+    date: String,
+) -> String {
+    graph.nodes.insert(
+        normalize_id(&name),
+        Node {
+            node_type: node_type.clone(),
+            body,
+            date,
+        },
+    );
+    format!("upsert_node: {name} ({node_type})")
+}
+
+fn apply_upsert_edge(graph: &mut Graph, source: String, target: String, edge: Edge) -> String {
+    insert_edge(graph, edge);
+    format!("upsert_edge: {source} → {target}")
+}
+
+fn apply_delete_node(graph: &mut Graph, name: String) -> String {
+    delete_node(graph, &normalize_id(&name));
+    format!("delete_node: {name}")
+}
+
+fn apply_delete_edge(graph: &mut Graph, source: String, target: String) -> String {
+    remove_edges(
+        &mut graph.edges,
+        &normalize_id(&source),
+        &normalize_id(&target),
+    );
+    format!("delete_edge: {source} → {target}")
 }

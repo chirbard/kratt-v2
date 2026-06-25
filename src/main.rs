@@ -17,14 +17,17 @@ mod memory_prompt;
 mod session;
 
 use std::io::Stdout;
+use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
-use std::path::PathBuf;
 
 use api::{Chunk, Stats};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use memory_agent::MemoryEvent;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -76,7 +79,11 @@ struct App {
     scroll: u16,
     auto_scroll: bool,
     stream_rx: Option<Receiver<Chunk>>,
-    memory_rx: Option<Receiver<()>>,
+    memory_rx: Option<Receiver<MemoryEvent>>,
+    memory_log: Vec<(String, String)>,
+    show_memory_panel: bool,
+    show_reasoning: bool,
+    show_debug: bool,
     session_path: PathBuf,
     memory_toon: String,
 }
@@ -96,6 +103,10 @@ impl App {
             auto_scroll: true,
             stream_rx: None,
             memory_rx: None,
+            memory_log: Vec::new(),
+            show_memory_panel: false,
+            show_reasoning: true,
+            show_debug: false,
             session_path,
             memory_toon,
         }
@@ -158,15 +169,27 @@ fn run(
 fn start_stream(app: &mut App) {
     let prompt = std::mem::take(&mut app.input);
     session::append_entry(&app.session_path, "user", &prompt);
-    app.history.push(Message { role: Role::User, reasoning: String::new(), content: prompt.clone() });
-    app.history.push(Message { role: Role::Assistant, reasoning: String::new(), content: String::new() });
+    app.history.push(Message {
+        role: Role::User,
+        reasoning: String::new(),
+        content: prompt.clone(),
+    });
+    app.history.push(Message {
+        role: Role::Assistant,
+        reasoning: String::new(),
+        content: String::new(),
+    });
     app.stats = None;
     app.auto_scroll = true;
     app.state = State::Streaming;
     let (sender, recvr) = std::sync::mpsc::channel();
     app.stream_rx = Some(recvr);
     let system = memory_prompt::build_chat_system_prompt(&app.memory_toon);
-    let system_opt = if system.is_empty() { None } else { Some(system) };
+    let system_opt = if system.is_empty() {
+        None
+    } else {
+        Some(system)
+    };
     let key = app.api_key.clone();
     let model = DEFAULT_MODEL.to_string();
     std::thread::spawn(move || api::stream(key, model, prompt, system_opt, sender));
@@ -209,6 +232,9 @@ fn handle_normal_key(key: KeyEvent, app: &mut App) -> bool {
             app.scroll = app.scroll.saturating_sub(3);
         }
         KeyCode::Char('G') => app.auto_scroll = true,
+        KeyCode::Char('m') => app.show_memory_panel = !app.show_memory_panel,
+        KeyCode::Char('R') => app.show_reasoning = !app.show_reasoning,
+        KeyCode::Char('d') => app.show_debug = !app.show_debug,
         _ => {}
     }
     false
@@ -253,12 +279,18 @@ fn start_memory_update(app: &mut App) {
     let assistant_content = assistant_content(app);
     let user_content = user_content(app);
     session::append_entry(&app.session_path, "assistant", &assistant_content);
-    let (sender, receiver) = std::sync::mpsc::channel::<()>();
+    app.memory_log.clear();
+    let (sender, receiver) = std::sync::mpsc::channel::<MemoryEvent>();
     let api_key = app.api_key.clone();
     let model = DEFAULT_MODEL.to_string();
     std::thread::spawn(move || {
-        let _ = memory_agent::run_memory_agent(&api_key, &model, &user_content, &assistant_content);
-        let _ = sender.send(());
+        let _ = memory_agent::run_memory_agent(
+            &api_key,
+            &model,
+            &user_content,
+            &assistant_content,
+            sender,
+        );
     });
     app.memory_rx = Some(receiver);
     app.memory_state = MemoryState::Updating;
@@ -283,17 +315,25 @@ fn drain_memory(app: &mut App) {
         Some(memory_receiver) => memory_receiver,
         None => return,
     };
-    match memory_receiver.try_recv() {
-        Ok(()) => {
-            let graph = graph::load_graph();
-            app.memory_toon = toon::encode(&graph::graph_to_json(&graph), None);
-            app.memory_state = MemoryState::Idle;
-        }
-        Err(std::sync::mpsc::TryRecvError::Empty) => {
-            app.memory_rx = Some(memory_receiver);
-        }
-        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-            app.memory_state = MemoryState::Idle;
+    loop {
+        match memory_receiver.try_recv() {
+            Ok(MemoryEvent::Log { phase, text }) => {
+                app.memory_log.push((phase.to_string(), text));
+            }
+            Ok(MemoryEvent::Done) => {
+                let graph = graph::load_graph();
+                app.memory_toon = toon::encode(&graph::graph_to_json(&graph), None);
+                app.memory_state = MemoryState::Idle;
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                app.memory_rx = Some(memory_receiver);
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                app.memory_state = MemoryState::Idle;
+                return;
+            }
         }
     }
 }
@@ -301,34 +341,49 @@ fn drain_memory(app: &mut App) {
 fn push_user_lines(lines: &mut Vec<Line>, msg: &Message) {
     lines.push(Line::from(Span::styled(
         "You",
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
     )));
     for line in msg.content.lines() {
         lines.push(Line::from(line.to_string()));
     }
 }
 
-fn push_assistant_lines(lines: &mut Vec<Line>, msg: &Message, is_streaming: bool, tick: u64) {
+fn push_assistant_lines(
+    lines: &mut Vec<Line>,
+    msg: &Message,
+    is_streaming: bool,
+    tick: u64,
+    show_reasoning: bool,
+) {
     lines.push(Line::from(Span::styled(
         "kratt",
-        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
     )));
-    for line in msg.reasoning.lines() {
-        lines.push(Line::from(Span::styled(
-            line.to_string(),
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-        )));
+    let reasoning_visible = show_reasoning && !msg.reasoning.is_empty();
+    if reasoning_visible {
+        for line in msg.reasoning.lines() {
+            lines.push(Line::from(Span::styled(
+                line.to_string(),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            )));
+        }
     }
-    let show_spinner = is_streaming && msg.content.is_empty() && msg.reasoning.is_empty();
+    let show_spinner = is_streaming && msg.content.is_empty() && !reasoning_visible;
     if show_spinner {
-        let frame = SPINNER[(tick as usize / 4) % SPINNER.len()];
+        let frame = SPINNER[((tick / 4) as usize) % SPINNER.len()];
         lines.push(Line::from(Span::styled(
             format!("{frame} waiting..."),
             Style::default().fg(Color::DarkGray),
         )));
         return;
     }
-    if !msg.reasoning.is_empty() && !msg.content.is_empty() {
+    if reasoning_visible && !msg.content.is_empty() {
         lines.push(Line::default());
     }
     for line in msg.content.lines() {
@@ -344,7 +399,13 @@ fn build_output_text(app: &App) -> Text<'static> {
         let streaming_here = is_last && app.state == State::Streaming;
         match msg.role {
             Role::User => push_user_lines(&mut lines, msg),
-            Role::Assistant => push_assistant_lines(&mut lines, msg, streaming_here, app.tick),
+            Role::Assistant => push_assistant_lines(
+                &mut lines,
+                msg,
+                streaming_here,
+                app.tick,
+                app.show_reasoning,
+            ),
         }
         if !is_last {
             lines.push(Line::default());
@@ -375,7 +436,11 @@ fn render_output(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         app.scroll.min(total_rows.saturating_sub(visible_height))
     };
-    let title = if app.state == State::Streaming { " ... " } else { " kratt " };
+    let title = if app.state == State::Streaming {
+        " ... "
+    } else {
+        " kratt "
+    };
     let output = Paragraph::new(text)
         .block(Block::default().borders(Borders::ALL).title(title))
         .wrap(Wrap { trim: false })
@@ -383,10 +448,57 @@ fn render_output(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(output, area);
 }
 
+fn phase_color(phase: &str) -> Color {
+    match phase {
+        "extract" => Color::Cyan,
+        "consolidate" => Color::Yellow,
+        "memory" => Color::Green,
+        "debug" => Color::DarkGray,
+        _ => Color::White,
+    }
+}
+
+fn render_memory_panel(frame: &mut Frame, area: Rect, app: &App) {
+    let mut lines: Vec<Line> = Vec::new();
+    for (phase, text) in &app.memory_log {
+        if phase == "debug" && !app.show_debug {
+            continue;
+        }
+        let label = format!("[{phase}] ");
+        let line = Line::from(vec![
+            Span::styled(label, Style::default().fg(phase_color(phase))),
+            Span::raw(text.clone()),
+        ]);
+        lines.push(line);
+    }
+    let text = Text::from(lines);
+    let total_rows = count_visual_rows(&text, area.width);
+    let visible_height = area.height.saturating_sub(2);
+    let scroll = total_rows.saturating_sub(visible_height);
+    let spinner_ch = SPINNER[((app.tick / 6) as usize) % SPINNER.len()];
+    let title = if app.memory_state == MemoryState::Updating {
+        format!(" memory {spinner_ch} ")
+    } else {
+        " memory ".to_string()
+    };
+    let panel = Paragraph::new(text)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
+    frame.render_widget(panel, area);
+}
+
 fn render_input(frame: &mut Frame, area: Rect, app: &App) {
     let in_normal = app.mode == Mode::Normal;
-    let style = if in_normal { Style::default().fg(Color::DarkGray) } else { Style::default() };
-    let block = Block::default().borders(Borders::ALL).title(" > ").border_style(style);
+    let style = if in_normal {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default()
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" > ")
+        .border_style(style);
     let input_widget = Paragraph::new(app.input.as_str()).style(style).block(block);
     frame.render_widget(input_widget, area);
     if app.mode == Mode::Insert {
@@ -405,7 +517,10 @@ fn render_stats(frame: &mut Frame, area: Rect, app: &App) {
                 Some(value) => format!("${value:.6}"),
                 None => "N/A".to_string(),
             };
-            format!(" ↑{} ↓{}  {}  TTFT {}ms", stats.tokens_in, stats.tokens_out, cost, stats.ttft_ms)
+            format!(
+                " ↑{} ↓{}  {}  TTFT {}ms",
+                stats.tokens_in, stats.tokens_out, cost, stats.ttft_ms
+            )
         }
         None => String::new(),
     };
@@ -422,8 +537,21 @@ fn render_stats(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_mode(frame: &mut Frame, area: Rect, app: &App) {
     let text = match app.mode {
-        Mode::Insert => "-- INSERT --",
-        Mode::Normal => "-- NORMAL --",
+        Mode::Insert => "-- INSERT --".to_string(),
+        Mode::Normal => {
+            let mem_hint = if app.show_memory_panel {
+                "[m] mem ✓"
+            } else {
+                "[m] mem"
+            };
+            let rea_hint = if app.show_reasoning {
+                "[R] reasoning ✓"
+            } else {
+                "[R] reasoning"
+            };
+            let dbg_hint = if app.show_debug { "[d] debug ✓" } else { "[d] debug" };
+            format!("-- NORMAL --  {mem_hint}  {rea_hint}  {dbg_hint}")
+        }
     };
     let widget = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(widget, area);
@@ -438,7 +566,14 @@ fn render(frame: &mut Frame, app: &App) {
     ])
     .split(frame.area());
 
-    render_output(frame, areas[0], app);
+    if app.show_memory_panel {
+        let cols = Layout::horizontal([Constraint::Percentage(65), Constraint::Percentage(35)])
+            .split(areas[0]);
+        render_output(frame, cols[0], app);
+        render_memory_panel(frame, cols[1], app);
+    } else {
+        render_output(frame, areas[0], app);
+    }
     render_input(frame, areas[1], app);
     render_stats(frame, areas[2], app);
     render_mode(frame, areas[3], app);

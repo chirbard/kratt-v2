@@ -13,17 +13,15 @@ struct SessionEntry {
 
 pub fn new_session_path() -> PathBuf {
     let timestamp = timestamp_parts();
-    PathBuf::from("kratt-data")
-        .join("sessions")
-        .join(format!(
-            "{:04}-{:02}-{:02}T{:02}-{:02}-{:02}.jsonl",
-            timestamp.year,
-            timestamp.month,
-            timestamp.day,
-            timestamp.hour,
-            timestamp.minute,
-            timestamp.second
-        ))
+    PathBuf::from("kratt-data").join("sessions").join(format!(
+        "{:04}-{:02}-{:02}T{:02}-{:02}-{:02}.jsonl",
+        timestamp.year,
+        timestamp.month,
+        timestamp.day,
+        timestamp.hour,
+        timestamp.minute,
+        timestamp.second
+    ))
 }
 
 pub fn append_entry(path: &Path, role: &str, content: &str) {
@@ -38,7 +36,11 @@ pub fn append_entry(path: &Path, role: &str, content: &str) {
     if std::fs::create_dir_all(parent).is_err() {
         return;
     }
-    let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) else {
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
         return;
     };
     if serde_json::to_writer(&mut file, &entry).is_err() {
@@ -103,7 +105,11 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
     let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
     let month_prime = (5 * day_of_year + 2) / 153;
     let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = if month_prime < 10 { month_prime + 3 } else { month_prime - 9 };
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    };
     let year = if month <= 2 { year_base + 1 } else { year_base };
     (year, month, day)
 }

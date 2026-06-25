@@ -1,5 +1,6 @@
+use std::error::Error;
 use std::io::{BufRead, BufReader};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Sender, channel};
 use std::time::Instant;
 
 use reqwest::blocking::Client;
@@ -75,7 +76,12 @@ fn make_request(
         "stream": true,
         "stream_options": {"include_usage": true},
     });
-    let resp = match Client::new().post(OPENROUTER_URL).bearer_auth(api_key).json(&body).send() {
+    let resp = match Client::new()
+        .post(OPENROUTER_URL)
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()
+    {
         Ok(resp) => resp,
         Err(err) => return Err(err.to_string()),
     };
@@ -148,6 +154,30 @@ fn send_done(state: StreamState, sender: &Sender<Chunk>) {
     }));
 }
 
+pub fn collect(
+    api_key: &str,
+    model: &str,
+    prompt: &str,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let (sender, receiver) = channel::<Chunk>();
+    stream(api_key.to_string(), model.to_string(), prompt.to_string(), None, sender);
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    loop {
+        match receiver.recv() {
+            Ok(Chunk::Content(text)) => content.push_str(&text),
+            Ok(Chunk::Reasoning(text)) => reasoning.push_str(&text),
+            Ok(Chunk::Done(_)) => break,
+            Ok(Chunk::Err(err)) => return Err(err.into()),
+            Err(err) => return Err(err.into()),
+        }
+    }
+    if !content.is_empty() {
+        return Ok(content);
+    }
+    Ok(reasoning)
+}
+
 pub fn stream(
     api_key: String,
     model: String,
@@ -162,7 +192,13 @@ pub fn stream(
             return;
         }
     };
-    let mut state = StreamState { start: Instant::now(), ttft: None, tokens_in: 0, tokens_out: 0, cost_usd: None };
+    let mut state = StreamState {
+        start: Instant::now(),
+        ttft: None,
+        tokens_in: 0,
+        tokens_out: 0,
+        cost_usd: None,
+    };
     let reader = BufReader::new(resp);
     for line_result in reader.lines() {
         let line = match line_result {

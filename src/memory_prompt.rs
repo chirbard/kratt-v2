@@ -139,7 +139,11 @@ fn today_iso() -> String {
     let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
     let month_prime = (5 * day_of_year + 2) / 153;
     let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = if month_prime < 10 { month_prime + 3 } else { month_prime - 9 };
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    };
     let year = if month <= 2 { year_base + 1 } else { year_base };
     format!("{year:04}-{month:02}-{day:02}")
 }

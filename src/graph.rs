@@ -27,7 +27,10 @@ pub struct Graph {
 
 impl Graph {
     pub fn new() -> Self {
-        Self { nodes: HashMap::new(), edges: Vec::new() }
+        Self {
+            nodes: HashMap::new(),
+            edges: Vec::new(),
+        }
     }
 }
 
