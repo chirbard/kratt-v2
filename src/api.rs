@@ -19,6 +19,7 @@ pub struct Stats {
 pub enum Chunk {
     Reasoning(String),
     Content(String),
+    ToolCall(String),
     Done(Stats),
     Err(String),
 }
@@ -173,6 +174,7 @@ pub fn collect(
         match receiver.recv() {
             Ok(Chunk::Content(text)) => content.push_str(&text),
             Ok(Chunk::Reasoning(text)) => reasoning.push_str(&text),
+            Ok(Chunk::ToolCall(_)) => {}
             Ok(Chunk::Done(_)) => break,
             Ok(Chunk::Err(err)) => return Err(err.into()),
             Err(err) => return Err(err.into()),

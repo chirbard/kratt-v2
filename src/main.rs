@@ -86,6 +86,7 @@ struct Message {
     role: Role,
     reasoning: String,
     content: String,
+    tool_call: String,
 }
 
 struct App {
@@ -105,6 +106,7 @@ struct App {
     show_memory_panel: bool,
     show_reasoning: bool,
     show_debug: bool,
+    show_tools: bool,
     session_path: PathBuf,
     memory_toon: String,
 }
@@ -128,6 +130,7 @@ impl App {
             show_memory_panel: false,
             show_reasoning: true,
             show_debug: false,
+            show_tools: false,
             session_path,
             memory_toon,
         }
@@ -195,11 +198,13 @@ fn start_stream(app: &mut App) {
         role: Role::User,
         reasoning: String::new(),
         content: prompt.clone(),
+        tool_call: String::new(),
     });
     app.history.push(Message {
         role: Role::Assistant,
         reasoning: String::new(),
         content: String::new(),
+        tool_call: String::new(),
     });
     app.stats = None;
     app.auto_scroll = true;
@@ -216,14 +221,18 @@ fn start_stream(app: &mut App) {
     let model = DEFAULT_MODEL.to_string();
     let session_path = app.session_path.clone();
     std::thread::spawn(move || {
-        let stream_prompt = maybe_augment_prompt_with_history(&key, &model, &prompt, &session_path);
+        let (stream_prompt, tool_desc) =
+            maybe_augment_prompt_with_history(&key, &model, &prompt, &session_path);
+        if let Some(desc) = tool_desc {
+            let _ = sender.send(Chunk::ToolCall(desc));
+        }
         api::stream(key, model, stream_prompt, system_opt, sender);
     });
 }
 
 enum HistoryResult {
-    Found(String),
-    NotFound(String),
+    Found(String, String),    // (text_to_append, ui_description)
+    NotFound(String, String), // (keywords_for_prompt, ui_description)
     Skip,
 }
 
@@ -232,29 +241,29 @@ fn maybe_augment_prompt_with_history(
     model: &str,
     prompt: &str,
     session_path: &Path,
-) -> String {
+) -> (String, Option<String>) {
     if !should_lookup_history(prompt) {
-        return prompt.to_string();
+        return (prompt.to_string(), None);
     }
     let lookup_prompt = memory_prompt::build_history_lookup_prompt(prompt);
     let lookup_response = match api::collect(api_key, model, &lookup_prompt) {
         Ok(lookup_response) => lookup_response,
-        Err(_) => return prompt.to_string(),
+        Err(_) => return (prompt.to_string(), None),
     };
     match parse_history_response(&lookup_response, session_path) {
-        HistoryResult::Skip => prompt.to_string(),
-        HistoryResult::Found(text) => {
+        HistoryResult::Skip => (prompt.to_string(), None),
+        HistoryResult::Found(text, ui_desc) => {
             let mut augmented = prompt.to_string();
             augmented.push_str("\n\n[History lookup result]\n");
             augmented.push_str(&text);
-            augmented
+            (augmented, Some(ui_desc))
         }
-        HistoryResult::NotFound(keywords) => {
+        HistoryResult::NotFound(keywords, ui_desc) => {
             let mut augmented = prompt.to_string();
             augmented.push_str("\n\n[History search found no results for: ");
             augmented.push_str(&keywords);
             augmented.push_str("]\nIf you cannot answer from your memory graph either, say explicitly that you checked your memory and searched past sessions for these keywords but found nothing.");
-            augmented
+            (augmented, Some(ui_desc))
         }
     }
 }
@@ -312,9 +321,12 @@ fn execute_read_history(arguments: &serde_json::Value, session_path: &Path) -> H
     };
     let text = history::read_history(session_path, offset);
     if text.is_empty() {
-        HistoryResult::NotFound(format!("turn offset {offset}"))
+        HistoryResult::NotFound(
+            format!("turn offset {offset}"),
+            format!("read_history offset={offset} → no results"),
+        )
     } else {
-        HistoryResult::Found(text)
+        HistoryResult::Found(text, format!("read_history offset={offset} → found"))
     }
 }
 
@@ -342,9 +354,12 @@ fn execute_search_history(arguments: &serde_json::Value) -> HistoryResult {
     let keywords_display = queries.join(", ");
     let text = history::search_history(&queries);
     if text.is_empty() {
-        HistoryResult::NotFound(keywords_display)
+        HistoryResult::NotFound(
+            keywords_display.clone(),
+            format!("search_history [{keywords_display}] → no results"),
+        )
     } else {
-        HistoryResult::Found(text)
+        HistoryResult::Found(text, format!("search_history [{keywords_display}] → found"))
     }
 }
 
@@ -388,6 +403,7 @@ fn handle_normal_key(key: KeyEvent, app: &mut App) -> bool {
         KeyCode::Char('m') => app.show_memory_panel = !app.show_memory_panel,
         KeyCode::Char('R') => app.show_reasoning = !app.show_reasoning,
         KeyCode::Char('d') => app.show_debug = !app.show_debug,
+        KeyCode::Char('t') => app.show_tools = !app.show_tools,
         _ => {}
     }
     false
@@ -408,6 +424,11 @@ fn drain_stream(app: &mut App) {
             Chunk::Content(text) => {
                 if let Some(msg) = app.history.last_mut() {
                     msg.content.push_str(&text);
+                }
+            }
+            Chunk::ToolCall(desc) => {
+                if let Some(msg) = app.history.last_mut() {
+                    msg.tool_call = desc;
                 }
             }
             Chunk::Done(stats) => {
@@ -503,33 +524,46 @@ fn push_user_lines(lines: &mut Vec<Line>, msg: &Message) {
     }
 }
 
+fn push_tool_line(lines: &mut Vec<Line>, tool_call: &str) {
+    lines.push(Line::from(Span::styled(
+        format!("[tool] {tool_call}"),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+    )));
+}
+
+fn push_reasoning_lines(lines: &mut Vec<Line>, reasoning: &str) {
+    for line in reasoning.lines() {
+        lines.push(Line::from(Span::styled(
+            line.to_string(),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )));
+    }
+}
+
 fn push_assistant_lines(
     lines: &mut Vec<Line>,
     msg: &Message,
     is_streaming: bool,
-    tick: u64,
-    show_reasoning: bool,
+    app: &App,
 ) {
     lines.push(Line::from(Span::styled(
         "kratt",
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
     )));
-    let reasoning_visible = show_reasoning && !msg.reasoning.is_empty();
+    if app.show_tools && !msg.tool_call.is_empty() {
+        push_tool_line(lines, &msg.tool_call);
+    }
+    let reasoning_visible = app.show_reasoning && !msg.reasoning.is_empty();
     if reasoning_visible {
-        for line in msg.reasoning.lines() {
-            lines.push(Line::from(Span::styled(
-                line.to_string(),
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::ITALIC),
-            )));
-        }
+        push_reasoning_lines(lines, &msg.reasoning);
     }
     let show_spinner = is_streaming && msg.content.is_empty() && !reasoning_visible;
     if show_spinner {
-        let frame = SPINNER[((tick / 4) as usize) % SPINNER.len()];
+        let frame = SPINNER[((app.tick / 4) as usize) % SPINNER.len()];
         lines.push(Line::from(Span::styled(
             format!("{frame} waiting..."),
             Style::default().fg(Color::DarkGray),
@@ -552,13 +586,7 @@ fn build_output_text(app: &App) -> Text<'static> {
         let streaming_here = is_last && app.state == State::Streaming;
         match msg.role {
             Role::User => push_user_lines(&mut lines, msg),
-            Role::Assistant => push_assistant_lines(
-                &mut lines,
-                msg,
-                streaming_here,
-                app.tick,
-                app.show_reasoning,
-            ),
+            Role::Assistant => push_assistant_lines(&mut lines, msg, streaming_here, app),
         }
         if !is_last {
             lines.push(Line::default());
@@ -715,7 +743,12 @@ fn render_mode(frame: &mut Frame, area: Rect, app: &App) {
             } else {
                 "[d] debug"
             };
-            format!("-- NORMAL --  {mem_hint}  {rea_hint}  {dbg_hint}")
+            let tool_hint = if app.show_tools {
+                "[t] tools ✓"
+            } else {
+                "[t] tools"
+            };
+            format!("-- NORMAL --  {mem_hint}  {rea_hint}  {dbg_hint}  {tool_hint}")
         }
     };
     let widget = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
