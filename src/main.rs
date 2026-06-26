@@ -11,6 +11,7 @@
 )]
 
 mod api;
+mod decay;
 mod git;
 mod graph;
 mod history;

@@ -6,7 +6,10 @@ pub const EXTRACT_EXPLANATION: &str = r#"You are an aggressive extraction agent 
 - Structural relationships (is-a, speaks, works-at, is a type of): add as direct edges between entity nodes
 - Events, actions, and observations (moved, left, sold, likes, hates): create a fact node (type "fact", one-sentence body, date if known), add a subject edge from the fact node to the primary entity (subject=true, importance=1.0), and add an edge from the source entity to the fact node
 - When uncertain, add it anyway — over-extraction is corrected in the next step
-- Do not include a respond call"#;
+- Do not include a respond call
+- Always set reinforced_at to today's date on every upsert_edge call
+- Facts about software versions, release dates, or world events the user asserts that post-date your training knowledge cutoff are the highest priority to extract — extract them even if stated casually; always prefer the user's stated version over your training data
+- When a fact is already present in the graph and the current conversation mentions or touches it, upsert it again with reinforced_at set to today and confidence raised toward 0.9 — this prevents it from decaying"#;
 
 pub const CONSOLIDATE_EXPLANATION: &str = r#"You are the final agent in a memory pipeline.
 
@@ -15,7 +18,8 @@ First, update the graph:
 - Check every fact node: if it is missing a subject declaration (an edge with subject=true pointing to its primary entity), add it
 - Add missing taxonomy links so every named concept links through to its category
 - Normalise inconsistent edge content templates — reword edges that use novel phrasing when an equivalent existing template already exists in the graph
-- Add relationships clearly implied by two or more existing edges"#;
+- Add relationships clearly implied by two or more existing edges
+- When keeping or merging an edge, always emit an upsert_edge with reinforced_at set to today's date to reset its decay clock"#;
 
 pub const TOOL_DEFINITIONS: &str = r#"## Available tools
 
@@ -32,7 +36,8 @@ Create or update a directed edge between two nodes.
 - confidence: 1.0 stated clearly, 0.7 stated once, 0.4 inferred, 0.1 uncertain
 - importance: 1.0 target must load with source, 0.0 supplementary
 - subject: true only on fact nodes — marks the primary entity the fact is about; set importance to 1.0
-{"tool": "upsert_edge", "arguments": {"source": "string", "target": "string", "content": "string", "stability": 0.0, "confidence": 0.0, "importance": 0.0, "subject": false}}
+- reinforced_at: always set to today's date
+{"tool": "upsert_edge", "arguments": {"source": "string", "target": "string", "content": "string", "stability": 0.0, "confidence": 0.0, "importance": 0.0, "subject": false, "reinforced_at": "YYYY-MM-DD"}}
 
 ### delete_node
 Remove a node from the graph.
@@ -80,7 +85,7 @@ Single tool call:
 {"tool": "upsert_node", "arguments": {"name": "example", "type": "entity", "body": "", "date": ""}}
 
 Multiple tool calls:
-{"tools": [{"tool": "upsert_node", "arguments": {"name": "example", "type": "entity", "body": "", "date": ""}}, {"tool": "upsert_edge", "arguments": {"source": "a", "target": "b", "content": "<subject> verb <target>", "stability": 1.0, "confidence": 1.0, "importance": 0.0, "subject": false}}]}"#;
+{"tools": [{"tool": "upsert_node", "arguments": {"name": "example", "type": "entity", "body": "", "date": ""}}, {"tool": "upsert_edge", "arguments": {"source": "a", "target": "b", "content": "<subject> verb <target>", "stability": 1.0, "confidence": 1.0, "importance": 0.0, "subject": false, "reinforced_at": "YYYY-MM-DD"}}]}"#;
 
 pub const HISTORY_TOOL_DEFINITIONS: &str = r#"### read_history
 Returns a specific past turn from the current session.
@@ -125,6 +130,9 @@ Use the facts inside <memory> to recall what you know about the user. \
 Use <recent_context> for short-term continuity. \
 Respond naturally and concisely. Never output graph data, JSON, edge lists, or memory update descriptions — just answer the user.",
     );
+    prompt.push_str("\nToday's date is ");
+    prompt.push_str(&today_iso());
+    prompt.push('.');
     if !memory_toon.trim().is_empty() {
         prompt.push_str("\n\n<memory>\n");
         prompt.push_str(memory_toon);
@@ -154,6 +162,9 @@ Output ONLY one of:\n\
 1. A raw JSON tool call (no prose, no markdown fences)\n\
 2. The single word: skip — only if the question is clearly about something that could not exist in past sessions",
     );
+    prompt.push_str("\nToday's date is ");
+    prompt.push_str(&today_iso());
+    prompt.push('.');
     prompt.push_str("\n\n<tools>\n");
     prompt.push_str(HISTORY_TOOL_DEFINITIONS);
     prompt.push_str("\n</tools>\n\nUser message: ");
@@ -169,7 +180,7 @@ fn recent_role_label(recent_entry: &RecentEntry) -> &str {
     }
 }
 
-fn today_iso() -> String {
+pub fn today_iso() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     let seconds_since_epoch = SystemTime::now()

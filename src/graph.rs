@@ -17,6 +17,7 @@ pub struct Edge {
     pub stability: f64,
     pub confidence: f64,
     pub importance: f64,
+    pub reinforced_at: String,
     pub subject: bool,
 }
 
@@ -82,14 +83,21 @@ fn parse_toon_edge(fields: &[String]) -> Option<Edge> {
     if fields.len() < 7 {
         return None;
     }
+    let new_format = fields.len() >= 8;
+    let (reinforced_at, source, stability, subject, target) = if new_format {
+        (fields[3].clone(), &fields[4], &fields[5], &fields[6], &fields[7])
+    } else {
+        (String::new(), &fields[3], &fields[4], &fields[5], &fields[6])
+    };
     Some(Edge {
         confidence: fields[0].parse().unwrap_or(0.0),
         content: fields[1].clone(),
         importance: fields[2].parse().unwrap_or(0.0),
-        source: normalize_id(&fields[3]),
-        stability: fields[4].parse().unwrap_or(0.0),
-        subject: fields[5] == "true",
-        target: normalize_id(&fields[6]),
+        reinforced_at,
+        source: normalize_id(source),
+        stability: stability.parse().unwrap_or(0.0),
+        subject: *subject == "true",
+        target: normalize_id(target),
     })
 }
 
@@ -179,6 +187,7 @@ pub fn graph_to_json(graph: &Graph) -> serde_json::Value {
             "confidence": edge.confidence,
             "content": edge.content,
             "importance": edge.importance,
+            "reinforced_at": edge.reinforced_at,
             "source": edge.source,
             "stability": edge.stability,
             "subject": edge.subject,

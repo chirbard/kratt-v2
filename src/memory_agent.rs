@@ -1,6 +1,7 @@
 use std::error::Error;
 
 use crate::api;
+use crate::decay;
 use crate::git;
 use crate::graph::{
     Edge, Graph, Node, delete_node, graph_to_json, insert_edge, load_graph, normalize_id,
@@ -37,6 +38,7 @@ enum ToolCall {
         confidence: f64,
         importance: f64,
         subject: bool,
+        reinforced_at: String,
     },
     DeleteNode {
         name: String,
@@ -72,6 +74,7 @@ pub fn run_memory_agent(
 impl<'run> AgentRun<'run> {
     fn run(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut graph = load_graph();
+        decay::apply_decay_if_needed(&mut graph);
         let mut toon_text = toon::encode(&graph_to_json(&graph), None);
 
         self.run_pass(&mut graph, &toon_text, "extract", EXTRACT_EXPLANATION)?;
@@ -220,6 +223,7 @@ fn parse_upsert_edge(arguments: &serde_json::Value) -> Option<ToolCall> {
         confidence: json_f64(arguments, "confidence"),
         importance: json_f64(arguments, "importance"),
         subject: json_bool(arguments, "subject"),
+        reinforced_at: json_str(arguments, "reinforced_at"),
     })
 }
 
@@ -280,6 +284,7 @@ fn apply_tool(call: ToolCall, graph: &mut Graph) -> String {
             confidence,
             importance,
             subject,
+            reinforced_at,
         } => {
             let edge = Edge {
                 source: normalize_id(&source),
@@ -289,6 +294,7 @@ fn apply_tool(call: ToolCall, graph: &mut Graph) -> String {
                 confidence,
                 importance,
                 subject,
+                reinforced_at,
             };
             apply_upsert_edge(graph, source, target, edge)
         }
