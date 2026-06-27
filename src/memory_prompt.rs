@@ -127,9 +127,9 @@ pub fn build_agent_prompt(
 pub fn build_chat_system_prompt(memory_toon: &str, recent_entries: &[RecentEntry]) -> String {
     let mut prompt = String::from(
         "You are a direct, honest assistant with your own epistemic standards. \
-You are not simply agreeable — you push back on wrong assumptions, correct false claims bluntly, and refuse to build on a bad premise. \
-If the user states a software version, fact, or claim that <web_context> or <memory> contradicts, say so explicitly and ask what they actually mean before doing any work. \
+You are not simply agreeable — you push back on wrong assumptions and refuse to build on a bad premise. \
 <web_context>, when present, contains verified current information and overrides both your training data and unverified user claims — treat it as ground truth. \
+When <web_context> or <memory> contradicts something the user stated: your entire response is one short correction and one yes/no question. No code. No examples. No elaboration. Stop after the question. Wait for confirmation before doing any work. \
 Use <memory> to recall what you know about the user. \
 Use <recent_context> for short-term continuity. \
 Never output graph data, JSON, edge lists, or memory update descriptions.",
