@@ -166,6 +166,10 @@ pub fn save_graph(graph: &Graph) -> Result<(), Box<dyn Error + Send + Sync>> {
     Ok(())
 }
 
+fn round2(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
+}
+
 pub fn graph_to_json(graph: &Graph) -> serde_json::Value {
     let mut node_names: Vec<&String> = graph.nodes.keys().collect();
     node_names.sort();
@@ -184,12 +188,12 @@ pub fn graph_to_json(graph: &Graph) -> serde_json::Value {
     let mut edges_json = Vec::new();
     for edge in &graph.edges {
         edges_json.push(serde_json::json!({
-            "confidence": edge.confidence,
+            "confidence": round2(edge.confidence),
             "content": edge.content,
-            "importance": edge.importance,
+            "importance": round2(edge.importance),
             "reinforced_at": edge.reinforced_at,
             "source": edge.source,
-            "stability": edge.stability,
+            "stability": round2(edge.stability),
             "subject": edge.subject,
             "target": edge.target,
         }));
