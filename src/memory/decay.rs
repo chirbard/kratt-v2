@@ -1,24 +1,16 @@
+use super::db;
 use super::graph::{Edge, Graph};
 use crate::prompts::today_iso;
 
-const DECAY_DATE_PATH: &str = "kratt-data/last-decay.txt";
-
 pub fn apply_decay_if_needed(graph: &mut Graph) {
     let today = today_iso();
-    if last_decay_date() == today {
+    if db::load_last_decay() == today {
         return;
     }
     for edge in &mut graph.edges {
         decay_edge(edge, &today);
     }
-    let _ = std::fs::write(DECAY_DATE_PATH, &today);
-}
-
-fn last_decay_date() -> String {
-    std::fs::read_to_string(DECAY_DATE_PATH)
-        .unwrap_or_default()
-        .trim()
-        .to_string()
+    db::save_last_decay(&today);
 }
 
 fn decay_edge(edge: &mut Edge, today: &str) {

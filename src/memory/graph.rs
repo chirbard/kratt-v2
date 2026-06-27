@@ -1,15 +1,15 @@
 use std::collections::HashMap;
-use std::error::Error;
 
-const DATA_DIR: &str = "kratt-data";
 const TOON_PATH: &str = "kratt-data/kratt-graph.toon";
 
+#[derive(Clone)]
 pub struct Node {
     pub node_type: String,
     pub body: String,
     pub date: String,
 }
 
+#[derive(Clone)]
 pub struct Edge {
     pub source: String,
     pub target: String,
@@ -21,6 +21,7 @@ pub struct Edge {
     pub subject: bool,
 }
 
+#[derive(Clone)]
 pub struct Graph {
     pub nodes: HashMap<String, Node>,
     pub edges: Vec<Edge>,
@@ -149,7 +150,7 @@ pub fn normalize_id(input: &str) -> String {
     input.trim().to_lowercase().replace(' ', "-")
 }
 
-pub fn load_graph() -> Graph {
+pub fn load_from_toon() -> Graph {
     let toon_text = match std::fs::read_to_string(TOON_PATH) {
         Ok(contents) => contents,
         Err(_) => return Graph::new(),
@@ -164,12 +165,6 @@ pub fn load_graph() -> Graph {
         apply_toon_line(trimmed, &mut graph, &mut section);
     }
     graph
-}
-
-pub fn save_graph(graph: &Graph) -> Result<(), Box<dyn Error + Send + Sync>> {
-    std::fs::create_dir_all(DATA_DIR)?;
-    std::fs::write(TOON_PATH, toon::encode(&graph_to_json(graph), None))?;
-    Ok(())
 }
 
 fn round2(value: f64) -> f64 {

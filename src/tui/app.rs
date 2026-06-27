@@ -177,28 +177,17 @@ pub(crate) fn drain_memory(app: &mut App) {
 fn start_memory_update(app: &mut App) {
     let assistant_content = last_assistant_content(app);
     let user_content = second_to_last_content(app);
-    let session_label = session_label(&app.session_path);
     session::append_entry(&app.session_path, "assistant", &assistant_content);
     app.memory_log.clear();
     let (sender, receiver) = std::sync::mpsc::channel::<MemoryEvent>();
     let llm = Arc::clone(&app.memory_llm);
     std::thread::spawn(move || {
-        let _ = memory::run_memory_agent(llm, &user_content, &assistant_content, session_label, sender);
+        let _ = memory::run_memory_agent(llm, &user_content, &assistant_content, sender);
     });
     app.memory_rx = Some(receiver);
     app.memory_state = MemoryState::Updating;
 }
 
-fn session_label(session_path: &std::path::Path) -> String {
-    let stem_os = match session_path.file_stem() {
-        Some(stem_os) => stem_os,
-        None => return "unknown".to_string(),
-    };
-    match stem_os.to_str() {
-        Some(stem_text) => stem_text.to_string(),
-        None => "unknown".to_string(),
-    }
-}
 
 pub(crate) fn last_assistant_content(app: &App) -> String {
     match app.history.last() {

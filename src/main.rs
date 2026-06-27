@@ -41,11 +41,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Some(Arc::new(web::new_search_client(tavily_key)))
     };
+    if let Err(err) = memory::db_init() {
+        eprintln!("warning: db init failed: {err}");
+    }
     let graph = memory::load_graph();
     let memory_toon = toon::encode(&memory::graph_to_json(&graph), None);
     let session_path = session::new_session_path();
-    if let Err(err) = memory::git_init_if_needed() {
-        eprintln!("warning: git init failed: {err}");
-    }
     tui::run(chat_llm, memory_llm, search, memory_toon, session_path)
 }

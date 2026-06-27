@@ -3,11 +3,10 @@ use std::sync::Arc;
 
 use crate::api::{Chunk, LlmClient};
 use crate::prompts::{CONSOLIDATE_EXPLANATION, EXTRACT_EXPLANATION, build_agent_prompt};
+use super::db;
 use super::decay;
-use super::git;
 use super::graph::{
-    Edge, Graph, Node, delete_node, graph_to_json, insert_edge, load_graph, normalize_id,
-    remove_edges, save_graph,
+    Edge, Graph, Node, delete_node, graph_to_json, insert_edge, normalize_id, remove_edges,
 };
 
 pub enum MemoryEvent {
@@ -20,7 +19,6 @@ struct AgentRun<'run> {
     llm: Arc<dyn LlmClient>,
     user_msg: &'run str,
     assistant_msg: &'run str,
-    session_label: &'run str,
     sender: &'run std::sync::mpsc::Sender<MemoryEvent>,
 }
 
@@ -54,14 +52,12 @@ pub fn run_memory_agent(
     llm: Arc<dyn LlmClient>,
     user_msg: &str,
     assistant_msg: &str,
-    session_label: String,
     sender: std::sync::mpsc::Sender<MemoryEvent>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let agent_run = AgentRun {
         llm,
         user_msg,
         assistant_msg,
-        session_label: &session_label,
         sender: &sender,
     };
     let result = agent_run.run();
@@ -71,10 +67,11 @@ pub fn run_memory_agent(
 
 impl<'run> AgentRun<'run> {
     fn run(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let mut graph = load_graph();
+        let mut graph = db::load_graph();
         decay::apply_decay_if_needed(&mut graph);
 
-        let pre_extract_toon = toon::encode(&graph_to_json(&graph), None);
+        let pre_extract_graph = graph.clone();
+        let pre_extract_toon = toon::encode(&graph_to_json(&pre_extract_graph), None);
         let extract_prompt = build_agent_prompt(
             EXTRACT_EXPLANATION,
             &pre_extract_toon,
@@ -84,13 +81,12 @@ impl<'run> AgentRun<'run> {
         );
         self.run_pass(&mut graph, "extract", extract_prompt)?;
 
-        if let Err(err) = save_graph(&graph) {
+        if let Err(err) = db::save_graph(&graph) {
             self.send_log("memory", format!("error: {err}"));
             return Err(err);
         }
-        let extract_committed = self.git_commit_logged(&format!("{} [extract]", self.session_label));
 
-        let diff = if extract_committed { git::git_diff_last() } else { String::new() };
+        let diff = db::graph_diff_toon(&pre_extract_graph, &graph);
         let consolidate_prompt = build_agent_prompt(
             CONSOLIDATE_EXPLANATION,
             &pre_extract_toon,
@@ -100,31 +96,15 @@ impl<'run> AgentRun<'run> {
         );
         self.run_pass(&mut graph, "consolidate", consolidate_prompt)?;
 
-        if let Err(err) = save_graph(&graph) {
+        if let Err(err) = db::save_graph(&graph) {
             self.send_log("memory", format!("error: {err}"));
             return Err(err);
         }
-        self.git_commit_logged(self.session_label);
         self.send_log(
             "memory",
             format!("saved — {} nodes, {} edges", graph.nodes.len(), graph.edges.len()),
         );
         Ok(())
-    }
-
-    fn git_commit_logged(&self, label: &str) -> bool {
-        match git::git_commit(label) {
-            Ok(committed) => {
-                if committed {
-                    self.send_log("debug", format!("git: committed {label}"));
-                }
-                committed
-            }
-            Err(err) => {
-                self.send_log("memory", format!("git: {err}"));
-                false
-            }
-        }
     }
 
     fn run_pass(

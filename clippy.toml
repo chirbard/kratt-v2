@@ -2,7 +2,7 @@ cognitive-complexity-threshold = 9
 too-many-lines-threshold = 40
 too-many-arguments-threshold = 5
 min-ident-chars-threshold = 2
-allowed-idents-below-min-chars = ["i", "j", "x", "y", "z"]
+allowed-idents-below-min-chars = ["db", "i", "j", "x", "y", "z"]
 
 disallowed-methods = [
     # Iterator functional chains — use explicit for loops instead
