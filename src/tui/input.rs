@@ -32,14 +32,30 @@ fn handle_normal_key(key: KeyEvent, app: &mut App) -> bool {
         KeyCode::Char('q') => return true,
         KeyCode::Char('i') => app.mode = Mode::Insert,
         KeyCode::Char('j') => {
-            app.auto_scroll = false;
-            app.scroll = app.scroll.saturating_add(3);
+            if app.show_memory_panel {
+                app.memory_auto_scroll = false;
+                app.memory_scroll = app.memory_scroll.saturating_add(3);
+            } else {
+                app.auto_scroll = false;
+                app.scroll = app.scroll.saturating_add(3);
+            }
         }
         KeyCode::Char('k') => {
-            app.auto_scroll = false;
-            app.scroll = app.scroll.saturating_sub(3);
+            if app.show_memory_panel {
+                app.memory_auto_scroll = false;
+                app.memory_scroll = app.memory_scroll.saturating_sub(3);
+            } else {
+                app.auto_scroll = false;
+                app.scroll = app.scroll.saturating_sub(3);
+            }
         }
-        KeyCode::Char('G') => app.auto_scroll = true,
+        KeyCode::Char('G') => {
+            if app.show_memory_panel {
+                app.memory_auto_scroll = true;
+            } else {
+                app.auto_scroll = true;
+            }
+        }
         KeyCode::Char('m') => app.show_memory_panel = !app.show_memory_panel,
         KeyCode::Char('R') => app.show_reasoning = !app.show_reasoning,
         KeyCode::Char('d') => app.show_debug = !app.show_debug,
