@@ -65,15 +65,15 @@ pub const EXTRACT_EXPLANATION: &str = r#"You are an aggressive extraction agent 
 - If a fact is already in the graph and the conversation touches it, upsert with date=today and confidence raised toward 0.9
 - If the assistant cites or corrects a fact from a web result, extract with confidence 0.9"#;
 
-pub const CONSOLIDATE_EXPLANATION: &str = r#"You are the final agent in a memory pipeline.
+pub const CONSOLIDATE_EXPLANATION: &str = r#"You are a quality-gate agent for a memory graph. The extract agent just ran — your job is to audit its changes and push back where needed.
 
-Update the graph:
-- Merge near-duplicate nodes (same entity, different spelling/capitalisation/abbreviation): re-add edges under the canonical name, delete_node the duplicate
-- Fix any fact node missing a subject declaration (edge with subject=true to its primary entity)
-- Add missing taxonomy links so every named concept chains to its category
-- Normalise edge content: reword novel-phrasing edges to match an existing template when one fits
-- Add relationships clearly implied by two or more existing edges
-- On every kept or merged edge, emit upsert_edge with date=today to reset its decay clock"#;
+The diff below shows exactly what extract added (+) and removed (-). Focus on those lines.
+
+- Delete nodes or edges that are wrong, too vague, or cannot be verified from the conversation
+- Merge nodes that duplicate existing ones: re-add their edges under the canonical name, delete_node the duplicate
+- Reword edge content to match the closest existing predicate template when one clearly fits
+- Fix any fact node missing a subject edge (subject=true, importance=1.0) to its primary entity
+- Do not add new nodes or edges beyond corrections and merges"#;
 
 pub const TOOL_DEFINITIONS: &str = r#"TOOLS
 
@@ -135,6 +135,7 @@ pub fn build_agent_prompt(
     toon: &str,
     user_msg: &str,
     assistant_msg: &str,
+    diff_text: Option<&str>,
 ) -> String {
     let mut prompt = String::new();
     prompt.push_str(explanation);
@@ -149,6 +150,10 @@ pub fn build_agent_prompt(
     prompt.push_str(MEMORY_RULES);
     prompt.push_str("\n\n## Current memory state\n\n");
     prompt.push_str(toon);
+    if let Some(diff) = diff_text {
+        prompt.push_str("\n\n## What extract added\n\n");
+        prompt.push_str(diff);
+    }
     prompt.push_str("\n\n## Exchange to process\n\nUser: ");
     prompt.push_str(user_msg);
     prompt.push_str("\nAssistant: ");

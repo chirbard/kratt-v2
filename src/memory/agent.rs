@@ -73,41 +73,67 @@ impl<'run> AgentRun<'run> {
     fn run(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut graph = load_graph();
         decay::apply_decay_if_needed(&mut graph);
-        let mut toon_text = toon::encode(&graph_to_json(&graph), None);
 
-        self.run_pass(&mut graph, &toon_text, "extract", EXTRACT_EXPLANATION)?;
-
-        toon_text = toon::encode(&graph_to_json(&graph), None);
-        self.run_pass(&mut graph, &toon_text, "consolidate", CONSOLIDATE_EXPLANATION)?;
+        let pre_extract_toon = toon::encode(&graph_to_json(&graph), None);
+        let extract_prompt = build_agent_prompt(
+            EXTRACT_EXPLANATION,
+            &pre_extract_toon,
+            self.user_msg,
+            self.assistant_msg,
+            None,
+        );
+        self.run_pass(&mut graph, "extract", extract_prompt)?;
 
         if let Err(err) = save_graph(&graph) {
             self.send_log("memory", format!("error: {err}"));
             return Err(err);
         }
-        match git::git_commit(self.session_label) {
-            Ok(()) => self.send_log("debug", format!("git: committed {}", self.session_label)),
-            Err(err) => self.send_log("memory", format!("git: {err}")),
+        let extract_committed = self.git_commit_logged(&format!("{} [extract]", self.session_label));
+
+        let diff = if extract_committed { git::git_diff_last() } else { String::new() };
+        let consolidate_prompt = build_agent_prompt(
+            CONSOLIDATE_EXPLANATION,
+            &pre_extract_toon,
+            self.user_msg,
+            self.assistant_msg,
+            if diff.is_empty() { None } else { Some(&diff) },
+        );
+        self.run_pass(&mut graph, "consolidate", consolidate_prompt)?;
+
+        if let Err(err) = save_graph(&graph) {
+            self.send_log("memory", format!("error: {err}"));
+            return Err(err);
         }
+        self.git_commit_logged(self.session_label);
         self.send_log(
             "memory",
-            format!(
-                "saved — {} nodes, {} edges",
-                graph.nodes.len(),
-                graph.edges.len()
-            ),
+            format!("saved — {} nodes, {} edges", graph.nodes.len(), graph.edges.len()),
         );
         Ok(())
+    }
+
+    fn git_commit_logged(&self, label: &str) -> bool {
+        match git::git_commit(label) {
+            Ok(committed) => {
+                if committed {
+                    self.send_log("debug", format!("git: committed {label}"));
+                }
+                committed
+            }
+            Err(err) => {
+                self.send_log("memory", format!("git: {err}"));
+                false
+            }
+        }
     }
 
     fn run_pass(
         &self,
         graph: &mut Graph,
-        toon_text: &str,
         phase: &'static str,
-        explanation: &str,
+        prompt: String,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.send_log(phase, "calling LLM…".to_string());
-        let prompt = build_agent_prompt(explanation, toon_text, self.user_msg, self.assistant_msg);
         let call_text = match stream_collect(
             Arc::clone(&self.llm),
             prompt,

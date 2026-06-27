@@ -49,11 +49,21 @@ pub fn git_init_if_needed() -> Result<(), Box<dyn Error + Send + Sync>> {
     Ok(())
 }
 
-pub fn git_commit(label: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+pub fn git_commit(label: &str) -> Result<bool, Box<dyn Error + Send + Sync>> {
     run_git(&["-C", DATA_DIR, "add", GRAPH_PATH])?;
     if !has_staged_changes()? {
-        return Ok(());
+        return Ok(false);
     }
     run_git(&["-C", DATA_DIR, "commit", "-m", &format!("mem: {label}")])?;
-    Ok(())
+    Ok(true)
+}
+
+pub fn git_diff_last() -> String {
+    let output = Command::new("git")
+        .args(["-C", DATA_DIR, "diff", "HEAD~1..HEAD", "--", GRAPH_PATH])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+        _ => String::new(),
+    }
 }
