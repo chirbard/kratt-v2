@@ -42,7 +42,7 @@ pub(crate) fn start_stream(app: &mut App) {
     let system = prompts::build_chat_system_prompt(&app.memory_toon, &recent_entries);
     let system_opt = if system.is_empty() { None } else { Some(system) };
     let job = StreamJob {
-        llm: Arc::clone(&app.llm),
+        llm: Arc::clone(&app.chat_llm),
         search: match &app.search {
             Some(arc) => Some(Arc::clone(arc)),
             None => None,

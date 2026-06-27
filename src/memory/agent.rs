@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::sync::Arc;
 
-use crate::api::LlmClient;
+use crate::api::{Chunk, LlmClient};
 use crate::prompts::{CONSOLIDATE_EXPLANATION, EXTRACT_EXPLANATION, build_agent_prompt};
 use super::decay;
 use super::git;
@@ -12,11 +12,12 @@ use super::graph::{
 
 pub enum MemoryEvent {
     Log { phase: &'static str, text: String },
+    Append { phase: &'static str, text: String },
     Done,
 }
 
 struct AgentRun<'run> {
-    llm: &'run dyn LlmClient,
+    llm: Arc<dyn LlmClient>,
     user_msg: &'run str,
     assistant_msg: &'run str,
     session_label: &'run str,
@@ -57,7 +58,7 @@ pub fn run_memory_agent(
     sender: std::sync::mpsc::Sender<MemoryEvent>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let agent_run = AgentRun {
-        llm: llm.as_ref(),
+        llm,
         user_msg,
         assistant_msg,
         session_label: &session_label,
@@ -107,16 +108,18 @@ impl<'run> AgentRun<'run> {
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.send_log(phase, "calling LLM…".to_string());
         let prompt = build_agent_prompt(explanation, toon_text, self.user_msg, self.assistant_msg);
-        let call_text = match self.llm.collect(&prompt) {
+        let call_text = match stream_collect(
+            Arc::clone(&self.llm),
+            prompt,
+            |text| self.send_append("think", text),
+            |text| self.send_append("debug", text),
+        ) {
             Ok(call_text) => call_text,
             Err(err) => {
                 self.send_log(phase, format!("error: {err}"));
                 return Err(err);
             }
         };
-        for line in call_text.lines() {
-            self.send_log("debug", format!("  {line}"));
-        }
         let tool_calls = parse_tool_calls(&call_text);
         if tool_calls.is_empty() {
             self.send_log(phase, "no tool calls".to_string());
@@ -134,6 +137,48 @@ impl<'run> AgentRun<'run> {
     fn send_log(&self, phase: &'static str, text: String) {
         let _ = self.sender.send(MemoryEvent::Log { phase, text });
     }
+
+    fn send_append(&self, phase: &'static str, text: String) {
+        let _ = self.sender.send(MemoryEvent::Append { phase, text });
+    }
+}
+
+fn stream_collect(
+    llm: Arc<dyn LlmClient>,
+    prompt: String,
+    on_reasoning: impl Fn(String),
+    on_content: impl Fn(String),
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let (chunk_tx, chunk_rx) = std::sync::mpsc::channel::<Chunk>();
+    std::thread::spawn(move || llm.stream(prompt, None, chunk_tx));
+    let mut reasoning_full = String::new();
+    let mut content = String::new();
+    let mut err: Option<Box<dyn Error + Send + Sync>> = None;
+    for chunk in chunk_rx {
+        match chunk {
+            Chunk::Reasoning(text) => {
+                reasoning_full.push_str(&text);
+                on_reasoning(text);
+            }
+            Chunk::Content(text) => {
+                content.push_str(&text);
+                on_content(text);
+            }
+            Chunk::Done(_) => break,
+            Chunk::Err(error) => {
+                err = Some(error.into());
+                break;
+            }
+            Chunk::ToolCall(_) => {}
+        }
+    }
+    if let Some(error) = err {
+        return Err(error);
+    }
+    if !content.is_empty() {
+        return Ok(content);
+    }
+    Ok(reasoning_full)
 }
 
 fn parse_tool_calls(text: &str) -> Vec<ToolCall> {

@@ -60,6 +60,9 @@ fn render_output(frame: &mut Frame, area: Rect, app: &mut App) {
 fn build_memory_text(app: &App) -> Text<'static> {
     let mut lines: Vec<Line> = Vec::new();
     for (phase, text) in &app.memory_log {
+        if phase == "think" && !app.show_reasoning {
+            continue;
+        }
         if phase == "debug" && !app.show_debug {
             continue;
         }
@@ -301,6 +304,7 @@ fn phase_color(phase: &str) -> Color {
         "extract" => Color::Cyan,
         "consolidate" => Color::Yellow,
         "memory" => Color::Green,
+        "think" => Color::Magenta,
         "debug" => Color::DarkGray,
         _ => Color::White,
     }

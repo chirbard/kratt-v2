@@ -39,7 +39,8 @@ pub(crate) struct Message {
 }
 
 pub(crate) struct App {
-    pub(crate) llm: Arc<dyn LlmClient>,
+    pub(crate) chat_llm: Arc<dyn LlmClient>,
+    pub(crate) memory_llm: Arc<dyn LlmClient>,
     pub(crate) search: Option<Arc<dyn SearchClient>>,
     pub(crate) input: String,
     pub(crate) mode: Mode,
@@ -65,13 +66,15 @@ pub(crate) struct App {
 
 impl App {
     pub(crate) fn new(
-        llm: Arc<dyn LlmClient>,
+        chat_llm: Arc<dyn LlmClient>,
+        memory_llm: Arc<dyn LlmClient>,
         search: Option<Arc<dyn SearchClient>>,
         memory_toon: String,
         session_path: PathBuf,
     ) -> Self {
         Self {
-            llm,
+            chat_llm,
+            memory_llm,
             search,
             input: String::new(),
             mode: Mode::Insert,
@@ -147,6 +150,12 @@ pub(crate) fn drain_memory(app: &mut App) {
             Ok(MemoryEvent::Log { phase, text }) => {
                 app.memory_log.push((phase.to_string(), text));
             }
+            Ok(MemoryEvent::Append { phase, text }) => {
+                match app.memory_log.last_mut() {
+                    Some(last) if last.0 == phase => last.1.push_str(&text),
+                    _ => app.memory_log.push((phase.to_string(), text)),
+                }
+            }
             Ok(MemoryEvent::Done) => {
                 let graph = memory::load_graph();
                 app.memory_toon = toon::encode(&memory::graph_to_json(&graph), None);
@@ -172,7 +181,7 @@ fn start_memory_update(app: &mut App) {
     session::append_entry(&app.session_path, "assistant", &assistant_content);
     app.memory_log.clear();
     let (sender, receiver) = std::sync::mpsc::channel::<MemoryEvent>();
-    let llm = Arc::clone(&app.llm);
+    let llm = Arc::clone(&app.memory_llm);
     std::thread::spawn(move || {
         let _ = memory::run_memory_agent(llm, &user_content, &assistant_content, session_label, sender);
     });

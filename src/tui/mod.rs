@@ -24,7 +24,8 @@ use app::{App, drain_memory, drain_stream};
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
 pub fn run(
-    llm: Arc<dyn LlmClient>,
+    chat_llm: Arc<dyn LlmClient>,
+    memory_llm: Arc<dyn LlmClient>,
     search: Option<Arc<dyn SearchClient>>,
     memory_toon: String,
     session_path: PathBuf,
@@ -34,7 +35,7 @@ pub fn run(
     tui_enter(&mut stdout)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let mut app = App::new(llm, search, memory_toon, session_path);
+    let mut app = App::new(chat_llm, memory_llm, search, memory_toon, session_path);
     let result = run_loop(&mut terminal, &mut app);
     disable_raw_mode()?;
     tui_exit(&mut terminal)?;
