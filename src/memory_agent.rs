@@ -7,7 +7,7 @@ use crate::graph::{
     Edge, Graph, Node, delete_node, graph_to_json, insert_edge, load_graph, normalize_id,
     remove_edges, save_graph,
 };
-use crate::memory_prompt::{CONSOLIDATE_EXPLANATION, EXTRACT_EXPLANATION, build_agent_prompt};
+use crate::prompts::{CONSOLIDATE_EXPLANATION, EXTRACT_EXPLANATION, build_agent_prompt};
 
 pub enum MemoryEvent {
     Log { phase: &'static str, text: String },

@@ -1,5 +1,66 @@
 use crate::session::RecentEntry;
 
+pub const HISTORY_LOOKUP_KEYWORDS: &[&str] = &[
+    "remember",
+    "earlier",
+    "last time",
+    "last session",
+    "you said",
+    "we said",
+    "previous",
+    "history",
+    "search",
+    "when did",
+    "what did you",
+    "what did i",
+    "what did we",
+    "do you recall",
+    "can you recall",
+    "did we",
+    "did i",
+];
+
+pub const CHAT_SYSTEM_PROMPT: &str = "You are a direct, honest assistant with your own epistemic standards. \
+You are not simply agreeable — you push back on wrong assumptions and refuse to build on a bad premise. \
+<web_context>, when present, contains verified current information and overrides both your training data and unverified user claims — treat it as ground truth. \
+When <web_context> or <memory> contradicts something the user stated: your entire response is one short correction and one yes/no question. No code. No examples. No elaboration. Stop after the question. Wait for confirmation before doing any work. \
+Use <memory> to recall what you know about the user. \
+Use <recent_context> for short-term continuity. \
+Never output graph data, JSON, edge lists, or memory update descriptions.";
+
+pub const HISTORY_LOOKUP_EXPLANATION: &str = "You are a memory lookup agent. Decide whether to search past session history before the main model answers.\n\
+\n\
+Search aggressively: if there is any chance past sessions contain relevant information, search. Default to searching over skipping.\n\
+For search_history, provide 3–5 short keywords that cover different phrasings of the concept — the match is a substring OR across all keywords.\n\
+\n\
+Output ONLY one of:\n\
+1. A raw JSON tool call (no prose, no markdown fences)\n\
+2. The single word: skip — only if the question is clearly about something that could not exist in past sessions";
+
+pub const WEB_CHECK_EXPLANATION: &str = r#"You are a web fact-check decision agent. Before the user receives an answer, decide if a web search is needed to verify a factual claim.
+
+Search when the user message:
+- Mentions a specific software version, release, or changelog (e.g. "Python 3.14", "Rust 2.0")
+- Asserts a date, news item, or world event that might post-date your training knowledge
+- Contains a claim that contradicts what is already in the memory graph
+- Asks about the current state of something that changes over time
+
+Skip when the message:
+- Is conversational, personal, or opinion-based
+- Is about something already verified in memory or timeless knowledge
+- Contains no verifiable factual claims
+
+Output ONLY one of:
+1. The single word: skip — if no web search is needed
+2. Raw JSON with 2–3 targeted queries (no prose, no markdown): {"tool": "search", "arguments": {"queries": ["exact version or claim", "latest stable release", "release candidate or upcoming"]}}
+
+Always provide separate queries for: the exact claim the user made, the current stable release, and any RC or upcoming release. This gives a complete picture and catches cases where the claimed version does not exist yet."#;
+
+pub const HISTORY_FOUND_PREFIX: &str = "\n\n[History lookup result]\n";
+pub const HISTORY_NOT_FOUND_PREFIX: &str = "\n\n[History search found no results for: ";
+pub const HISTORY_NOT_FOUND_SUFFIX: &str =
+    "]\nIf you cannot answer from your memory graph either, say explicitly that you checked your memory and searched past sessions for these keywords but found nothing.";
+
 pub const EXTRACT_EXPLANATION: &str = r#"You are an aggressive extraction agent for a memory graph. Extract every entity and relationship from the user message that is not yet in the graph.
 
 - Every named person, place, object, technology, or concept gets an entity node
@@ -125,15 +186,7 @@ pub fn build_agent_prompt(
 }
 
 pub fn build_chat_system_prompt(memory_toon: &str, recent_entries: &[RecentEntry]) -> String {
-    let mut prompt = String::from(
-        "You are a direct, honest assistant with your own epistemic standards. \
-You are not simply agreeable — you push back on wrong assumptions and refuse to build on a bad premise. \
-<web_context>, when present, contains verified current information and overrides both your training data and unverified user claims — treat it as ground truth. \
-When <web_context> or <memory> contradicts something the user stated: your entire response is one short correction and one yes/no question. No code. No examples. No elaboration. Stop after the question. Wait for confirmation before doing any work. \
-Use <memory> to recall what you know about the user. \
-Use <recent_context> for short-term continuity. \
-Never output graph data, JSON, edge lists, or memory update descriptions.",
-    );
+    let mut prompt = String::from(CHAT_SYSTEM_PROMPT);
     prompt.push_str("\nToday's date is ");
     prompt.push_str(&today_iso());
     prompt.push('.');
@@ -156,16 +209,7 @@ Never output graph data, JSON, edge lists, or memory update descriptions.",
 }
 
 pub fn build_history_lookup_prompt(user_msg: &str) -> String {
-    let mut prompt = String::from(
-        "You are a memory lookup agent. Decide whether to search past session history before the main model answers.\n\
-\n\
-Search aggressively: if there is any chance past sessions contain relevant information, search. Default to searching over skipping.\n\
-For search_history, provide 3–5 short keywords that cover different phrasings of the concept — the match is a substring OR across all keywords.\n\
-\n\
-Output ONLY one of:\n\
-1. A raw JSON tool call (no prose, no markdown fences)\n\
-2. The single word: skip — only if the question is clearly about something that could not exist in past sessions",
-    );
+    let mut prompt = String::from(HISTORY_LOOKUP_EXPLANATION);
     prompt.push_str("\nToday's date is ");
     prompt.push_str(&today_iso());
     prompt.push('.');
@@ -174,6 +218,21 @@ Output ONLY one of:\n\
     prompt.push_str("\n</tools>\n\nUser message: ");
     prompt.push_str(user_msg);
     prompt
+}
+
+pub fn build_web_check_prompt(user_msg: &str, memory_toon: &str) -> String {
+    let mut text = String::from(WEB_CHECK_EXPLANATION);
+    text.push_str("\nToday's date is ");
+    text.push_str(&today_iso());
+    text.push('.');
+    if !memory_toon.trim().is_empty() {
+        text.push_str("\n\n<memory>\n");
+        text.push_str(memory_toon);
+        text.push_str("\n</memory>");
+    }
+    text.push_str("\n\nUser message: ");
+    text.push_str(user_msg);
+    text
 }
 
 fn recent_role_label(recent_entry: &RecentEntry) -> &str {

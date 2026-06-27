@@ -1,5 +1,5 @@
 use crate::graph::{Edge, Graph};
-use crate::memory_prompt::today_iso;
+use crate::prompts::today_iso;
 
 const DECAY_DATE_PATH: &str = "kratt-data/last-decay.txt";
 

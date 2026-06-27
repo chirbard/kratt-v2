@@ -1,46 +1,12 @@
 use std::error::Error;
 
 use crate::api;
-use crate::memory_prompt::today_iso;
+use crate::prompts;
 
 const TAVILY_URL: &str = "https://api.tavily.com/search";
 
-const WEB_CHECK_EXPLANATION: &str = r#"You are a web fact-check decision agent. Before the user receives an answer, decide if a web search is needed to verify a factual claim.
-
-Search when the user message:
-- Mentions a specific software version, release, or changelog (e.g. "Python 3.14", "Rust 2.0")
-- Asserts a date, news item, or world event that might post-date your training knowledge
-- Contains a claim that contradicts what is already in the memory graph
-- Asks about the current state of something that changes over time
-
-Skip when the message:
-- Is conversational, personal, or opinion-based
-- Is about something already verified in memory or timeless knowledge
-- Contains no verifiable factual claims
-
-Output ONLY one of:
-1. The single word: skip — if no web search is needed
-2. Raw JSON with 2–3 targeted queries (no prose, no markdown): {"tool": "search", "arguments": {"queries": ["exact version or claim", "latest stable release", "release candidate or upcoming"]}}
-
-Always provide separate queries for: the exact claim the user made, the current stable release, and any RC or upcoming release. This gives a complete picture and catches cases where the claimed version does not exist yet."#;
-
-fn build_web_check_prompt(prompt: &str, memory_toon: &str) -> String {
-    let mut text = String::from(WEB_CHECK_EXPLANATION);
-    text.push_str("\nToday's date is ");
-    text.push_str(&today_iso());
-    text.push('.');
-    if !memory_toon.trim().is_empty() {
-        text.push_str("\n\n<memory>\n");
-        text.push_str(memory_toon);
-        text.push_str("\n</memory>");
-    }
-    text.push_str("\n\nUser message: ");
-    text.push_str(prompt);
-    text
-}
-
 pub fn decide_queries(api_key: &str, model: &str, prompt: &str, memory_toon: &str) -> Option<Vec<String>> {
-    let check_prompt = build_web_check_prompt(prompt, memory_toon);
+    let check_prompt = prompts::build_web_check_prompt(prompt, memory_toon);
     let response = api::collect(api_key, model, &check_prompt).ok()?;
     parse_search_queries(&response)
 }

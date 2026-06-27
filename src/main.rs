@@ -16,7 +16,7 @@ mod git;
 mod graph;
 mod history;
 mod memory_agent;
-mod memory_prompt;
+mod prompts;
 mod session;
 mod web_check;
 
@@ -40,25 +40,6 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
 const DEFAULT_MODEL: &str = "deepseek/deepseek-v4-flash";
-const HISTORY_LOOKUP_KEYWORDS: &[&str] = &[
-    "remember",
-    "earlier",
-    "last time",
-    "last session",
-    "you said",
-    "we said",
-    "previous",
-    "history",
-    "search",
-    "when did",
-    "what did you",
-    "what did i",
-    "what did we",
-    "do you recall",
-    "can you recall",
-    "did we",
-    "did i",
-];
 const RECENT_TURNS: usize = 2;
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -237,7 +218,7 @@ fn start_stream(app: &mut App) {
     app.state = State::Streaming;
     let (sender, recvr) = std::sync::mpsc::channel();
     app.stream_rx = Some(recvr);
-    let system = memory_prompt::build_chat_system_prompt(&app.memory_toon, &recent_entries);
+    let system = prompts::build_chat_system_prompt(&app.memory_toon, &recent_entries);
     let system_opt = if system.is_empty() {
         None
     } else {
@@ -300,7 +281,7 @@ fn maybe_augment_prompt_with_history(
     if !should_lookup_history(prompt) {
         return (prompt.to_string(), None);
     }
-    let lookup_prompt = memory_prompt::build_history_lookup_prompt(prompt);
+    let lookup_prompt = prompts::build_history_lookup_prompt(prompt);
     let lookup_response = match api::collect(api_key, model, &lookup_prompt) {
         Ok(lookup_response) => lookup_response,
         Err(_) => return (prompt.to_string(), None),
@@ -309,15 +290,15 @@ fn maybe_augment_prompt_with_history(
         HistoryResult::Skip => (prompt.to_string(), None),
         HistoryResult::Found(text, ui_desc) => {
             let mut augmented = prompt.to_string();
-            augmented.push_str("\n\n[History lookup result]\n");
+            augmented.push_str(prompts::HISTORY_FOUND_PREFIX);
             augmented.push_str(&text);
             (augmented, Some(ui_desc))
         }
         HistoryResult::NotFound(keywords, ui_desc) => {
             let mut augmented = prompt.to_string();
-            augmented.push_str("\n\n[History search found no results for: ");
+            augmented.push_str(prompts::HISTORY_NOT_FOUND_PREFIX);
             augmented.push_str(&keywords);
-            augmented.push_str("]\nIf you cannot answer from your memory graph either, say explicitly that you checked your memory and searched past sessions for these keywords but found nothing.");
+            augmented.push_str(prompts::HISTORY_NOT_FOUND_SUFFIX);
             (augmented, Some(ui_desc))
         }
     }
@@ -325,7 +306,7 @@ fn maybe_augment_prompt_with_history(
 
 fn should_lookup_history(prompt: &str) -> bool {
     let prompt_lower = prompt.to_ascii_lowercase();
-    for keyword in HISTORY_LOOKUP_KEYWORDS {
+    for keyword in prompts::HISTORY_LOOKUP_KEYWORDS {
         if prompt_lower.contains(keyword) {
             return true;
         }
