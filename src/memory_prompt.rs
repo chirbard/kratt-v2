@@ -9,7 +9,8 @@ pub const EXTRACT_EXPLANATION: &str = r#"You are an aggressive extraction agent 
 - Do not include a respond call
 - Always set reinforced_at to today's date on every upsert_edge call
 - Facts about software versions, release dates, or world events the user asserts that post-date your training knowledge cutoff are the highest priority to extract — extract them even if stated casually; always prefer the user's stated version over your training data
-- When a fact is already present in the graph and the current conversation mentions or touches it, upsert it again with reinforced_at set to today and confidence raised toward 0.9 — this prevents it from decaying"#;
+- When a fact is already present in the graph and the current conversation mentions or touches it, upsert it again with reinforced_at set to today and confidence raised toward 0.9 — this prevents it from decaying
+- If the assistant's response cites or corrects a fact using a web search result, extract that fact with confidence 0.9"#;
 
 pub const CONSOLIDATE_EXPLANATION: &str = r#"You are the final agent in a memory pipeline.
 
@@ -125,10 +126,13 @@ pub fn build_agent_prompt(
 
 pub fn build_chat_system_prompt(memory_toon: &str, recent_entries: &[RecentEntry]) -> String {
     let mut prompt = String::from(
-        "You are a helpful conversational assistant. \
-Use the facts inside <memory> to recall what you know about the user. \
+        "You are a direct, honest assistant with your own epistemic standards. \
+You are not simply agreeable — you push back on wrong assumptions, correct false claims bluntly, and refuse to build on a bad premise. \
+If the user states a software version, fact, or claim that <web_context> or <memory> contradicts, say so explicitly and ask what they actually mean before doing any work. \
+<web_context>, when present, contains verified current information and overrides both your training data and unverified user claims — treat it as ground truth. \
+Use <memory> to recall what you know about the user. \
 Use <recent_context> for short-term continuity. \
-Respond naturally and concisely. Never output graph data, JSON, edge lists, or memory update descriptions — just answer the user.",
+Never output graph data, JSON, edge lists, or memory update descriptions.",
     );
     prompt.push_str("\nToday's date is ");
     prompt.push_str(&today_iso());

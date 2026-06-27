@@ -18,10 +18,11 @@ mod history;
 mod memory_agent;
 mod memory_prompt;
 mod session;
+mod web_check;
 
 use std::io::Stdout;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use api::{Chunk, Stats};
@@ -111,10 +112,16 @@ struct App {
     show_tools: bool,
     session_path: PathBuf,
     memory_toon: String,
+    tavily_key: String,
 }
 
 impl App {
-    fn new(api_key: String, memory_toon: String, session_path: PathBuf) -> Self {
+    fn new(
+        api_key: String,
+        memory_toon: String,
+        session_path: PathBuf,
+        tavily_key: String,
+    ) -> Self {
         Self {
             api_key,
             input: String::new(),
@@ -135,11 +142,23 @@ impl App {
             show_tools: false,
             session_path,
             memory_toon,
+            tavily_key,
         }
     }
 }
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
+
+struct StreamJob {
+    key: String,
+    model: String,
+    prompt: String,
+    session_path: PathBuf,
+    memory_toon: String,
+    tavily_key: String,
+    system_opt: Option<String>,
+    sender: Sender<Chunk>,
+}
 
 #[allow(clippy::disallowed_methods)]
 fn tui_enter(stdout: &mut Stdout) -> std::io::Result<()> {
@@ -154,6 +173,7 @@ fn tui_exit(terminal: &mut Term) -> std::io::Result<()> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv()?;
     let api_key = std::env::var("OPENROUTER_API_KEY")?;
+    let tavily_key = std::env::var("TAVILY_API_KEY").unwrap_or_default();
     let graph = graph::load_graph();
     let memory_toon = toon::encode(&graph::graph_to_json(&graph), None);
     let session_path = session::new_session_path();
@@ -165,7 +185,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tui_enter(&mut stdout)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let result = run(&mut terminal, api_key, memory_toon, session_path);
+    let result = run(&mut terminal, api_key, memory_toon, session_path, tavily_key);
     disable_raw_mode()?;
     tui_exit(&mut terminal)?;
     terminal.show_cursor()?;
@@ -177,8 +197,9 @@ fn run(
     api_key: String,
     memory_toon: String,
     session_path: PathBuf,
+    tavily_key: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut app = App::new(api_key, memory_toon, session_path);
+    let mut app = App::new(api_key, memory_toon, session_path, tavily_key);
     loop {
         if event::poll(Duration::from_millis(16))?
             && let Event::Key(key) = event::read()?
@@ -222,17 +243,46 @@ fn start_stream(app: &mut App) {
     } else {
         Some(system)
     };
-    let key = app.api_key.clone();
-    let model = DEFAULT_MODEL.to_string();
-    let session_path = app.session_path.clone();
-    std::thread::spawn(move || {
-        let (stream_prompt, tool_desc) =
-            maybe_augment_prompt_with_history(&key, &model, &prompt, &session_path);
-        if let Some(desc) = tool_desc {
-            let _ = sender.send(Chunk::ToolCall(desc));
-        }
-        api::stream(key, model, stream_prompt, system_opt, sender);
+    spawn_stream_worker(StreamJob {
+        key: app.api_key.clone(),
+        model: DEFAULT_MODEL.to_string(),
+        prompt,
+        session_path: app.session_path.clone(),
+        memory_toon: app.memory_toon.clone(),
+        tavily_key: app.tavily_key.clone(),
+        system_opt,
+        sender,
     });
+}
+
+fn spawn_stream_worker(job: StreamJob) {
+    std::thread::spawn(move || run_stream_worker(job));
+}
+
+fn run_stream_worker(job: StreamJob) {
+    let mut system_opt = job.system_opt;
+    let (stream_prompt, tool_desc) =
+        maybe_augment_prompt_with_history(&job.key, &job.model, &job.prompt, &job.session_path);
+    if let Some(desc) = tool_desc {
+        let _ = job.sender.send(Chunk::ToolCall(desc));
+    }
+    if let Some(queries) =
+        web_check::decide_queries(&job.key, &job.model, &stream_prompt, &job.memory_toon)
+    {
+        let display = queries.join(" | ");
+        let _ = job
+            .sender
+            .send(Chunk::ToolCall(format!("checking web: {display}…")));
+        if let Some(context) = web_check::execute_searches(&job.tavily_key, &queries) {
+            if let Some(ref mut sys) = system_opt {
+                sys.push_str("\n\n<web_context>\n");
+                sys.push_str(&context);
+                sys.push_str("\n</web_context>");
+            }
+            let _ = job.sender.send(Chunk::ToolCall(format!("web: {display}")));
+        }
+    }
+    api::stream(job.key, job.model, stream_prompt, system_opt, job.sender);
 }
 
 enum HistoryResult {
@@ -582,8 +632,13 @@ fn push_assistant_lines(
     let show_spinner = is_streaming && msg.content.is_empty() && !reasoning_visible;
     if show_spinner {
         let frame = SPINNER[((app.tick / 4) as usize) % SPINNER.len()];
+        let status = if msg.tool_call.is_empty() {
+            "waiting…"
+        } else {
+            msg.tool_call.as_str()
+        };
         lines.push(Line::from(Span::styled(
-            format!("{frame} waiting..."),
+            format!("{frame} {status}"),
             Style::default().fg(Color::DarkGray),
         )));
         return;
