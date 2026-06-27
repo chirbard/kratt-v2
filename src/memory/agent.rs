@@ -1,13 +1,14 @@
 use std::error::Error;
+use std::sync::Arc;
 
-use crate::api;
-use crate::decay;
-use crate::git;
-use crate::graph::{
+use crate::api::LlmClient;
+use crate::prompts::{CONSOLIDATE_EXPLANATION, EXTRACT_EXPLANATION, build_agent_prompt};
+use super::decay;
+use super::git;
+use super::graph::{
     Edge, Graph, Node, delete_node, graph_to_json, insert_edge, load_graph, normalize_id,
     remove_edges, save_graph,
 };
-use crate::prompts::{CONSOLIDATE_EXPLANATION, EXTRACT_EXPLANATION, build_agent_prompt};
 
 pub enum MemoryEvent {
     Log { phase: &'static str, text: String },
@@ -15,8 +16,7 @@ pub enum MemoryEvent {
 }
 
 struct AgentRun<'run> {
-    api_key: &'run str,
-    model: &'run str,
+    llm: &'run dyn LlmClient,
     user_msg: &'run str,
     assistant_msg: &'run str,
     session_label: &'run str,
@@ -49,18 +49,15 @@ enum ToolCall {
     },
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn run_memory_agent(
-    api_key: &str,
-    model: &str,
+    llm: Arc<dyn LlmClient>,
     user_msg: &str,
     assistant_msg: &str,
     session_label: String,
     sender: std::sync::mpsc::Sender<MemoryEvent>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let agent_run = AgentRun {
-        api_key,
-        model,
+        llm: llm.as_ref(),
         user_msg,
         assistant_msg,
         session_label: &session_label,
@@ -80,12 +77,7 @@ impl<'run> AgentRun<'run> {
         self.run_pass(&mut graph, &toon_text, "extract", EXTRACT_EXPLANATION)?;
 
         toon_text = toon::encode(&graph_to_json(&graph), None);
-        self.run_pass(
-            &mut graph,
-            &toon_text,
-            "consolidate",
-            CONSOLIDATE_EXPLANATION,
-        )?;
+        self.run_pass(&mut graph, &toon_text, "consolidate", CONSOLIDATE_EXPLANATION)?;
 
         if let Err(err) = save_graph(&graph) {
             self.send_log("memory", format!("error: {err}"));
@@ -115,7 +107,7 @@ impl<'run> AgentRun<'run> {
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.send_log(phase, "calling LLM…".to_string());
         let prompt = build_agent_prompt(explanation, toon_text, self.user_msg, self.assistant_msg);
-        let call_text = match api::collect(self.api_key, self.model, &prompt) {
+        let call_text = match self.llm.collect(&prompt) {
             Ok(call_text) => call_text,
             Err(err) => {
                 self.send_log(phase, format!("error: {err}"));

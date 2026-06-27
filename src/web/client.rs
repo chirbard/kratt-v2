@@ -1,49 +1,37 @@
 use std::error::Error;
 
-use crate::api;
-use crate::prompts;
+use super::SearchClient;
 
 const TAVILY_URL: &str = "https://api.tavily.com/search";
 
-pub fn decide_queries(api_key: &str, model: &str, prompt: &str, memory_toon: &str) -> Option<Vec<String>> {
-    let check_prompt = prompts::build_web_check_prompt(prompt, memory_toon);
-    let response = api::collect(api_key, model, &check_prompt).ok()?;
-    parse_search_queries(&response)
+pub(super) struct TavilyClient {
+    api_key: String,
 }
 
-fn parse_search_queries(response: &str) -> Option<Vec<String>> {
-    let trimmed = response.trim();
-    if trimmed == "skip" {
-        return None;
+impl TavilyClient {
+    pub(super) fn new(api_key: String) -> Self {
+        Self { api_key }
     }
-    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
-    let tool = value.get("tool")?.as_str()?;
-    if tool != "search" {
-        return None;
-    }
-    let args = value.get("arguments")?;
-    let arr = args.get("queries")?.as_array()?;
-    let mut queries = Vec::new();
-    for item in arr {
-        let Some(query) = item.as_str() else { continue; };
-        let query = query.trim();
-        if !query.is_empty() {
-            queries.push(query.to_string());
-        }
-    }
-    if queries.is_empty() { None } else { Some(queries) }
 }
 
-pub fn execute_searches(tavily_key: &str, queries: &[String]) -> Option<String> {
-    let mut parts: Vec<String> = Vec::new();
-    for query in queries {
-        let Ok(value) = tavily_post(tavily_key, query) else { continue; };
-        let section = format_search_section(query, &value);
-        if !section.is_empty() {
-            parts.push(section);
+impl SearchClient for TavilyClient {
+    fn search_many(&self, queries: &[String]) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        for query in queries {
+            let Ok(value) = tavily_post(&self.api_key, query) else {
+                continue;
+            };
+            let section = format_search_section(query, &value);
+            if !section.is_empty() {
+                parts.push(section);
+            }
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("\n\n"))
         }
     }
-    if parts.is_empty() { None } else { Some(parts.join("\n\n")) }
 }
 
 fn format_search_section(query: &str, value: &serde_json::Value) -> String {
@@ -55,11 +43,11 @@ fn format_search_section(query: &str, value: &serde_json::Value) -> String {
 }
 
 fn tavily_post(
-    tavily_key: &str,
+    api_key: &str,
     query: &str,
 ) -> Result<serde_json::Value, Box<dyn Error + Send + Sync>> {
     let body = serde_json::json!({
-        "api_key": tavily_key,
+        "api_key": api_key,
         "query": query,
         "search_depth": "basic",
         "max_results": 3,

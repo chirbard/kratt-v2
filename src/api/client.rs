@@ -1,4 +1,3 @@
-use std::error::Error;
 use std::io::{BufRead, BufReader};
 use std::sync::mpsc::{Sender, channel};
 use std::time::Instant;
@@ -7,22 +6,9 @@ use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::json;
 
+use super::{Chunk, LlmClient, Stats};
+
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
-
-pub struct Stats {
-    pub tokens_in: u32,
-    pub tokens_out: u32,
-    pub cost_usd: Option<f64>,
-    pub ttft_ms: u128,
-}
-
-pub enum Chunk {
-    Reasoning(String),
-    Content(String),
-    ToolCall(String),
-    Done(Stats),
-    Err(String),
-}
 
 #[derive(Deserialize)]
 struct Delta {
@@ -54,6 +40,75 @@ struct StreamState {
     tokens_in: u32,
     tokens_out: u32,
     cost_usd: Option<f64>,
+}
+
+pub(super) struct OpenRouterClient {
+    api_key: String,
+    model: String,
+}
+
+impl OpenRouterClient {
+    pub(super) fn new(api_key: String, model: String) -> Self {
+        Self { api_key, model }
+    }
+}
+
+impl LlmClient for OpenRouterClient {
+    fn collect(&self, prompt: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let (sender, receiver) = channel::<Chunk>();
+        self.stream(prompt.to_string(), None, sender);
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        loop {
+            match receiver.recv() {
+                Ok(Chunk::Content(text)) => content.push_str(&text),
+                Ok(Chunk::Reasoning(text)) => reasoning.push_str(&text),
+                Ok(Chunk::ToolCall(_)) => {}
+                Ok(Chunk::Done(_)) => break,
+                Ok(Chunk::Err(err)) => return Err(err.into()),
+                Err(err) => return Err(err.into()),
+            }
+        }
+        if !content.is_empty() {
+            return Ok(content);
+        }
+        Ok(reasoning)
+    }
+
+    fn stream(&self, prompt: String, system: Option<String>, sender: Sender<Chunk>) {
+        let resp = match make_request(&self.api_key, &self.model, &prompt, system.as_deref()) {
+            Ok(resp) => resp,
+            Err(err) => {
+                let _ = sender.send(Chunk::Err(err));
+                return;
+            }
+        };
+        let mut state = StreamState {
+            start: Instant::now(),
+            ttft: None,
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: None,
+        };
+        let reader = BufReader::new(resp);
+        for line_result in reader.lines() {
+            let line = match line_result {
+                Ok(line) => line,
+                Err(err) => {
+                    let _ = sender.send(Chunk::Err(err.to_string()));
+                    return;
+                }
+            };
+            let data = match line.strip_prefix("data: ") {
+                Some(data) => data,
+                None => continue,
+            };
+            if process_line(data, &mut state, &sender) {
+                break;
+            }
+        }
+        send_done(state, &sender);
+    }
 }
 
 fn make_request(
@@ -153,76 +208,4 @@ fn send_done(state: StreamState, sender: &Sender<Chunk>) {
         cost_usd: state.cost_usd,
         ttft_ms: state.ttft.unwrap_or(0),
     }));
-}
-
-pub fn collect(
-    api_key: &str,
-    model: &str,
-    prompt: &str,
-) -> Result<String, Box<dyn Error + Send + Sync>> {
-    let (sender, receiver) = channel::<Chunk>();
-    stream(
-        api_key.to_string(),
-        model.to_string(),
-        prompt.to_string(),
-        None,
-        sender,
-    );
-    let mut content = String::new();
-    let mut reasoning = String::new();
-    loop {
-        match receiver.recv() {
-            Ok(Chunk::Content(text)) => content.push_str(&text),
-            Ok(Chunk::Reasoning(text)) => reasoning.push_str(&text),
-            Ok(Chunk::ToolCall(_)) => {}
-            Ok(Chunk::Done(_)) => break,
-            Ok(Chunk::Err(err)) => return Err(err.into()),
-            Err(err) => return Err(err.into()),
-        }
-    }
-    if !content.is_empty() {
-        return Ok(content);
-    }
-    Ok(reasoning)
-}
-
-pub fn stream(
-    api_key: String,
-    model: String,
-    prompt: String,
-    system: Option<String>,
-    sender: Sender<Chunk>,
-) {
-    let resp = match make_request(&api_key, &model, &prompt, system.as_deref()) {
-        Ok(resp) => resp,
-        Err(err) => {
-            let _ = sender.send(Chunk::Err(err));
-            return;
-        }
-    };
-    let mut state = StreamState {
-        start: Instant::now(),
-        ttft: None,
-        tokens_in: 0,
-        tokens_out: 0,
-        cost_usd: None,
-    };
-    let reader = BufReader::new(resp);
-    for line_result in reader.lines() {
-        let line = match line_result {
-            Ok(line) => line,
-            Err(err) => {
-                let _ = sender.send(Chunk::Err(err.to_string()));
-                return;
-            }
-        };
-        let data = match line.strip_prefix("data: ") {
-            Some(data) => data,
-            None => continue,
-        };
-        if process_line(data, &mut state, &sender) {
-            break;
-        }
-    }
-    send_done(state, &sender);
 }
