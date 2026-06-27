@@ -39,7 +39,7 @@ enum ToolCall {
         confidence: f64,
         importance: f64,
         subject: bool,
-        reinforced_at: String,
+        date: String,
     },
     DeleteNode {
         name: String,
@@ -217,12 +217,15 @@ fn strip_markdown_fences(text: &str) -> &str {
 
 fn parse_single_tool(obj: &serde_json::Value) -> Option<ToolCall> {
     let tool_name = obj.get("tool")?.as_str()?;
-    let arguments = obj.get("arguments")?;
+    let args = match obj.get("args") {
+        Some(val) => val,
+        None => obj.get("arguments")?,
+    };
     match tool_name {
-        "upsert_node" => parse_upsert_node(arguments),
-        "upsert_edge" => parse_upsert_edge(arguments),
-        "delete_node" => parse_delete_node(arguments),
-        "delete_edge" => parse_delete_edge(arguments),
+        "upsert_node" => parse_upsert_node(args),
+        "upsert_edge" => parse_upsert_edge(args),
+        "delete_node" => parse_delete_node(args),
+        "delete_edge" => parse_delete_edge(args),
         _ => None,
     }
 }
@@ -232,49 +235,57 @@ fn tool_array(obj: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
     tools.as_array()
 }
 
-fn parse_upsert_node(arguments: &serde_json::Value) -> Option<ToolCall> {
-    let name = json_str(arguments, "name");
-    let node_type = json_str(arguments, "type");
+fn parse_upsert_node(args: &serde_json::Value) -> Option<ToolCall> {
+    let name = json_str(args, "name");
+    let node_type = json_str(args, "type");
     if name.is_empty() || node_type.is_empty() {
         return None;
     }
     Some(ToolCall::UpsertNode {
         name,
         node_type,
-        body: json_str(arguments, "body"),
-        date: json_str(arguments, "date"),
+        body: json_str(args, "body"),
+        date: json_str(args, "date"),
     })
 }
 
-fn parse_upsert_edge(arguments: &serde_json::Value) -> Option<ToolCall> {
-    let source = json_str(arguments, "source");
-    let target = json_str(arguments, "target");
+fn parse_upsert_edge(args: &serde_json::Value) -> Option<ToolCall> {
+    let source = json_str(args, "source");
+    let target = json_str(args, "target");
     if source.is_empty() || target.is_empty() {
         return None;
     }
+    let date = {
+        let date_val = json_str(args, "date");
+        if date_val.is_empty() {
+            json_str(args, "reinforced_at")
+        } else {
+            date_val
+        }
+    };
     Some(ToolCall::UpsertEdge {
         source,
         target,
-        content: json_str(arguments, "content"),
-        stability: json_f64(arguments, "stability"),
-        confidence: json_f64(arguments, "confidence"),
-        importance: json_f64(arguments, "importance"),
-        subject: json_bool(arguments, "subject"),
-        reinforced_at: json_str(arguments, "reinforced_at"),
+        content: json_str(args, "content"),
+        stability: json_f64(args, "stability"),
+        confidence: json_f64(args, "confidence"),
+        importance: json_f64(args, "importance"),
+        subject: json_bool(args, "subject"),
+        date,
     })
 }
 
-fn parse_delete_node(arguments: &serde_json::Value) -> Option<ToolCall> {
-    let name = json_str(arguments, "name");
+fn parse_delete_node(args: &serde_json::Value) -> Option<ToolCall> {
+    let name = json_str(args, "name");
     if name.is_empty() {
         return None;
     }
     Some(ToolCall::DeleteNode { name })
 }
 
-fn parse_delete_edge(arguments: &serde_json::Value) -> Option<ToolCall> {
-    let source = json_str(arguments, "source");
-    let target = json_str(arguments, "target");
+fn parse_delete_edge(args: &serde_json::Value) -> Option<ToolCall> {
+    let source = json_str(args, "source");
+    let target = json_str(args, "target");
     if source.is_empty() || target.is_empty() {
         return None;
     }
@@ -321,7 +332,7 @@ fn apply_tool(call: ToolCall, graph: &mut Graph) -> String {
             confidence,
             importance,
             subject,
-            reinforced_at,
+            date,
         } => {
             let edge = Edge {
                 source: normalize_id(&source),
@@ -331,7 +342,7 @@ fn apply_tool(call: ToolCall, graph: &mut Graph) -> String {
                 confidence,
                 importance,
                 subject,
-                reinforced_at,
+                date,
             };
             apply_upsert_edge(graph, source, target, edge)
         }

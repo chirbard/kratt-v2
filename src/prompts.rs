@@ -45,7 +45,7 @@ Skip when: conversational, personal, or opinion-based; about timeless knowledge 
 
 Output ONLY one of:
 1. The word: skip
-2. Raw JSON with 2–3 targeted queries (no prose, no markdown): {"tool": "search", "arguments": {"queries": ["exact claim", "current stable release", "RC or upcoming"]}}
+2. Raw JSON with 2–3 targeted queries (no prose, no markdown): {"tool":"search","args":{"queries":["exact claim","current stable release","RC or upcoming"]}}
 
 Always provide separate queries for the exact claim, the current stable release, and any RC/upcoming release."#;
 
@@ -60,9 +60,9 @@ pub const EXTRACT_EXPLANATION: &str = r#"You are an aggressive extraction agent 
 - Structural relationships (is-a, speaks, works-at, is a type of): direct edges between entity nodes
 - Events, actions, observations (moved, left, sold, likes, hates): create a fact node (one-sentence body, date if known), subject edge from fact to primary entity (subject=true, importance=1.0), and edge from source entity to the fact node
 - When uncertain, add it anyway — over-extraction is corrected in consolidation
-- No respond call; always set reinforced_at to today on every upsert_edge
+- No respond call; always set date=today on every upsert_edge
 - Post-training facts (software versions, release dates, world events) are highest priority — prefer user's stated version over training data; extract even if stated casually
-- If a fact is already in the graph and the conversation touches it, upsert with reinforced_at=today and confidence raised toward 0.9
+- If a fact is already in the graph and the conversation touches it, upsert with date=today and confidence raised toward 0.9
 - If the assistant cites or corrects a fact from a web result, extract with confidence 0.9"#;
 
 pub const CONSOLIDATE_EXPLANATION: &str = r#"You are the final agent in a memory pipeline.
@@ -73,14 +73,14 @@ Update the graph:
 - Add missing taxonomy links so every named concept chains to its category
 - Normalise edge content: reword novel-phrasing edges to match an existing template when one fits
 - Add relationships clearly implied by two or more existing edges
-- On every kept or merged edge, emit upsert_edge with reinforced_at=today to reset its decay clock"#;
+- On every kept or merged edge, emit upsert_edge with date=today to reset its decay clock"#;
 
 pub const TOOL_DEFINITIONS: &str = r#"TOOLS
 
 upsert_node — create or update a node.
 - type "entity": body="" date="" always
 - type "fact": body is one atomic sentence, no period; date YYYY-MM-DD when event occurred, empty if unknown
-{"tool": "upsert_node", "arguments": {"name": "kebab-case-string", "type": "entity | fact", "body": "", "date": ""}}
+{"tool":"upsert_node","args":{"name":"kebab-case-string","type":"entity | fact","body":"","date":""}}
 
 upsert_edge — create or update a directed edge.
 - content: "<subject> verb <target>" or "<subject> verb <fact>"; "implies" for fact→fact; empty when subject=true
@@ -88,14 +88,14 @@ upsert_edge — create or update a directed edge.
 - confidence: 1.0 stated clearly, 0.7 once, 0.4 inferred, 0.1 uncertain
 - importance: 1.0 must load with source, 0.0 supplementary
 - subject: true only on fact nodes; set importance=1.0
-- reinforced_at: always today's date
-{"tool": "upsert_edge", "arguments": {"source": "string", "target": "string", "content": "string", "stability": 0.0, "confidence": 0.0, "importance": 0.0, "subject": false, "reinforced_at": "YYYY-MM-DD"}}
+- date: always today's date
+{"tool":"upsert_edge","args":{"source":"string","target":"string","content":"string","stability":0.0,"confidence":0.0,"importance":0.0,"subject":false,"date":"YYYY-MM-DD"}}
 
 delete_node — remove a node.
-{"tool": "delete_node", "arguments": {"name": "string"}}
+{"tool":"delete_node","args":{"name":"string"}}
 
 delete_edge — remove a directed edge.
-{"tool": "delete_edge", "arguments": {"source": "string", "target": "string"}}"#;
+{"tool":"delete_edge","args":{"source":"string","target":"string"}}"#;
 
 pub const MEMORY_RULES: &str = r#"Node types: entity (person, place, technology, named concept; body and date always empty) or fact (one atomic claim; body is one sentence, no period; date YYYY-MM-DD when event occurred, empty if unknown; use today for current events; resolve relative dates to YYYY-MM-DD).
 
@@ -119,15 +119,15 @@ Taxonomy links must chain through every category level so unrelated nodes can co
 
 pub const JSON_OUTPUT_RULES: &str = r#"Respond with raw JSON only. No markdown. No prose. No code fences. Start with `{`.
 
-Single call: {"tool": "upsert_node", "arguments": {"name": "example", "type": "entity", "body": "", "date": ""}}
-Multiple calls: {"tools": [{"tool": "upsert_node", "arguments": {"name": "example", "type": "entity", "body": "", "date": ""}}, {"tool": "upsert_edge", "arguments": {"source": "a", "target": "b", "content": "<subject> verb <target>", "stability": 1.0, "confidence": 1.0, "importance": 0.0, "subject": false, "reinforced_at": "YYYY-MM-DD"}}]}"#;
+Single call: {"tool":"upsert_node","args":{"name":"example","type":"entity","body":"","date":""}}
+Multiple calls: {"tools":[{"tool":"upsert_node","args":{"name":"example","type":"entity","body":"","date":""}},{"tool":"upsert_edge","args":{"source":"a","target":"b","content":"<subject> verb <target>","stability":1.0,"confidence":1.0,"importance":0.0,"subject":false,"date":"YYYY-MM-DD"}}]}"#;
 
 pub const HISTORY_TOOL_DEFINITIONS: &str = r#"read_history — returns a specific past turn from the current session.
-{"tool": "read_history", "arguments": {"offset": 0}}
+{"tool":"read_history","args":{"offset":0}}
 offset: 0 = most recent turn, 1 = one before that, etc.
 
 search_history — substring search (OR) across all past sessions. Multiple short keywords cast a wider net.
-{"tool": "search_history", "arguments": {"queries": ["keyword1", "keyword2", "keyword3"]}}
+{"tool":"search_history","args":{"queries":["keyword1","keyword2","keyword3"]}}
 Returns up to 5 matching lines with timestamps."#;
 
 pub fn build_agent_prompt(

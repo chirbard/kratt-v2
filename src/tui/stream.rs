@@ -144,9 +144,12 @@ fn parse_history_response(response: &str, session_path: &Path) -> HistoryResult 
         Some(name) => name,
         None => return HistoryResult::Skip,
     };
-    let arguments = match call_value.get("arguments") {
-        Some(args) => args,
-        None => return HistoryResult::Skip,
+    let arguments = match call_value.get("args") {
+        Some(val) => val,
+        None => match call_value.get("arguments") {
+            Some(val) => val,
+            None => return HistoryResult::Skip,
+        },
     };
     match tool_name {
         "read_history" => execute_read_history(arguments, session_path),

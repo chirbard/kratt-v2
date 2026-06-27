@@ -17,7 +17,10 @@ fn parse_search_queries(response: &str) -> Option<Vec<String>> {
     if tool != "search" {
         return None;
     }
-    let args = value.get("arguments")?;
+    let args = match value.get("args") {
+        Some(val) => val,
+        None => value.get("arguments")?,
+    };
     let arr = args.get("queries")?.as_array()?;
     let mut queries = Vec::new();
     for item in arr {

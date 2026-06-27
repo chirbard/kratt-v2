@@ -22,10 +22,10 @@ fn last_decay_date() -> String {
 }
 
 fn decay_edge(edge: &mut Edge, today: &str) {
-    if edge.stability >= 1.0 || edge.reinforced_at.is_empty() {
+    if edge.stability >= 1.0 || edge.date.is_empty() {
         return;
     }
-    let days = days_between(&edge.reinforced_at, today);
+    let days = days_between(&edge.date, today);
     if days <= 0 {
         return;
     }
