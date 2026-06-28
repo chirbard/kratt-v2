@@ -12,4 +12,4 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 toon = "0.1"
-turso = "0.4"
+turso = "0.6.1"
