@@ -23,7 +23,7 @@ struct AgentRun<'run> {
     user_message_id: &'run str,
 }
 
-enum ToolCall {
+pub(super) enum ToolCall {
     UpsertNode {
         name: String,
         node_type: String,
@@ -73,9 +73,7 @@ impl<'run> AgentRun<'run> {
         let conn = db::open_connection()?;
         let mut graph = db::load_graph();
         let decay_ran = decay::apply_decay_if_needed(&mut graph);
-        if decay_ran
-            && let Err(err) = db::save_graph(&graph)
-        {
+        if decay_ran && let Err(err) = db::save_graph(&graph) {
             self.send_log("memory", format!("error: {err}"));
             return Err(err);
         }
@@ -156,7 +154,7 @@ impl<'run> AgentRun<'run> {
     }
 }
 
-fn stream_collect(
+pub(super) fn stream_collect(
     llm: Arc<dyn LlmClient>,
     prompt: String,
     on_reasoning: impl Fn(String),
@@ -194,7 +192,7 @@ fn stream_collect(
     Ok(reasoning_full)
 }
 
-fn parse_tool_calls(text: &str) -> Vec<ToolCall> {
+pub(super) fn parse_tool_calls(text: &str) -> Vec<ToolCall> {
     let stripped = strip_markdown_fences(text);
     let Ok(json_value) = serde_json::from_str::<serde_json::Value>(stripped) else {
         return Vec::new();

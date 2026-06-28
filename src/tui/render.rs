@@ -2,9 +2,11 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+};
 
-use super::app::{App, MemoryState, Message, Mode, Role, State};
+use super::app::{App, DreamState, MemoryState, Message, Mode, Role, State};
 
 pub(crate) const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -71,6 +73,27 @@ fn build_memory_text(app: &App) -> Text<'static> {
             Span::styled(label, Style::default().fg(phase_color(phase))),
             Span::raw(text.clone()),
         ]));
+    }
+    if !app.dream_log.is_empty() {
+        if !app.memory_log.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "── dream ──".to_string(),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        for (phase, text) in &app.dream_log {
+            if phase == "think" && !app.show_reasoning {
+                continue;
+            }
+            if phase == "debug" && !app.show_debug {
+                continue;
+            }
+            let label = format!("[{phase}] ");
+            lines.push(Line::from(vec![
+                Span::styled(label, Style::default().fg(phase_color(phase))),
+                Span::raw(text.clone()),
+            ]));
+        }
     }
     Text::from(lines)
 }
@@ -168,6 +191,18 @@ fn render_stats(frame: &mut Frame, area: Rect, app: &App) {
         }
         text.push_str(&format!("mem {spinner}"));
     }
+    if app.dream_state == DreamState::Running {
+        let spinner = SPINNER[((app.tick / 6) as usize) % SPINNER.len()];
+        if !text.is_empty() {
+            text.push_str("  ");
+        }
+        text.push_str(&format!("dream {spinner}"));
+    } else if app.dream_state == DreamState::Done && !app.dream_summary.is_empty() {
+        if !text.is_empty() {
+            text.push_str("  ");
+        }
+        text.push_str(&app.dream_summary);
+    }
     let widget = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(widget, area);
 }
@@ -196,7 +231,12 @@ fn render_mode(frame: &mut Frame, area: Rect, app: &App) {
             } else {
                 "[t] tools"
             };
-            format!("-- NORMAL --  {mem_hint}  {rea_hint}  {dbg_hint}  {tool_hint}")
+            let dream_hint = match app.dream_state {
+                DreamState::Idle => "[D] dream",
+                DreamState::Running => "[D] dreaming…",
+                DreamState::Done => "[D] dream ✓",
+            };
+            format!("-- NORMAL --  {mem_hint}  {rea_hint}  {dbg_hint}  {tool_hint}  {dream_hint}")
         }
     };
     let widget = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
@@ -255,7 +295,9 @@ fn push_reasoning_lines(lines: &mut Vec<Line>, reasoning: &str) {
 fn push_assistant_lines(lines: &mut Vec<Line>, msg: &Message, is_streaming: bool, app: &App) {
     lines.push(Line::from(Span::styled(
         "kratt",
-        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
     )));
     if app.show_tools && !msg.tool_call.is_empty() {
         push_tool_line(lines, &msg.tool_call);
@@ -304,6 +346,12 @@ fn phase_color(phase: &str) -> Color {
         "extract" => Color::Cyan,
         "consolidate" => Color::Yellow,
         "memory" => Color::Green,
+        "biologist" | "historian" | "economist" | "child" => Color::Blue,
+        "connector" => Color::Cyan,
+        "skeptic" => Color::Red,
+        "lateral" => Color::Magenta,
+        "consolidation" => Color::Yellow,
+        "dream" => Color::Green,
         "think" => Color::Magenta,
         "debug" => Color::DarkGray,
         _ => Color::White,

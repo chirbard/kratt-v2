@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::api::{Chunk, LlmClient, Stats};
-use crate::memory::{self, MemoryEvent};
+use crate::memory::{self, DreamEvent, MemoryEvent};
 use crate::session;
 use crate::web::SearchClient;
 
@@ -24,6 +24,13 @@ pub(crate) enum State {
 pub(crate) enum MemoryState {
     Idle,
     Updating,
+}
+
+#[derive(PartialEq)]
+pub(crate) enum DreamState {
+    Idle,
+    Running,
+    Done,
 }
 
 pub(crate) enum Role {
@@ -63,6 +70,10 @@ pub(crate) struct App {
     pub(crate) session_path: PathBuf,
     pub(crate) memory_toon: String,
     pub(crate) last_user_message_id: String,
+    pub(crate) dream_state: DreamState,
+    pub(crate) dream_rx: Option<std::sync::mpsc::Receiver<DreamEvent>>,
+    pub(crate) dream_log: Vec<(String, String)>,
+    pub(crate) dream_summary: String,
 }
 
 impl App {
@@ -98,6 +109,10 @@ impl App {
             session_path,
             memory_toon,
             last_user_message_id: String::new(),
+            dream_state: DreamState::Idle,
+            dream_rx: None,
+            dream_log: Vec::new(),
+            dream_summary: String::new(),
         }
     }
 }
@@ -152,12 +167,10 @@ pub(crate) fn drain_memory(app: &mut App) {
             Ok(MemoryEvent::Log { phase, text }) => {
                 app.memory_log.push((phase.to_string(), text));
             }
-            Ok(MemoryEvent::Append { phase, text }) => {
-                match app.memory_log.last_mut() {
-                    Some(last) if last.0 == phase => last.1.push_str(&text),
-                    _ => app.memory_log.push((phase.to_string(), text)),
-                }
-            }
+            Ok(MemoryEvent::Append { phase, text }) => match app.memory_log.last_mut() {
+                Some(last) if last.0 == phase => last.1.push_str(&text),
+                _ => app.memory_log.push((phase.to_string(), text)),
+            },
             Ok(MemoryEvent::Done) => {
                 let graph = memory::load_graph();
                 app.memory_toon = toon::encode(&memory::graph_to_json(&graph), None);
@@ -170,6 +183,39 @@ pub(crate) fn drain_memory(app: &mut App) {
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 app.memory_state = MemoryState::Idle;
+                return;
+            }
+        }
+    }
+}
+
+pub(crate) fn drain_dream(app: &mut App) {
+    let dream_receiver = match app.dream_rx.take() {
+        Some(dream_receiver) => dream_receiver,
+        None => return,
+    };
+    loop {
+        match dream_receiver.try_recv() {
+            Ok(DreamEvent::Log { phase, text }) => {
+                app.dream_log.push((phase.to_string(), text));
+            }
+            Ok(DreamEvent::Append { phase, text }) => match app.dream_log.last_mut() {
+                Some(last) if last.0 == phase => last.1.push_str(&text),
+                _ => app.dream_log.push((phase.to_string(), text)),
+            },
+            Ok(DreamEvent::Done { edges_added }) => {
+                app.dream_summary = format!("dream done — {edges_added} edges written");
+                app.dream_state = DreamState::Done;
+                let graph = memory::load_graph();
+                app.memory_toon = toon::encode(&memory::graph_to_json(&graph), None);
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                app.dream_rx = Some(dream_receiver);
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                app.dream_state = DreamState::Idle;
                 return;
             }
         }
@@ -197,6 +243,17 @@ fn start_memory_update(app: &mut App) {
     app.memory_state = MemoryState::Updating;
 }
 
+pub(crate) fn start_dream(app: &mut App) {
+    app.dream_log.clear();
+    app.dream_summary.clear();
+    let (sender, receiver) = std::sync::mpsc::channel::<DreamEvent>();
+    let llm = Arc::clone(&app.memory_llm);
+    std::thread::spawn(move || {
+        let _ = memory::run_dream_pass(llm, sender);
+    });
+    app.dream_rx = Some(receiver);
+    app.dream_state = DreamState::Running;
+}
 
 pub(crate) fn last_assistant_content(app: &App) -> String {
     match app.history.last() {

@@ -24,7 +24,11 @@ fn database() -> &'static Database {
     DATABASE.get_or_init(|| {
         runtime().block_on(async {
             std::fs::create_dir_all(DATA_DIR).expect("create data dir");
-            let database = Builder::new_local(DB_PATH).experimental_index_method(true).build().await.expect("open db");
+            let database = Builder::new_local(DB_PATH)
+                .experimental_index_method(true)
+                .build()
+                .await
+                .expect("open db");
             let conn = database.connect().expect("db connect");
             init_schema(&conn).await.expect("init schema");
             database
@@ -55,7 +59,14 @@ async fn create_base_tables(conn: &Connection) -> Result<(), Box<dyn Error + Sen
     conn.execute(
         "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '')",
         (),
-    ).await?;
+    )
+    .await?;
+    let _ = conn
+        .execute(
+            "ALTER TABLE nodes ADD COLUMN views INTEGER NOT NULL DEFAULT 0",
+            (),
+        )
+        .await;
     Ok(())
 }
 
@@ -71,20 +82,22 @@ async fn create_history_tables(conn: &Connection) -> Result<(), Box<dyn Error + 
     )
     .await?;
     // fts index has no IF NOT EXISTS in turso — try and ignore if already exists
-    let _ = conn.execute(
-        "CREATE INDEX fts_messages_content ON messages USING fts (content)",
-        (),
-    )
-    .await;
+    let _ = conn
+        .execute(
+            "CREATE INDEX fts_messages_content ON messages USING fts (content)",
+            (),
+        )
+        .await;
     Ok(())
 }
 
 async fn add_edge_provenance_column(conn: &Connection) {
-    let _ = conn.execute(
-        "ALTER TABLE edges ADD COLUMN source_message_id TEXT NOT NULL DEFAULT ''",
-        (),
-    )
-    .await;
+    let _ = conn
+        .execute(
+            "ALTER TABLE edges ADD COLUMN source_message_id TEXT NOT NULL DEFAULT ''",
+            (),
+        )
+        .await;
 }
 
 pub fn db_init() -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -125,7 +138,10 @@ async fn load_graph_async(conn: &Connection) -> Graph {
 }
 
 async fn load_nodes(conn: &Connection, graph: &mut Graph) {
-    let Ok(mut rows) = conn.query("SELECT id, node_type, body, date FROM nodes", ()).await else {
+    let Ok(mut rows) = conn
+        .query("SELECT id, node_type, body, date FROM nodes", ())
+        .await
+    else {
         return;
     };
     while let Ok(Some(row)) = rows.next().await {
@@ -137,7 +153,14 @@ async fn load_nodes(conn: &Connection, graph: &mut Graph) {
         ) else {
             continue;
         };
-        graph.nodes.insert(text(node_id), Node { node_type: text(node_type), body: text(body), date: text(date) });
+        graph.nodes.insert(
+            text(node_id),
+            Node {
+                node_type: text(node_type),
+                body: text(body),
+                date: text(date),
+            },
+        );
     }
 }
 
@@ -150,9 +173,14 @@ async fn load_edges(conn: &Connection, graph: &mut Graph) {
     };
     while let Ok(Some(row)) = rows.next().await {
         let (Ok(src), Ok(tgt), Ok(content), Ok(stab), Ok(conf), Ok(imp), Ok(subj), Ok(date)) = (
-            row.get_value(0), row.get_value(1), row.get_value(2),
-            row.get_value(3), row.get_value(4), row.get_value(5),
-            row.get_value(6), row.get_value(7),
+            row.get_value(0),
+            row.get_value(1),
+            row.get_value(2),
+            row.get_value(3),
+            row.get_value(4),
+            row.get_value(5),
+            row.get_value(6),
+            row.get_value(7),
         ) else {
             continue;
         };
@@ -196,7 +224,12 @@ pub fn write_node(
     runtime().block_on(async {
         conn.execute(
             "INSERT OR REPLACE INTO nodes (id, node_type, body, date) VALUES (?1, ?2, ?3, ?4)",
-            params![node_id, node.node_type.as_str(), node.body.as_str(), node.date.as_str()],
+            params![
+                node_id,
+                node.node_type.as_str(),
+                node.body.as_str(),
+                node.date.as_str()
+            ],
         )
         .await?;
         Ok(())
@@ -315,8 +348,22 @@ pub fn register_session(session_id: &str, created_at: &str) {
         return;
     };
     runtime().block_on(async {
+        let _ = conn
+            .execute(
+                "INSERT OR IGNORE INTO sessions (id, created_at) VALUES (?1, ?2)",
+                params![session_id, created_at],
+            )
+            .await;
+    });
+}
+
+pub fn register_dream_session(session_id: &str, created_at: &str) {
+    let Ok(conn) = open_connection() else {
+        return;
+    };
+    runtime().block_on(async {
         let _ = conn.execute(
-            "INSERT OR IGNORE INTO sessions (id, created_at) VALUES (?1, ?2)",
+            "INSERT OR IGNORE INTO sessions (id, session_type, created_at) VALUES (?1, 'dream', ?2)",
             params![session_id, created_at],
         )
         .await;
@@ -412,14 +459,20 @@ async fn read_message_context_async(
     format_message_context(&messages, &source_message_id)
 }
 
-async fn lookup_source_message_id(conn: &Connection, edge_source: &str, edge_target: &str) -> String {
+async fn lookup_source_message_id(
+    conn: &Connection,
+    edge_source: &str,
+    edge_target: &str,
+) -> String {
     let normalized_source = normalize_id(edge_source);
     let normalized_target = normalize_id(edge_target);
-    let Ok(mut rows) = conn.query(
-        "SELECT source_message_id FROM edges WHERE source = ?1 AND target = ?2",
-        params![normalized_source.as_str(), normalized_target.as_str()],
-    )
-    .await else {
+    let Ok(mut rows) = conn
+        .query(
+            "SELECT source_message_id FROM edges WHERE source = ?1 AND target = ?2",
+            params![normalized_source.as_str(), normalized_target.as_str()],
+        )
+        .await
+    else {
         return String::new();
     };
     if let Ok(Some(row)) = rows.next().await
@@ -516,7 +569,9 @@ pub fn load_last_decay() -> String {
         return String::new();
     };
     runtime().block_on(async {
-        let Ok(mut rows) = conn.query("SELECT value FROM meta WHERE key = 'last_decay'", ()).await
+        let Ok(mut rows) = conn
+            .query("SELECT value FROM meta WHERE key = 'last_decay'", ())
+            .await
         else {
             return String::new();
         };
@@ -531,9 +586,10 @@ pub fn load_last_decay() -> String {
 
 pub fn save_last_decay(date: &str) {
     let Ok(conn) = open_connection() else { return };
-    let _ = runtime().block_on(
-        conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('last_decay', ?1)", params![date]),
-    );
+    let _ = runtime().block_on(conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('last_decay', ?1)",
+        params![date],
+    ));
 }
 
 pub fn graph_diff_toon(pre: &Graph, post: &Graph) -> String {
@@ -547,7 +603,10 @@ pub fn graph_diff_toon(pre: &Graph, post: &Graph) -> String {
 fn node_diff_lines(pre: &Graph, post: &Graph, lines: &mut Vec<String>) {
     for (node_id, node) in &post.nodes {
         if !pre.nodes.contains_key(node_id) {
-            lines.push(format!("+nodes[{node_id} | {} | {} | {}]", node.node_type, node.body, node.date));
+            lines.push(format!(
+                "+nodes[{node_id} | {} | {} | {}]",
+                node.node_type, node.body, node.date
+            ));
         }
     }
     for node_id in pre.nodes.keys() {
@@ -568,7 +627,15 @@ fn edge_diff_lines(pre: &Graph, post: &Graph, lines: &mut Vec<String>) {
     }
     for edge in &post.edges {
         if !pre_keys.contains(&(edge.source.as_str(), edge.target.as_str())) {
-            lines.push(format!("+edges[{} → {} | {} | conf={} imp={} stab={}]", edge.source, edge.target, edge.content, edge.confidence, edge.importance, edge.stability));
+            lines.push(format!(
+                "+edges[{} → {} | {} | conf={} imp={} stab={}]",
+                edge.source,
+                edge.target,
+                edge.content,
+                edge.confidence,
+                edge.importance,
+                edge.stability
+            ));
         }
     }
     for edge in &pre.edges {

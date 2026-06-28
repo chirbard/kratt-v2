@@ -9,7 +9,7 @@ use crate::prompts;
 use crate::session;
 use crate::web::SearchClient;
 
-use super::app::{App, Message, Role, State, RECENT_TURNS};
+use super::app::{App, Message, RECENT_TURNS, Role, State};
 
 pub(crate) struct StreamJob {
     pub(crate) llm: Arc<dyn LlmClient>,
@@ -49,7 +49,11 @@ pub(crate) fn start_stream(app: &mut App) {
     let (sender, recvr) = std::sync::mpsc::channel();
     app.stream_rx = Some(recvr);
     let system = prompts::build_chat_system_prompt(&app.memory_toon, &recent_entries);
-    let system_opt = if system.is_empty() { None } else { Some(system) };
+    let system_opt = if system.is_empty() {
+        None
+    } else {
+        Some(system)
+    };
     let job = StreamJob {
         llm: Arc::clone(&app.chat_llm),
         search: clone_search_client(app),
@@ -251,7 +255,11 @@ fn read_source_tool() -> Value {
     })
 }
 
-fn execute_tool(call: &ToolCallRequest, search: Option<&dyn SearchClient>, session_path: &Path) -> String {
+fn execute_tool(
+    call: &ToolCallRequest,
+    search: Option<&dyn SearchClient>,
+    session_path: &Path,
+) -> String {
     match call.name.as_str() {
         "search_web" => execute_search_web(&call.args, search),
         "search_history" => execute_search_history(&call.args),

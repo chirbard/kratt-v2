@@ -259,7 +259,11 @@ fn apply_delta(
     Ok(())
 }
 
-fn send_reasoning_delta(reasoning: Option<String>, state: &mut StreamState, sender: &Sender<Chunk>) {
+fn send_reasoning_delta(
+    reasoning: Option<String>,
+    state: &mut StreamState,
+    sender: &Sender<Chunk>,
+) {
     if let Some(reasoning) = reasoning
         && !reasoning.is_empty()
     {
