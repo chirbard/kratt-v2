@@ -32,7 +32,7 @@ fn database() -> &'static Database {
     })
 }
 
-fn connect() -> Result<Connection, Box<dyn Error + Send + Sync>> {
+pub fn open_connection() -> Result<Connection, Box<dyn Error + Send + Sync>> {
     Ok(database().connect()?)
 }
 
@@ -53,7 +53,7 @@ async fn init_schema(conn: &Connection) -> Result<(), Box<dyn Error + Send + Syn
 }
 
 pub fn db_init() -> Result<(), Box<dyn Error + Send + Sync>> {
-    let conn = connect()?;
+    let conn = open_connection()?;
     let count = runtime().block_on(node_count(&conn))?;
     if count > 0 {
         return Ok(());
@@ -76,7 +76,9 @@ async fn node_count(conn: &Connection) -> Result<i64, Box<dyn Error + Send + Syn
 }
 
 pub fn load_graph() -> Graph {
-    let Ok(conn) = connect() else { return Graph::new() };
+    let Ok(conn) = open_connection() else {
+        return Graph::new();
+    };
     runtime().block_on(load_graph_async(&conn))
 }
 
@@ -133,8 +135,85 @@ async fn load_edges(conn: &Connection, graph: &mut Graph) {
 }
 
 pub fn save_graph(graph: &Graph) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let conn = connect()?;
+    let conn = open_connection()?;
     runtime().block_on(write_graph(&conn, graph))
+}
+
+pub fn begin_transaction(conn: &Connection) -> Result<(), Box<dyn Error + Send + Sync>> {
+    runtime().block_on(async {
+        conn.execute("BEGIN", ()).await?;
+        Ok(())
+    })
+}
+
+pub fn commit_transaction(conn: &Connection) -> Result<(), Box<dyn Error + Send + Sync>> {
+    runtime().block_on(async {
+        conn.execute("COMMIT", ()).await?;
+        Ok(())
+    })
+}
+
+pub fn write_node(
+    conn: &Connection,
+    node_id: &str,
+    node: &Node,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    runtime().block_on(async {
+        conn.execute(
+            "INSERT OR REPLACE INTO nodes (id, node_type, body, date) VALUES (?1, ?2, ?3, ?4)",
+            params![node_id, node.node_type.as_str(), node.body.as_str(), node.date.as_str()],
+        )
+        .await?;
+        Ok(())
+    })
+}
+
+pub fn write_edge(conn: &Connection, edge: &Edge) -> Result<(), Box<dyn Error + Send + Sync>> {
+    runtime().block_on(async {
+        conn.execute(
+            "INSERT OR REPLACE INTO edges (source, target, content, stability, confidence, importance, subject, date) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                edge.source.as_str(),
+                edge.target.as_str(),
+                edge.content.as_str(),
+                edge.stability,
+                edge.confidence,
+                edge.importance,
+                edge.subject as i64,
+                edge.date.as_str(),
+            ],
+        )
+        .await?;
+        Ok(())
+    })
+}
+
+pub fn erase_node(conn: &Connection, node_id: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+    runtime().block_on(async {
+        conn.execute("DELETE FROM nodes WHERE id = ?1", params![node_id])
+            .await?;
+        conn.execute(
+            "DELETE FROM edges WHERE source = ?1 OR target = ?1",
+            params![node_id],
+        )
+        .await?;
+        Ok(())
+    })
+}
+
+pub fn erase_edge(
+    conn: &Connection,
+    source: &str,
+    target: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    runtime().block_on(async {
+        conn.execute(
+            "DELETE FROM edges WHERE source = ?1 AND target = ?2",
+            params![source, target],
+        )
+        .await?;
+        Ok(())
+    })
 }
 
 async fn write_graph(conn: &Connection, graph: &Graph) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -158,7 +237,9 @@ async fn write_graph(conn: &Connection, graph: &Graph) -> Result<(), Box<dyn Err
 }
 
 pub fn load_last_decay() -> String {
-    let Ok(conn) = connect() else { return String::new() };
+    let Ok(conn) = open_connection() else {
+        return String::new();
+    };
     runtime().block_on(async {
         let Ok(mut rows) = conn.query("SELECT value FROM meta WHERE key = 'last_decay'", ()).await
         else {
@@ -174,7 +255,7 @@ pub fn load_last_decay() -> String {
 }
 
 pub fn save_last_decay(date: &str) {
-    let Ok(conn) = connect() else { return };
+    let Ok(conn) = open_connection() else { return };
     let _ = runtime().block_on(
         conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('last_decay', ?1)", params![date]),
     );

@@ -3,11 +3,11 @@ use std::sync::Arc;
 
 use crate::api::{Chunk, LlmClient};
 use crate::prompts::{CONSOLIDATE_EXPLANATION, EXTRACT_EXPLANATION, build_agent_prompt};
+use turso::Connection;
+
 use super::db;
 use super::decay;
-use super::graph::{
-    Edge, Graph, Node, delete_node, graph_to_json, insert_edge, normalize_id, remove_edges,
-};
+use super::graph::{Edge, Node, graph_to_json, normalize_id};
 
 pub enum MemoryEvent {
     Log { phase: &'static str, text: String },
@@ -67,8 +67,15 @@ pub fn run_memory_agent(
 
 impl<'run> AgentRun<'run> {
     fn run(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let conn = db::open_connection()?;
         let mut graph = db::load_graph();
-        decay::apply_decay_if_needed(&mut graph);
+        let decay_ran = decay::apply_decay_if_needed(&mut graph);
+        if decay_ran
+            && let Err(err) = db::save_graph(&graph)
+        {
+            self.send_log("memory", format!("error: {err}"));
+            return Err(err);
+        }
 
         let pre_extract_graph = graph.clone();
         let pre_extract_toon = toon::encode(&graph_to_json(&pre_extract_graph), None);
@@ -79,14 +86,10 @@ impl<'run> AgentRun<'run> {
             self.assistant_msg,
             None,
         );
-        self.run_pass(&mut graph, "extract", extract_prompt)?;
+        self.run_pass(&conn, "extract", extract_prompt)?;
 
-        if let Err(err) = db::save_graph(&graph) {
-            self.send_log("memory", format!("error: {err}"));
-            return Err(err);
-        }
-
-        let diff = db::graph_diff_toon(&pre_extract_graph, &graph);
+        let post_extract_graph = db::load_graph();
+        let diff = db::graph_diff_toon(&pre_extract_graph, &post_extract_graph);
         let consolidate_prompt = build_agent_prompt(
             CONSOLIDATE_EXPLANATION,
             &pre_extract_toon,
@@ -94,22 +97,23 @@ impl<'run> AgentRun<'run> {
             self.assistant_msg,
             if diff.is_empty() { None } else { Some(&diff) },
         );
-        self.run_pass(&mut graph, "consolidate", consolidate_prompt)?;
+        self.run_pass(&conn, "consolidate", consolidate_prompt)?;
 
-        if let Err(err) = db::save_graph(&graph) {
-            self.send_log("memory", format!("error: {err}"));
-            return Err(err);
-        }
+        let final_graph = db::load_graph();
         self.send_log(
             "memory",
-            format!("saved — {} nodes, {} edges", graph.nodes.len(), graph.edges.len()),
+            format!(
+                "saved — {} nodes, {} edges",
+                final_graph.nodes.len(),
+                final_graph.edges.len()
+            ),
         );
         Ok(())
     }
 
     fn run_pass(
         &self,
-        graph: &mut Graph,
+        conn: &Connection,
         phase: &'static str,
         prompt: String,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -132,9 +136,9 @@ impl<'run> AgentRun<'run> {
         } else {
             self.send_log(phase, format!("{} tool calls", tool_calls.len()));
         }
-        for call in tool_calls {
-            let description = apply_tool(call, graph);
-            self.send_log(phase, description);
+        if let Err(err) = apply_tool_calls(self, conn, phase, tool_calls) {
+            self.send_log(phase, format!("error: {err}"));
+            return Err(err);
         }
         self.send_log(phase, "done".to_string());
         Ok(())
@@ -236,9 +240,12 @@ fn parse_single_tool(obj: &serde_json::Value) -> Option<ToolCall> {
     }
 }
 
-fn tool_array(obj: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+fn tool_array(obj: &serde_json::Value) -> Option<&[serde_json::Value]> {
     let tools = obj.get("tools")?;
-    tools.as_array()
+    match tools.as_array() {
+        Some(array) => Some(array.as_slice()),
+        None => None,
+    }
 }
 
 fn parse_upsert_node(args: &serde_json::Value) -> Option<ToolCall> {
@@ -322,14 +329,32 @@ fn json_f64(obj: &serde_json::Value, key: &str) -> f64 {
     value.as_f64().unwrap_or(0.0)
 }
 
-fn apply_tool(call: ToolCall, graph: &mut Graph) -> String {
+fn apply_tool_calls<'agent_run>(
+    agent_run: &AgentRun<'agent_run>,
+    conn: &Connection,
+    phase: &'static str,
+    tool_calls: Vec<ToolCall>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    db::begin_transaction(conn)?;
+    for call in tool_calls {
+        let description = apply_tool(call, conn)?;
+        agent_run.send_log(phase, description);
+    }
+    db::commit_transaction(conn)?;
+    Ok(())
+}
+
+fn apply_tool(
+    call: ToolCall,
+    conn: &Connection,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
     match call {
         ToolCall::UpsertNode {
             name,
             node_type,
             body,
             date,
-        } => apply_upsert_node(graph, name, node_type, body, date),
+        } => apply_upsert_node(conn, name, node_type, body, date),
         ToolCall::UpsertEdge {
             source,
             target,
@@ -350,46 +375,56 @@ fn apply_tool(call: ToolCall, graph: &mut Graph) -> String {
                 subject,
                 date,
             };
-            apply_upsert_edge(graph, source, target, edge)
+            apply_upsert_edge(conn, source, target, edge)
         }
-        ToolCall::DeleteNode { name } => apply_delete_node(graph, name),
-        ToolCall::DeleteEdge { source, target } => apply_delete_edge(graph, source, target),
+        ToolCall::DeleteNode { name } => apply_delete_node(conn, name),
+        ToolCall::DeleteEdge { source, target } => apply_delete_edge(conn, source, target),
     }
 }
 
 fn apply_upsert_node(
-    graph: &mut Graph,
+    conn: &Connection,
     name: String,
     node_type: String,
     body: String,
     date: String,
-) -> String {
-    graph.nodes.insert(
-        normalize_id(&name),
-        Node {
-            node_type: node_type.clone(),
-            body,
-            date,
-        },
-    );
-    format!("upsert_node: {name} ({node_type})")
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let normalized = normalize_id(&name);
+    let node = Node {
+        node_type: node_type.clone(),
+        body,
+        date,
+    };
+    db::write_node(conn, &normalized, &node)?;
+    Ok(format!("upsert_node: {name} ({node_type})"))
 }
 
-fn apply_upsert_edge(graph: &mut Graph, source: String, target: String, edge: Edge) -> String {
-    insert_edge(graph, edge);
-    format!("upsert_edge: {source} → {target}")
+fn apply_upsert_edge(
+    conn: &Connection,
+    source: String,
+    target: String,
+    edge: Edge,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    db::write_edge(conn, &edge)?;
+    Ok(format!("upsert_edge: {source} → {target}"))
 }
 
-fn apply_delete_node(graph: &mut Graph, name: String) -> String {
-    delete_node(graph, &normalize_id(&name));
-    format!("delete_node: {name}")
+fn apply_delete_node(
+    conn: &Connection,
+    name: String,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let normalized = normalize_id(&name);
+    db::erase_node(conn, &normalized)?;
+    Ok(format!("delete_node: {name}"))
 }
 
-fn apply_delete_edge(graph: &mut Graph, source: String, target: String) -> String {
-    remove_edges(
-        &mut graph.edges,
-        &normalize_id(&source),
-        &normalize_id(&target),
-    );
-    format!("delete_edge: {source} → {target}")
+fn apply_delete_edge(
+    conn: &Connection,
+    source: String,
+    target: String,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let normalized_source = normalize_id(&source);
+    let normalized_target = normalize_id(&target);
+    db::erase_edge(conn, &normalized_source, &normalized_target)?;
+    Ok(format!("delete_edge: {source} → {target}"))
 }

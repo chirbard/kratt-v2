@@ -204,31 +204,3 @@ pub fn graph_to_json(graph: &Graph) -> serde_json::Value {
         "edges": edges_json,
     })
 }
-
-pub fn insert_edge(graph: &mut Graph, edge: Edge) {
-    remove_edges(&mut graph.edges, &edge.source, &edge.target);
-    graph.edges.push(edge);
-}
-
-pub fn remove_edges(edges: &mut Vec<Edge>, source: &str, target: &str) {
-    let mut index = 0;
-    while index < edges.len() {
-        if edges[index].source == source && edges[index].target == target {
-            edges.remove(index);
-        } else {
-            index += 1;
-        }
-    }
-}
-
-pub fn delete_node(graph: &mut Graph, name: &str) {
-    graph.nodes.remove(name);
-    let mut index = 0;
-    while index < graph.edges.len() {
-        if graph.edges[index].source == name || graph.edges[index].target == name {
-            graph.edges.remove(index);
-        } else {
-            index += 1;
-        }
-    }
-}

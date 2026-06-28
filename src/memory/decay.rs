@@ -2,15 +2,16 @@ use super::db;
 use super::graph::{Edge, Graph};
 use crate::prompts::today_iso;
 
-pub fn apply_decay_if_needed(graph: &mut Graph) {
+pub fn apply_decay_if_needed(graph: &mut Graph) -> bool {
     let today = today_iso();
     if db::load_last_decay() == today {
-        return;
+        return false;
     }
     for edge in &mut graph.edges {
         decay_edge(edge, &today);
     }
     db::save_last_decay(&today);
+    true
 }
 
 fn decay_edge(edge: &mut Edge, today: &str) {
