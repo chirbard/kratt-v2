@@ -62,6 +62,7 @@ pub(crate) struct App {
     pub(crate) show_tools: bool,
     pub(crate) session_path: PathBuf,
     pub(crate) memory_toon: String,
+    pub(crate) last_user_message_id: String,
 }
 
 impl App {
@@ -96,6 +97,7 @@ impl App {
             show_tools: false,
             session_path,
             memory_toon,
+            last_user_message_id: String::new(),
         }
     }
 }
@@ -177,12 +179,19 @@ pub(crate) fn drain_memory(app: &mut App) {
 fn start_memory_update(app: &mut App) {
     let assistant_content = last_assistant_content(app);
     let user_content = second_to_last_content(app);
-    session::append_entry(&app.session_path, "assistant", &assistant_content);
+    let _ = session::append_entry(&app.session_path, "assistant", &assistant_content);
+    let user_message_id = app.last_user_message_id.clone();
     app.memory_log.clear();
     let (sender, receiver) = std::sync::mpsc::channel::<MemoryEvent>();
     let llm = Arc::clone(&app.memory_llm);
     std::thread::spawn(move || {
-        let _ = memory::run_memory_agent(llm, &user_content, &assistant_content, sender);
+        let _ = memory::run_memory_agent(
+            llm,
+            &user_content,
+            &assistant_content,
+            &user_message_id,
+            sender,
+        );
     });
     app.memory_rx = Some(receiver);
     app.memory_state = MemoryState::Updating;

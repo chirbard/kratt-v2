@@ -1,3 +1,4 @@
+use crate::memory;
 use serde::Deserialize;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -40,6 +41,10 @@ pub fn read_history(session_path: &Path, offset: usize) -> String {
 pub fn search_history(queries: &[String]) -> String {
     if queries.is_empty() {
         return String::new();
+    }
+    let fts_result = memory::search_messages_fts(queries);
+    if !fts_result.is_empty() {
+        return fts_result;
     }
     let lower_queries = lowercase_queries(queries);
     if lower_queries.is_empty() {

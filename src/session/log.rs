@@ -1,3 +1,4 @@
+use crate::memory;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -18,24 +19,29 @@ pub struct RecentEntry {
 }
 
 pub fn new_session_path() -> PathBuf {
-    let timestamp = timestamp_parts();
-    PathBuf::from("kratt-data").join("sessions").join(format!(
-        "{:04}-{:02}-{:02}T{:02}-{:02}-{:02}.jsonl",
-        timestamp.year,
-        timestamp.month,
-        timestamp.day,
-        timestamp.hour,
-        timestamp.minute,
-        timestamp.second
-    ))
+    let created_at = format_timestamp(':');
+    let filename = created_at.replace(':', "-");
+    let path = PathBuf::from("kratt-data")
+        .join("sessions")
+        .join(format!("{filename}.jsonl"));
+    let session_id = session_id_from_path(&path);
+    memory::register_session(&session_id, &created_at);
+    path
 }
 
-pub fn append_entry(path: &Path, role: &str, content: &str) {
+pub fn append_entry(path: &Path, role: &str, content: &str) -> String {
+    let created_at = format_timestamp(':');
     let entry = SessionEntry {
         role: role.to_string(),
         content: content.to_string(),
-        timestamp: format_timestamp(':'),
+        timestamp: created_at.clone(),
     };
+    write_entry_jsonl(path, &entry);
+    let session_id = session_id_from_path(path);
+    memory::insert_message(&session_id, role, content, &created_at)
+}
+
+fn write_entry_jsonl(path: &Path, entry: &SessionEntry) {
     let Some(parent) = path.parent() else {
         return;
     };
@@ -53,6 +59,13 @@ pub fn append_entry(path: &Path, role: &str, content: &str) {
         return;
     }
     let _ = file.write_all(b"\n");
+}
+
+fn session_id_from_path(path: &Path) -> String {
+    match path.file_stem() {
+        Some(stem) => stem.to_string_lossy().into_owned(),
+        None => String::new(),
+    }
 }
 
 pub fn load_recent_entries(path: &Path, turn_count: usize) -> Vec<RecentEntry> {

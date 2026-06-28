@@ -4,6 +4,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use crate::api::{Chunk, LlmClient, Stats, ToolCallRequest, TurnOutcome};
+use crate::memory;
 use crate::prompts;
 use crate::session;
 use crate::web::SearchClient;
@@ -29,7 +30,7 @@ struct StatsAgg {
 pub(crate) fn start_stream(app: &mut App) {
     let prompt = std::mem::take(&mut app.input);
     let recent_entries = session::load_recent_entries(&app.session_path, RECENT_TURNS);
-    session::append_entry(&app.session_path, "user", &prompt);
+    app.last_user_message_id = session::append_entry(&app.session_path, "user", &prompt);
     app.history.push(Message {
         role: Role::User,
         reasoning: String::new(),
@@ -170,6 +171,7 @@ fn build_tools(has_search: bool) -> Value {
     }
     tools.push(search_history_tool());
     tools.push(read_history_tool());
+    tools.push(read_source_tool());
     Value::Array(tools)
 }
 
@@ -231,11 +233,30 @@ fn read_history_tool() -> Value {
     })
 }
 
+fn read_source_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "read_source",
+            "description": "Read the original conversation exchange that produced a specific memory edge. Use this to verify where a belief came from. Pass the edge's source and target node names exactly as they appear in your memory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string", "description": "Edge source node name"},
+                    "target": {"type": "string", "description": "Edge target node name"}
+                },
+                "required": ["source", "target"]
+            }
+        }
+    })
+}
+
 fn execute_tool(call: &ToolCallRequest, search: Option<&dyn SearchClient>, session_path: &Path) -> String {
     match call.name.as_str() {
         "search_web" => execute_search_web(&call.args, search),
         "search_history" => execute_search_history(&call.args),
         "read_history" => execute_read_history(&call.args, session_path),
+        "read_source" => execute_read_source(&call.args),
         _ => "unknown tool".to_string(),
     }
 }
@@ -278,6 +299,26 @@ fn execute_read_history(args: &str, session_path: &Path) -> String {
     result
 }
 
+fn execute_read_source(args: &str) -> String {
+    let root = match serde_json::from_str::<Value>(args) {
+        Ok(root) => root,
+        Err(_) => return "no results".to_string(),
+    };
+    let source = match parse_string_field(&root, "source") {
+        Some(source) => source,
+        None => return "no results".to_string(),
+    };
+    let target = match parse_string_field(&root, "target") {
+        Some(target) => target,
+        None => return "no results".to_string(),
+    };
+    let result = memory::read_message_context(&source, &target);
+    if result.is_empty() {
+        return "no results".to_string();
+    }
+    result
+}
+
 fn parse_queries(args: &str) -> Vec<String> {
     let root = match serde_json::from_str::<Value>(args) {
         Ok(root) => root,
@@ -311,4 +352,10 @@ fn parse_offset(args: &str) -> Option<usize> {
     let offset_value = root.get("offset")?;
     let offset = offset_value.as_u64()?;
     usize::try_from(offset).ok()
+}
+
+fn parse_string_field(root: &Value, key: &str) -> Option<String> {
+    let value = root.get(key)?;
+    let text = value.as_str()?;
+    Some(text.to_string())
 }

@@ -2,3 +2,5 @@
 .env
 /kratt-data/
 /ai-plans/
+
+.DS_Store

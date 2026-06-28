@@ -20,6 +20,7 @@ struct AgentRun<'run> {
     user_msg: &'run str,
     assistant_msg: &'run str,
     sender: &'run std::sync::mpsc::Sender<MemoryEvent>,
+    user_message_id: &'run str,
 }
 
 enum ToolCall {
@@ -52,6 +53,7 @@ pub fn run_memory_agent(
     llm: Arc<dyn LlmClient>,
     user_msg: &str,
     assistant_msg: &str,
+    user_message_id: &str,
     sender: std::sync::mpsc::Sender<MemoryEvent>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let agent_run = AgentRun {
@@ -59,6 +61,7 @@ pub fn run_memory_agent(
         user_msg,
         assistant_msg,
         sender: &sender,
+        user_message_id,
     };
     let result = agent_run.run();
     let _ = sender.send(MemoryEvent::Done);
@@ -337,7 +340,7 @@ fn apply_tool_calls<'agent_run>(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     db::begin_transaction(conn)?;
     for call in tool_calls {
-        let description = apply_tool(call, conn)?;
+        let description = apply_tool(call, conn, agent_run.user_message_id)?;
         agent_run.send_log(phase, description);
     }
     db::commit_transaction(conn)?;
@@ -347,6 +350,7 @@ fn apply_tool_calls<'agent_run>(
 fn apply_tool(
     call: ToolCall,
     conn: &Connection,
+    source_message_id: &str,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
     match call {
         ToolCall::UpsertNode {
@@ -375,7 +379,7 @@ fn apply_tool(
                 subject,
                 date,
             };
-            apply_upsert_edge(conn, source, target, edge)
+            apply_upsert_edge(conn, source, target, edge, source_message_id)
         }
         ToolCall::DeleteNode { name } => apply_delete_node(conn, name),
         ToolCall::DeleteEdge { source, target } => apply_delete_edge(conn, source, target),
@@ -404,8 +408,9 @@ fn apply_upsert_edge(
     source: String,
     target: String,
     edge: Edge,
+    source_message_id: &str,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
-    db::write_edge(conn, &edge)?;
+    db::write_edge(conn, &edge, source_message_id)?;
     Ok(format!("upsert_edge: {source} → {target}"))
 }
 
