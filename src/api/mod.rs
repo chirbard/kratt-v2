@@ -18,9 +18,28 @@ pub enum Chunk {
     Err(String),
 }
 
+#[allow(clippy::min_ident_chars)]
+pub struct ToolCallRequest {
+    pub id: String,
+    pub name: String,
+    pub args: String,
+}
+
+pub enum TurnOutcome {
+    Done(Stats),
+    ToolCalls(Vec<ToolCallRequest>),
+}
+
 pub trait LlmClient: Send + Sync {
+    #[allow(dead_code)]
     fn collect(&self, prompt: &str) -> Result<String, Box<dyn Error + Send + Sync>>;
     fn stream(&self, prompt: String, system: Option<String>, sender: Sender<Chunk>);
+    fn stream_turn(
+        &self,
+        messages: &[serde_json::Value],
+        tools: Option<&serde_json::Value>,
+        sender: &std::sync::mpsc::Sender<Chunk>,
+    ) -> Result<TurnOutcome, Box<dyn Error + Send + Sync>>;
 }
 
 pub(crate) fn new_client(api_key: String, model: String) -> impl LlmClient {

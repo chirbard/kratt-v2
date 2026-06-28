@@ -1,10 +1,12 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::api::{Chunk, LlmClient};
+use serde_json::{Value, json};
+
+use crate::api::{Chunk, LlmClient, Stats, ToolCallRequest, TurnOutcome};
 use crate::prompts;
 use crate::session;
-use crate::web::{self, SearchClient};
+use crate::web::SearchClient;
 
 use super::app::{App, Message, Role, State, RECENT_TURNS};
 
@@ -13,9 +15,15 @@ pub(crate) struct StreamJob {
     pub(crate) search: Option<Arc<dyn SearchClient>>,
     pub(crate) prompt: String,
     pub(crate) session_path: std::path::PathBuf,
-    pub(crate) memory_toon: String,
     pub(crate) system_opt: Option<String>,
     pub(crate) sender: std::sync::mpsc::Sender<Chunk>,
+}
+
+struct StatsAgg {
+    tokens_in: u32,
+    tokens_out: u32,
+    cost_usd: f64,
+    ttft_ms: u128,
 }
 
 pub(crate) fn start_stream(app: &mut App) {
@@ -43,153 +51,245 @@ pub(crate) fn start_stream(app: &mut App) {
     let system_opt = if system.is_empty() { None } else { Some(system) };
     let job = StreamJob {
         llm: Arc::clone(&app.chat_llm),
-        search: match &app.search {
-            Some(arc) => Some(Arc::clone(arc)),
-            None => None,
-        },
+        search: clone_search_client(app),
         prompt,
         session_path: app.session_path.clone(),
-        memory_toon: app.memory_toon.clone(),
         system_opt,
         sender,
     };
     std::thread::spawn(move || run_stream_worker(job));
 }
 
+fn clone_search_client(app: &App) -> Option<Arc<dyn SearchClient>> {
+    match &app.search {
+        Some(arc) => Some(Arc::clone(arc)),
+        None => None,
+    }
+}
+
 fn run_stream_worker(job: StreamJob) {
-    let mut system_opt = job.system_opt;
-    let (stream_prompt, tool_desc) =
-        maybe_augment_prompt_with_history(job.llm.as_ref(), &job.prompt, &job.session_path);
-    if let Some(desc) = tool_desc {
-        let _ = job.sender.send(Chunk::ToolCall(desc));
-    }
-    if let Some(queries) = web::decide_queries(job.llm.as_ref(), &stream_prompt, &job.memory_toon) {
-        let display = queries.join(" | ");
-        let _ = job.sender.send(Chunk::ToolCall(format!("checking web: {display}…")));
-        if let Some(ref search) = job.search
-            && let Some(context) = search.search_many(&queries)
-        {
-            if let Some(ref mut sys) = system_opt {
-                sys.push_str("\n\n<web_context>\n");
-                sys.push_str(&context);
-                sys.push_str("\n</web_context>");
+    let mut messages = build_initial_messages(&job.prompt, job.system_opt.as_deref());
+    let tools = build_tools(job.search.is_some());
+    let mut stats_agg = StatsAgg {
+        tokens_in: 0,
+        tokens_out: 0,
+        cost_usd: 0.0,
+        ttft_ms: 0,
+    };
+    let mut first_turn = true;
+    loop {
+        match job.llm.stream_turn(&messages, Some(&tools), &job.sender) {
+            Ok(TurnOutcome::Done(stats)) => {
+                send_final_stats(&job.sender, stats, &mut stats_agg, first_turn);
+                return;
             }
-            let _ = job.sender.send(Chunk::ToolCall(format!("web: {display}")));
+            Ok(TurnOutcome::ToolCalls(calls)) => {
+                execute_tool_turn(&job, &calls, &mut messages);
+            }
+            Err(err) => {
+                let _ = job.sender.send(Chunk::Err(err.to_string()));
+                return;
+            }
         }
-    }
-    job.llm.stream(stream_prompt, system_opt, job.sender);
-}
-
-enum HistoryResult {
-    Found(String, String),
-    NotFound(String, String),
-    Skip,
-}
-
-fn maybe_augment_prompt_with_history(
-    llm: &dyn LlmClient,
-    prompt: &str,
-    session_path: &Path,
-) -> (String, Option<String>) {
-    if !should_lookup_history(prompt) {
-        return (prompt.to_string(), None);
-    }
-    let lookup_prompt = prompts::build_history_lookup_prompt(prompt);
-    let lookup_response = match llm.collect(&lookup_prompt) {
-        Ok(lookup_response) => lookup_response,
-        Err(_) => return (prompt.to_string(), None),
-    };
-    match parse_history_response(&lookup_response, session_path) {
-        HistoryResult::Skip => (prompt.to_string(), None),
-        HistoryResult::Found(text, ui_desc) => {
-            let mut augmented = prompt.to_string();
-            augmented.push_str(prompts::HISTORY_FOUND_PREFIX);
-            augmented.push_str(&text);
-            (augmented, Some(ui_desc))
-        }
-        HistoryResult::NotFound(keywords, ui_desc) => {
-            let mut augmented = prompt.to_string();
-            augmented.push_str(prompts::HISTORY_NOT_FOUND_PREFIX);
-            augmented.push_str(&keywords);
-            augmented.push_str(prompts::HISTORY_NOT_FOUND_SUFFIX);
-            (augmented, Some(ui_desc))
-        }
+        first_turn = false;
     }
 }
 
-fn should_lookup_history(prompt: &str) -> bool {
-    let prompt_lower = prompt.to_ascii_lowercase();
-    for keyword in prompts::HISTORY_LOOKUP_KEYWORDS {
-        if prompt_lower.contains(keyword) {
-            return true;
-        }
+fn build_initial_messages(prompt: &str, system_opt: Option<&str>) -> Vec<Value> {
+    let mut messages = Vec::new();
+    if let Some(system) = system_opt {
+        messages.push(json!({"role": "system", "content": system}));
     }
-    false
+    messages.push(json!({"role": "user", "content": prompt}));
+    messages
 }
 
-fn parse_history_response(response: &str, session_path: &Path) -> HistoryResult {
-    let trimmed = response.trim();
-    if trimmed == "skip" {
-        return HistoryResult::Skip;
+fn send_final_stats(
+    sender: &std::sync::mpsc::Sender<Chunk>,
+    stats: Stats,
+    stats_agg: &mut StatsAgg,
+    first_turn: bool,
+) {
+    stats_agg.tokens_in += stats.tokens_in;
+    stats_agg.tokens_out += stats.tokens_out;
+    stats_agg.cost_usd += stats.cost_usd.unwrap_or(0.0);
+    if first_turn {
+        stats_agg.ttft_ms = stats.ttft_ms;
     }
-    let call_value = match serde_json::from_str::<serde_json::Value>(trimmed) {
-        Ok(call_value) => call_value,
-        Err(_) => return HistoryResult::Skip,
-    };
-    let tool_entry = match call_value.get("tool") {
-        Some(entry) => entry,
-        None => return HistoryResult::Skip,
-    };
-    let tool_name = match tool_entry.as_str() {
-        Some(name) => name,
-        None => return HistoryResult::Skip,
-    };
-    let arguments = match call_value.get("args") {
-        Some(val) => val,
-        None => match call_value.get("arguments") {
-            Some(val) => val,
-            None => return HistoryResult::Skip,
-        },
-    };
-    match tool_name {
-        "read_history" => execute_read_history(arguments, session_path),
-        "search_history" => execute_search_history(arguments),
-        _ => HistoryResult::Skip,
-    }
-}
-
-fn execute_read_history(arguments: &serde_json::Value, session_path: &Path) -> HistoryResult {
-    let offset_entry = match arguments.get("offset") {
-        Some(entry) => entry,
-        None => return HistoryResult::Skip,
-    };
-    let offset_value = match offset_entry.as_u64() {
-        Some(val) => val,
-        None => return HistoryResult::Skip,
-    };
-    let offset = match usize::try_from(offset_value) {
-        Ok(offset) => offset,
-        Err(_) => return HistoryResult::Skip,
-    };
-    let text = session::read_history(session_path, offset);
-    if text.is_empty() {
-        HistoryResult::NotFound(
-            format!("turn offset {offset}"),
-            format!("read_history offset={offset} → no results"),
-        )
+    let cost_usd = if stats_agg.cost_usd > 0.0 {
+        Some(stats_agg.cost_usd)
     } else {
-        HistoryResult::Found(text, format!("read_history offset={offset} → found"))
+        None
+    };
+    let _ = sender.send(Chunk::Done(Stats {
+        tokens_in: stats_agg.tokens_in,
+        tokens_out: stats_agg.tokens_out,
+        cost_usd,
+        ttft_ms: stats_agg.ttft_ms,
+    }));
+}
+
+fn execute_tool_turn(job: &StreamJob, calls: &[ToolCallRequest], messages: &mut Vec<Value>) {
+    messages.push(build_tool_call_message(calls));
+    for call in calls {
+        let _ = job
+            .sender
+            .send(Chunk::ToolCall(format!("{}: running…", call.name)));
+        let result = execute_tool(call, job.search.as_deref(), &job.session_path);
+        let _ = job
+            .sender
+            .send(Chunk::ToolCall(format!("{}: done", call.name)));
+        messages.push(json!({
+            "role": "tool",
+            "tool_call_id": call.id,
+            "content": result
+        }));
     }
 }
 
-fn execute_search_history(arguments: &serde_json::Value) -> HistoryResult {
-    let queries_entry = match arguments.get("queries") {
-        Some(entry) => entry,
-        None => return HistoryResult::Skip,
+fn build_tool_call_message(calls: &[ToolCallRequest]) -> Value {
+    let mut tool_calls_json = Vec::new();
+    for call in calls {
+        tool_calls_json.push(json!({
+            "id": call.id,
+            "type": "function",
+            "function": {"name": call.name, "arguments": call.args}
+        }));
+    }
+    json!({
+        "role": "assistant",
+        "content": Value::Null,
+        "tool_calls": tool_calls_json
+    })
+}
+
+fn build_tools(has_search: bool) -> Value {
+    let mut tools = Vec::new();
+    if has_search {
+        tools.push(search_web_tool());
+    }
+    tools.push(search_history_tool());
+    tools.push(read_history_tool());
+    Value::Array(tools)
+}
+
+fn search_web_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "search_web",
+            "description": "Search the web for current information: version numbers, release dates, recent events.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "queries": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "2-3 targeted queries"
+                    }
+                },
+                "required": ["queries"]
+            }
+        }
+    })
+}
+
+fn search_history_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "search_history",
+            "description": "Search past conversation sessions by keyword. Use 3-5 short keywords with different phrasings.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "queries": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    }
+                },
+                "required": ["queries"]
+            }
+        }
+    })
+}
+
+fn read_history_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "read_history",
+            "description": "Read a specific past turn from the current session. offset=0 is most recent, 1 is one before that.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "offset": {"type": "integer"}
+                },
+                "required": ["offset"]
+            }
+        }
+    })
+}
+
+fn execute_tool(call: &ToolCallRequest, search: Option<&dyn SearchClient>, session_path: &Path) -> String {
+    match call.name.as_str() {
+        "search_web" => execute_search_web(&call.args, search),
+        "search_history" => execute_search_history(&call.args),
+        "read_history" => execute_read_history(&call.args, session_path),
+        _ => "unknown tool".to_string(),
+    }
+}
+
+fn execute_search_web(args: &str, search: Option<&dyn SearchClient>) -> String {
+    let queries = parse_queries(args);
+    if queries.is_empty() {
+        return "no results".to_string();
+    }
+    let Some(search_client) = search else {
+        return "no results".to_string();
     };
-    let queries_array = match queries_entry.as_array() {
-        Some(arr) => arr,
-        None => return HistoryResult::Skip,
+    match search_client.search_many(&queries) {
+        Some(result) if !result.is_empty() => result,
+        _ => "no results".to_string(),
+    }
+}
+
+fn execute_search_history(args: &str) -> String {
+    let queries = parse_queries(args);
+    if queries.is_empty() {
+        return "no results".to_string();
+    }
+    let result = session::search_history(&queries);
+    if result.is_empty() {
+        return "no results".to_string();
+    }
+    result
+}
+
+fn execute_read_history(args: &str, session_path: &Path) -> String {
+    let offset = match parse_offset(args) {
+        Some(offset) => offset,
+        None => return "no results".to_string(),
+    };
+    let result = session::read_history(session_path, offset);
+    if result.is_empty() {
+        return "no results".to_string();
+    }
+    result
+}
+
+fn parse_queries(args: &str) -> Vec<String> {
+    let root = match serde_json::from_str::<Value>(args) {
+        Ok(root) => root,
+        Err(_) => return Vec::new(),
+    };
+    let queries_value = match root.get("queries") {
+        Some(queries_value) => queries_value,
+        None => return Vec::new(),
+    };
+    let queries_array = match queries_value.as_array() {
+        Some(queries_array) => queries_array,
+        None => return Vec::new(),
     };
     let mut queries = Vec::new();
     for item in queries_array {
@@ -200,17 +300,15 @@ fn execute_search_history(arguments: &serde_json::Value) -> HistoryResult {
             }
         }
     }
-    if queries.is_empty() {
-        return HistoryResult::Skip;
-    }
-    let keywords_display = queries.join(", ");
-    let text = session::search_history(&queries);
-    if text.is_empty() {
-        HistoryResult::NotFound(
-            keywords_display.clone(),
-            format!("search_history [{keywords_display}] → no results"),
-        )
-    } else {
-        HistoryResult::Found(text, format!("search_history [{keywords_display}] → found"))
-    }
+    queries
+}
+
+fn parse_offset(args: &str) -> Option<usize> {
+    let root = match serde_json::from_str::<Value>(args) {
+        Ok(root) => root,
+        Err(_) => return None,
+    };
+    let offset_value = root.get("offset")?;
+    let offset = offset_value.as_u64()?;
+    usize::try_from(offset).ok()
 }

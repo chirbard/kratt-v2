@@ -1,25 +1,5 @@
 use crate::session::RecentEntry;
 
-pub const HISTORY_LOOKUP_KEYWORDS: &[&str] = &[
-    "remember",
-    "earlier",
-    "last time",
-    "last session",
-    "you said",
-    "we said",
-    "previous",
-    "history",
-    "search",
-    "when did",
-    "what did you",
-    "what did i",
-    "what did we",
-    "do you recall",
-    "can you recall",
-    "did we",
-    "did i",
-];
-
 pub const CHAT_SYSTEM_PROMPT: &str = r#"You are a direct, honest assistant with your own epistemic standards.
 
 - Push back on wrong assumptions and refuse to build on a bad premise
@@ -28,31 +8,6 @@ pub const CHAT_SYSTEM_PROMPT: &str = r#"You are a direct, honest assistant with 
 - Use <memory> to recall what you know about the user
 - Use <recent_context> for short-term continuity
 - Never output graph data, JSON, edge lists, or memory update descriptions"#;
-
-pub const HISTORY_LOOKUP_EXPLANATION: &str = r#"You are a memory lookup agent. Decide whether to search past session history before the main model answers.
-
-Search aggressively — if there is any chance past sessions contain relevant information, search. Default to searching, not skipping. For search_history, provide 3–5 short keywords covering different phrasings — match is substring OR across keywords.
-
-Output ONLY one of:
-1. A raw JSON tool call (no prose, no markdown fences)
-2. The word: skip — only if the question clearly could not exist in past sessions"#;
-
-pub const WEB_CHECK_EXPLANATION: &str = r#"You are a web fact-check decision agent. Decide if a web search is needed before the user receives an answer.
-
-Search when the user message: mentions a specific software version, release, or changelog; asserts a date, news item, or world event that may post-date your training; contains a claim contradicting the memory graph; asks about something that changes over time.
-
-Skip when: conversational, personal, or opinion-based; about timeless knowledge or already verified in memory; no verifiable factual claims.
-
-Output ONLY one of:
-1. The word: skip
-2. Raw JSON with 2–3 targeted queries (no prose, no markdown): {"tool":"search","args":{"queries":["exact claim","current stable release","RC or upcoming"]}}
-
-Always provide separate queries for the exact claim, the current stable release, and any RC/upcoming release."#;
-
-pub const HISTORY_FOUND_PREFIX: &str = "\n\n[History lookup result]\n";
-pub const HISTORY_NOT_FOUND_PREFIX: &str = "\n\n[History search found no results for: ";
-pub const HISTORY_NOT_FOUND_SUFFIX: &str =
-    "]\nIf you cannot answer from your memory graph either, say explicitly that you checked your memory and searched past sessions for these keywords but found nothing.";
 
 pub const EXTRACT_EXPLANATION: &str = r#"You are an aggressive extraction agent for a memory graph. Extract every entity and relationship from the conversation that is not yet in the graph.
 
@@ -122,14 +77,6 @@ pub const JSON_OUTPUT_RULES: &str = r#"Respond with raw JSON only. No markdown. 
 Single call: {"tool":"upsert_node","args":{"name":"example","type":"entity","body":"","date":""}}
 Multiple calls: {"tools":[{"tool":"upsert_node","args":{"name":"example","type":"entity","body":"","date":""}},{"tool":"upsert_edge","args":{"source":"a","target":"b","content":"<subject> verb <target>","stability":1.0,"confidence":1.0,"importance":0.0,"subject":false,"date":"YYYY-MM-DD"}}]}"#;
 
-pub const HISTORY_TOOL_DEFINITIONS: &str = r#"read_history — returns a specific past turn from the current session.
-{"tool":"read_history","args":{"offset":0}}
-offset: 0 = most recent turn, 1 = one before that, etc.
-
-search_history — substring search (OR) across all past sessions. Multiple short keywords cast a wider net.
-{"tool":"search_history","args":{"queries":["keyword1","keyword2","keyword3"]}}
-Returns up to 5 matching lines with timestamps."#;
-
 pub fn build_agent_prompt(
     explanation: &str,
     toon: &str,
@@ -182,33 +129,6 @@ pub fn build_chat_system_prompt(memory_toon: &str, recent_entries: &[RecentEntry
         prompt.push_str("</recent_context>");
     }
     prompt
-}
-
-pub fn build_history_lookup_prompt(user_msg: &str) -> String {
-    let mut prompt = String::from(HISTORY_LOOKUP_EXPLANATION);
-    prompt.push_str("\nToday's date is ");
-    prompt.push_str(&today_iso());
-    prompt.push('.');
-    prompt.push_str("\n\n<tools>\n");
-    prompt.push_str(HISTORY_TOOL_DEFINITIONS);
-    prompt.push_str("\n</tools>\n\nUser message: ");
-    prompt.push_str(user_msg);
-    prompt
-}
-
-pub fn build_web_check_prompt(user_msg: &str, memory_toon: &str) -> String {
-    let mut text = String::from(WEB_CHECK_EXPLANATION);
-    text.push_str("\nToday's date is ");
-    text.push_str(&today_iso());
-    text.push('.');
-    if !memory_toon.trim().is_empty() {
-        text.push_str("\n\n<memory>\n");
-        text.push_str(memory_toon);
-        text.push_str("\n</memory>");
-    }
-    text.push_str("\n\nUser message: ");
-    text.push_str(user_msg);
-    text
 }
 
 fn recent_role_label(recent_entry: &RecentEntry) -> &str {
