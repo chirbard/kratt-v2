@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::api::{Chunk, LlmClient, Stats};
+use crate::api::{Chunk, EmbeddingClient, LlmClient, Stats};
 use crate::memory::{self, DreamEvent, MemoryEvent};
 use crate::session;
 use crate::web::SearchClient;
@@ -48,6 +48,7 @@ pub(crate) struct Message {
 pub(crate) struct App {
     pub(crate) chat_llm: Arc<dyn LlmClient>,
     pub(crate) memory_llm: Arc<dyn LlmClient>,
+    pub(crate) embed: Arc<dyn EmbeddingClient>,
     pub(crate) search: Option<Arc<dyn SearchClient>>,
     pub(crate) input: String,
     pub(crate) mode: Mode,
@@ -62,13 +63,13 @@ pub(crate) struct App {
     pub(crate) memory_auto_scroll: bool,
     pub(crate) stream_rx: Option<std::sync::mpsc::Receiver<Chunk>>,
     pub(crate) memory_rx: Option<std::sync::mpsc::Receiver<MemoryEvent>>,
+    pub(crate) embed_rx: Option<std::sync::mpsc::Receiver<MemoryEvent>>,
     pub(crate) memory_log: Vec<(String, String)>,
     pub(crate) show_memory_panel: bool,
     pub(crate) show_reasoning: bool,
     pub(crate) show_debug: bool,
     pub(crate) show_tools: bool,
     pub(crate) session_path: PathBuf,
-    pub(crate) memory_toon: String,
     pub(crate) last_user_message_id: String,
     pub(crate) dream_state: DreamState,
     pub(crate) dream_rx: Option<std::sync::mpsc::Receiver<DreamEvent>>,
@@ -80,13 +81,14 @@ impl App {
     pub(crate) fn new(
         chat_llm: Arc<dyn LlmClient>,
         memory_llm: Arc<dyn LlmClient>,
+        embed: Arc<dyn EmbeddingClient>,
         search: Option<Arc<dyn SearchClient>>,
-        memory_toon: String,
         session_path: PathBuf,
     ) -> Self {
         Self {
             chat_llm,
             memory_llm,
+            embed,
             search,
             input: String::new(),
             mode: Mode::Insert,
@@ -101,13 +103,13 @@ impl App {
             memory_auto_scroll: true,
             stream_rx: None,
             memory_rx: None,
+            embed_rx: None,
             memory_log: Vec::new(),
             show_memory_panel: false,
             show_reasoning: true,
             show_debug: false,
             show_tools: false,
             session_path,
-            memory_toon,
             last_user_message_id: String::new(),
             dream_state: DreamState::Idle,
             dream_rx: None,
@@ -172,9 +174,11 @@ pub(crate) fn drain_memory(app: &mut App) {
                 _ => app.memory_log.push((phase.to_string(), text)),
             },
             Ok(MemoryEvent::Done) => {
-                let graph = memory::load_graph();
-                app.memory_toon = toon::encode(&memory::graph_to_json(&graph), None);
                 app.memory_state = MemoryState::Idle;
+                let embed = Arc::clone(&app.embed);
+                let (embed_tx, embed_rx) = std::sync::mpsc::channel::<MemoryEvent>();
+                std::thread::spawn(move || memory::run_embed_pass(embed, &embed_tx));
+                app.embed_rx = Some(embed_rx);
                 return;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -185,6 +189,26 @@ pub(crate) fn drain_memory(app: &mut App) {
                 app.memory_state = MemoryState::Idle;
                 return;
             }
+        }
+    }
+}
+
+pub(crate) fn drain_embed(app: &mut App) {
+    let embed_receiver = match app.embed_rx.take() {
+        Some(embed_receiver) => embed_receiver,
+        None => return,
+    };
+    loop {
+        match embed_receiver.try_recv() {
+            Ok(MemoryEvent::Log { phase, text }) => {
+                app.memory_log.push((phase.to_string(), text));
+            }
+            Ok(MemoryEvent::Append { .. }) | Ok(MemoryEvent::Done) => {}
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                app.embed_rx = Some(embed_receiver);
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
         }
     }
 }
@@ -206,8 +230,6 @@ pub(crate) fn drain_dream(app: &mut App) {
             Ok(DreamEvent::Done { edges_added }) => {
                 app.dream_summary = format!("dream done — {edges_added} edges written");
                 app.dream_state = DreamState::Done;
-                let graph = memory::load_graph();
-                app.memory_toon = toon::encode(&memory::graph_to_json(&graph), None);
                 return;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -248,8 +270,9 @@ pub(crate) fn start_dream(app: &mut App) {
     app.dream_summary.clear();
     let (sender, receiver) = std::sync::mpsc::channel::<DreamEvent>();
     let llm = Arc::clone(&app.memory_llm);
+    let embed = Arc::clone(&app.embed);
     std::thread::spawn(move || {
-        let _ = memory::run_dream_pass(llm, sender);
+        let _ = memory::run_dream_pass(llm, embed, sender);
     });
     app.dream_rx = Some(receiver);
     app.dream_state = DreamState::Running;

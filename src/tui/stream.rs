@@ -3,20 +3,20 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 
-use crate::api::{Chunk, LlmClient, Stats, ToolCallRequest, TurnOutcome};
+use crate::api::{Chunk, EmbeddingClient, LlmClient, Stats, ToolCallRequest, TurnOutcome};
 use crate::memory;
 use crate::prompts;
 use crate::session;
 use crate::web::SearchClient;
 
-use super::app::{App, Message, RECENT_TURNS, Role, State};
+use super::app::{App, Message, Role, State};
 
 pub(crate) struct StreamJob {
     pub(crate) llm: Arc<dyn LlmClient>,
+    pub(crate) embed: Arc<dyn EmbeddingClient>,
     pub(crate) search: Option<Arc<dyn SearchClient>>,
     pub(crate) prompt: String,
     pub(crate) session_path: std::path::PathBuf,
-    pub(crate) system_opt: Option<String>,
     pub(crate) sender: std::sync::mpsc::Sender<Chunk>,
 }
 
@@ -29,7 +29,6 @@ struct StatsAgg {
 
 pub(crate) fn start_stream(app: &mut App) {
     let prompt = std::mem::take(&mut app.input);
-    let recent_entries = session::load_recent_entries(&app.session_path, RECENT_TURNS);
     app.last_user_message_id = session::append_entry(&app.session_path, "user", &prompt);
     app.history.push(Message {
         role: Role::User,
@@ -48,18 +47,12 @@ pub(crate) fn start_stream(app: &mut App) {
     app.state = State::Streaming;
     let (sender, recvr) = std::sync::mpsc::channel();
     app.stream_rx = Some(recvr);
-    let system = prompts::build_chat_system_prompt(&app.memory_toon, &recent_entries);
-    let system_opt = if system.is_empty() {
-        None
-    } else {
-        Some(system)
-    };
     let job = StreamJob {
         llm: Arc::clone(&app.chat_llm),
+        embed: Arc::clone(&app.embed),
         search: clone_search_client(app),
         prompt,
         session_path: app.session_path.clone(),
-        system_opt,
         sender,
     };
     std::thread::spawn(move || run_stream_worker(job));
@@ -73,7 +66,15 @@ fn clone_search_client(app: &App) -> Option<Arc<dyn SearchClient>> {
 }
 
 fn run_stream_worker(job: StreamJob) {
-    let mut messages = build_initial_messages(&job.prompt, job.system_opt.as_deref());
+    let recent_entries = session::load_recent_entries(&job.session_path, super::app::RECENT_TURNS);
+    let memory_block = build_memory_block(&*job.embed, &job.prompt);
+    let system = prompts::build_chat_system_prompt(&memory_block, &recent_entries);
+    let system_opt = if system.is_empty() {
+        None
+    } else {
+        Some(system)
+    };
+    let mut messages = build_initial_messages(&job.prompt, system_opt.as_deref());
     let tools = build_tools(job.search.is_some());
     let mut stats_agg = StatsAgg {
         tokens_in: 0,
@@ -98,6 +99,14 @@ fn run_stream_worker(job: StreamJob) {
         }
         first_turn = false;
     }
+}
+
+fn build_memory_block(embed: &dyn EmbeddingClient, query: &str) -> String {
+    let edges = memory::select_semantic_edges(embed, query);
+    if edges.is_empty() {
+        return String::new();
+    }
+    memory::edges_to_toon(&edges)
 }
 
 fn build_initial_messages(prompt: &str, system_opt: Option<&str>) -> Vec<Value> {

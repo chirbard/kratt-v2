@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 const DEFAULT_CHAT_MODEL: &str = "deepseek/deepseek-v4-flash";
 const DEFAULT_MEMORY_MODEL: &str = "openai/gpt-oss-20b:nitro";
+const DEFAULT_EMBED_MODEL: &str = "perplexity/pplx-embed-v1-0.6b";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv()?;
@@ -34,8 +35,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(model) => model,
         Err(_) => DEFAULT_MEMORY_MODEL.to_string(),
     };
+    let embed_model = DEFAULT_EMBED_MODEL.to_string();
     let chat_llm: Arc<dyn api::LlmClient> = Arc::new(api::new_client(api_key.clone(), chat_model));
-    let memory_llm: Arc<dyn api::LlmClient> = Arc::new(api::new_client(api_key, memory_model));
+    let memory_llm: Arc<dyn api::LlmClient> =
+        Arc::new(api::new_client(api_key.clone(), memory_model));
+    let embed: Arc<dyn api::EmbeddingClient> =
+        Arc::new(api::new_embed_client(api_key.clone(), embed_model));
     let search: Option<Arc<dyn web::SearchClient>> = if tavily_key.is_empty() {
         None
     } else {
@@ -44,8 +49,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(err) = memory::db_init() {
         eprintln!("warning: db init failed: {err}");
     }
-    let graph = memory::load_graph();
-    let memory_toon = toon::encode(&memory::graph_to_json(&graph), None);
+    let (embed_tx, _embed_rx) = std::sync::mpsc::channel::<memory::MemoryEvent>();
+    memory::run_embed_pass(Arc::clone(&embed), &embed_tx);
     let session_path = session::new_session_path();
-    tui::run(chat_llm, memory_llm, search, memory_toon, session_path)
+    tui::run(chat_llm, memory_llm, embed, search, session_path)
 }

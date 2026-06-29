@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use turso::Connection;
 
-use crate::api::LlmClient;
+use crate::api::{EmbeddingClient, LlmClient};
 use crate::prompts::{
     self, DREAM_BIOLOGIST, DREAM_CHILD, DREAM_CONNECTOR, DREAM_CONSOLIDATION, DREAM_ECONOMIST,
     DREAM_HISTORIAN, DREAM_LATERAL, DREAM_SKEPTIC,
@@ -12,10 +12,14 @@ use crate::prompts::{
 
 use super::agent::{ToolCall, parse_tool_calls, stream_collect};
 use super::db;
+use super::embed::{edges_to_toon, select_semantic_edges};
 use super::graph::{Edge, Node, graph_to_json, normalize_id};
 
 const DREAM_CONFIDENCE_CAP: f64 = 0.6;
 const DREAM_STABILITY: f64 = 0.3;
+const BIOLOGIST_ANCHOR: &str = "biology ecosystem evolution adaptation living organisms life systems";
+const HISTORIAN_ANCHOR: &str = "history timeline events temporal sequence causation past future";
+const ECONOMIST_ANCHOR: &str = "economics incentives trade-offs optimization value cost benefit";
 
 pub enum DreamEvent {
     Log { phase: &'static str, text: String },
@@ -25,9 +29,10 @@ pub enum DreamEvent {
 
 pub fn run_dream_pass(
     llm: Arc<dyn LlmClient>,
+    embed: Arc<dyn EmbeddingClient>,
     sender: std::sync::mpsc::Sender<DreamEvent>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    match execute_dream_pass(Arc::clone(&llm), &sender) {
+    match execute_dream_pass(Arc::clone(&llm), Arc::clone(&embed), &sender) {
         Ok(edges_added) => {
             let _ = sender.send(DreamEvent::Done { edges_added });
             Ok(())
@@ -46,18 +51,20 @@ pub fn run_dream_pass(
 
 fn execute_dream_pass(
     llm: Arc<dyn LlmClient>,
+    embed: Arc<dyn EmbeddingClient>,
     sender: &std::sync::mpsc::Sender<DreamEvent>,
 ) -> Result<usize, Box<dyn Error + Send + Sync>> {
     let session_id = dream_session_id();
     let created_at = dream_timestamp();
     db::register_dream_session(&session_id, &created_at);
     let graph = db::load_graph();
-    let toon = toon::encode(&graph_to_json(&graph), None);
-    let domain = run_domain_agents(Arc::clone(&llm), &session_id, &toon, sender)?;
+    let global_toon = toon::encode(&graph_to_json(&graph), None);
+    let domain = run_domain_agents(Arc::clone(&llm), embed, &session_id, &global_toon, sender)?;
     let abstract_outputs =
-        run_abstract_agents(Arc::clone(&llm), &session_id, &toon, &domain, sender)?;
+        run_abstract_agents(Arc::clone(&llm), &session_id, &global_toon, &domain, sender)?;
     let all_ctx = consolidation_context(&domain, &abstract_outputs);
-    let consolidation = run_consolidation_agent(llm, &session_id, &toon, &all_ctx, sender)?;
+    let consolidation =
+        run_consolidation_agent(llm, &session_id, &global_toon, &all_ctx, sender)?;
     let tool_calls = parse_tool_calls(&consolidation);
     let source_id = format!("dream:{session_id}");
     let conn = db::open_connection()?;
@@ -77,24 +84,33 @@ struct DomainOutputs {
     child: String,
 }
 
+struct DomainToons {
+    biologist: String,
+    historian: String,
+    economist: String,
+    child: String,
+}
+
 fn run_domain_agents(
     llm: Arc<dyn LlmClient>,
+    embed: Arc<dyn EmbeddingClient>,
     session_id: &str,
-    toon: &str,
+    global_toon: &str,
     sender: &std::sync::mpsc::Sender<DreamEvent>,
 ) -> Result<DomainOutputs, Box<dyn Error + Send + Sync>> {
     type AgentHandle = std::thread::JoinHandle<Result<String, Box<dyn Error + Send + Sync>>>;
-    let specs: [(&'static str, &'static str); 4] = [
-        ("biologist", DREAM_BIOLOGIST),
-        ("historian", DREAM_HISTORIAN),
-        ("economist", DREAM_ECONOMIST),
-        ("child", DREAM_CHILD),
+    let toons = build_domain_toons(&*embed, global_toon);
+    let specs = [
+        ("biologist", DREAM_BIOLOGIST, toons.biologist),
+        ("historian", DREAM_HISTORIAN, toons.historian),
+        ("economist", DREAM_ECONOMIST, toons.economist),
+        ("child", DREAM_CHILD, toons.child),
     ];
     let mut handles: Vec<AgentHandle> = Vec::new();
-    for (phase, explanation) in specs {
+    for (phase, explanation, toon) in specs {
         let llm_clone = Arc::clone(&llm);
         let session = session_id.to_string();
-        let prompt = prompts::build_dream_prompt(explanation, toon, None);
+        let prompt = prompts::build_dream_prompt(explanation, &toon, None);
         let agent_tx = sender.clone();
         handles.push(std::thread::spawn(move || {
             run_dream_agent(llm_clone, phase, prompt, &session, &agent_tx)
@@ -108,7 +124,26 @@ fn run_domain_agents(
     let economist = outputs.pop().unwrap_or_default();
     let historian = outputs.pop().unwrap_or_default();
     let biologist = outputs.pop().unwrap_or_default();
-    Ok(DomainOutputs { biologist, historian, economist, child: child_out })
+    Ok(DomainOutputs {
+        biologist,
+        historian,
+        economist,
+        child: child_out,
+    })
+}
+
+fn build_domain_toons(embed: &dyn EmbeddingClient, global_toon: &str) -> DomainToons {
+    DomainToons {
+        biologist: focused_toon(embed, BIOLOGIST_ANCHOR),
+        historian: focused_toon(embed, HISTORIAN_ANCHOR),
+        economist: focused_toon(embed, ECONOMIST_ANCHOR),
+        child: global_toon.to_string(),
+    }
+}
+
+fn focused_toon(embed: &dyn EmbeddingClient, anchor: &str) -> String {
+    let edges = select_semantic_edges(embed, anchor);
+    edges_to_toon(&edges)
 }
 
 fn join_agent(

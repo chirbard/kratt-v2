@@ -219,14 +219,14 @@ pub fn build_dream_prompt(explanation: &str, toon: &str, context: Option<&str>) 
     prompt
 }
 
-pub fn build_chat_system_prompt(memory_toon: &str, recent_entries: &[RecentEntry]) -> String {
+pub fn build_chat_system_prompt(memory_block: &str, recent_entries: &[RecentEntry]) -> String {
     let mut prompt = String::from(CHAT_SYSTEM_PROMPT);
     prompt.push_str("\nToday's date is ");
     prompt.push_str(&today_iso());
     prompt.push('.');
-    if !memory_toon.trim().is_empty() {
+    if !memory_block.trim().is_empty() {
         prompt.push_str("\n\n<memory>\n");
-        prompt.push_str(memory_toon);
+        prompt.push_str(memory_block);
         prompt.push_str("\n</memory>");
     }
     if !recent_entries.is_empty() {

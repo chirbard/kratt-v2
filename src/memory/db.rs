@@ -9,6 +9,7 @@ use super::graph::{Edge, Graph, Node, load_from_toon, normalize_id};
 
 const DATA_DIR: &str = "kratt-data";
 const DB_PATH: &str = "kratt-data/kratt.db";
+pub type SemanticEdgeRow = (String, String, String, f64, f64, f64, bool, String);
 
 #[allow(clippy::expect_used)]
 fn runtime() -> &'static Runtime {
@@ -44,6 +45,7 @@ async fn init_schema(conn: &Connection) -> Result<(), Box<dyn Error + Send + Syn
     create_base_tables(conn).await?;
     create_history_tables(conn).await?;
     add_edge_provenance_column(conn).await;
+    add_edge_embedding_column(conn).await;
     Ok(())
 }
 
@@ -95,6 +97,18 @@ async fn add_edge_provenance_column(conn: &Connection) {
     let _ = conn
         .execute(
             "ALTER TABLE edges ADD COLUMN source_message_id TEXT NOT NULL DEFAULT ''",
+            (),
+        )
+        .await;
+}
+
+async fn add_edge_embedding_column(conn: &Connection) {
+    let _ = conn
+        .execute("ALTER TABLE edges ADD COLUMN embedding BLOB", ())
+        .await;
+    let _ = conn
+        .execute(
+            "CREATE INDEX IF NOT EXISTS edges_vec ON edges (libsql_vector_idx(embedding, 1024))",
             (),
         )
         .await;
@@ -287,6 +301,185 @@ pub fn erase_edge(
         .await?;
         Ok(())
     })
+}
+
+pub fn load_unembedded_edges() -> Vec<(String, String, String)> {
+    let Ok(conn) = open_connection() else {
+        return Vec::new();
+    };
+    runtime().block_on(load_unembedded_edges_async(&conn))
+}
+
+async fn load_unembedded_edges_async(conn: &Connection) -> Vec<(String, String, String)> {
+    let Ok(mut rows) = conn
+        .query(
+            "SELECT source, target, content FROM edges WHERE embedding IS NULL",
+            (),
+        )
+        .await
+    else {
+        return Vec::new();
+    };
+    let mut edges = Vec::new();
+    while let Ok(Some(row)) = rows.next().await {
+        let Some(edge) = parse_unembedded_edge_row(&row) else {
+            continue;
+        };
+        edges.push(edge);
+    }
+    edges
+}
+
+fn parse_unembedded_edge_row(row: &turso::Row) -> Option<(String, String, String)> {
+    let source = text(row.get_value(0).ok()?);
+    let target = text(row.get_value(1).ok()?);
+    let content = text(row.get_value(2).ok()?);
+    Some((source, target, content))
+}
+
+pub fn save_edge_embedding(
+    source: &str,
+    target: &str,
+    vector: &[f64],
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let json_str = serde_json::to_string(vector)?;
+    let conn = open_connection()?;
+    runtime().block_on(async {
+        conn.execute(
+            "UPDATE edges SET embedding = vector32(?1) WHERE source = ?2 AND target = ?3",
+            params![json_str.as_str(), source, target],
+        )
+        .await?;
+        Ok(())
+    })
+}
+
+pub fn query_edges_by_vector(
+    vector: &[f64],
+    limit: usize,
+) -> Result<Vec<SemanticEdgeRow>, Box<dyn Error + Send + Sync>>
+{
+    let json_str = serde_json::to_string(vector)?;
+    let conn = open_connection()?;
+    runtime().block_on(query_edges_by_vector_async(&conn, &json_str, limit))
+}
+
+async fn query_edges_by_vector_async(
+    conn: &Connection,
+    json_str: &str,
+    limit: usize,
+) -> Result<Vec<SemanticEdgeRow>, Box<dyn Error + Send + Sync>>
+{
+    let limit_value = limit as i64;
+    match query_edges_ann(conn, json_str, limit_value).await {
+        Ok(rows) => Ok(rows),
+        Err(_) => query_edges_scan(conn, json_str, limit_value).await,
+    }
+}
+
+async fn query_edges_ann(
+    conn: &Connection,
+    json_str: &str,
+    limit: i64,
+) -> Result<Vec<SemanticEdgeRow>, Box<dyn Error + Send + Sync>>
+{
+    execute_semantic_query(
+        conn,
+        "SELECT e.source, e.target, e.content, e.confidence, e.stability, e.importance, e.subject, e.date FROM vector_top_k('edges_vec', vector32(?1), ?2) AS vt JOIN edges AS e ON e.rowid = vt.id",
+        json_str,
+        limit,
+    )
+    .await
+}
+
+async fn query_edges_scan(
+    conn: &Connection,
+    json_str: &str,
+    limit: i64,
+) -> Result<Vec<SemanticEdgeRow>, Box<dyn Error + Send + Sync>>
+{
+    execute_semantic_query(
+        conn,
+        "SELECT source, target, content, confidence, stability, importance, subject, date FROM edges WHERE embedding IS NOT NULL ORDER BY vector_distance_cos(embedding, vector32(?1)) LIMIT ?2",
+        json_str,
+        limit,
+    )
+    .await
+}
+
+async fn execute_semantic_query(
+    conn: &Connection,
+    query: &str,
+    json_str: &str,
+    limit: i64,
+) -> Result<Vec<SemanticEdgeRow>, Box<dyn Error + Send + Sync>>
+{
+    let mut rows = conn.query(query, params![json_str, limit]).await?;
+    let mut edges = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let Some(edge) = parse_semantic_edge_row(&row) else {
+            continue;
+        };
+        edges.push(edge);
+    }
+    Ok(edges)
+}
+
+fn parse_semantic_edge_row(row: &turso::Row) -> Option<SemanticEdgeRow> {
+    let source = text(row.get_value(0).ok()?);
+    let target = text(row.get_value(1).ok()?);
+    let content = text(row.get_value(2).ok()?);
+    let confidence = real(row.get_value(3).ok()?);
+    let stability = real(row.get_value(4).ok()?);
+    let importance = real(row.get_value(5).ok()?);
+    let subject = int(row.get_value(6).ok()?) != 0;
+    let date = text(row.get_value(7).ok()?);
+    Some((source, target, content, confidence, stability, importance, subject, date))
+}
+
+pub fn load_all_edges_semantic() -> Vec<SemanticEdgeRow> {
+    let Ok(conn) = open_connection() else {
+        return Vec::new();
+    };
+    runtime().block_on(load_all_edges_semantic_async(&conn))
+}
+
+async fn load_all_edges_semantic_async(
+    conn: &Connection,
+) -> Vec<SemanticEdgeRow> {
+    let Ok(mut rows) = conn
+        .query(
+            "SELECT source, target, content, confidence, stability, importance, subject, date FROM edges",
+            (),
+        )
+        .await
+    else {
+        return Vec::new();
+    };
+    let mut edges = Vec::new();
+    while let Ok(Some(row)) = rows.next().await {
+        let Some(edge) = parse_semantic_edge_row(&row) else {
+            continue;
+        };
+        edges.push(edge);
+    }
+    edges
+}
+
+pub fn edge_count() -> usize {
+    let Ok(conn) = open_connection() else {
+        return 0;
+    };
+    let result = runtime().block_on(async {
+        let mut rows = conn.query("SELECT COUNT(*) FROM edges", ()).await?;
+        if let Some(row) = rows.next().await?
+            && let Value::Integer(count) = row.get_value(0)?
+        {
+            return Ok::<usize, Box<dyn Error + Send + Sync>>(count as usize);
+        }
+        Ok(0)
+    });
+    result.unwrap_or_default()
 }
 
 async fn write_graph(conn: &Connection, graph: &Graph) -> Result<(), Box<dyn Error + Send + Sync>> {

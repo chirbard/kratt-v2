@@ -346,6 +346,7 @@ fn phase_color(phase: &str) -> Color {
         "extract" => Color::Cyan,
         "consolidate" => Color::Yellow,
         "memory" => Color::Green,
+        "embed" => Color::Green,
         "biologist" | "historian" | "economist" | "child" => Color::Blue,
         "connector" => Color::Cyan,
         "skeptic" => Color::Red,

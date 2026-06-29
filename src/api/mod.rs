@@ -1,4 +1,5 @@
 mod client;
+mod embed;
 
 use std::error::Error;
 use std::sync::mpsc::Sender;
@@ -42,6 +43,14 @@ pub trait LlmClient: Send + Sync {
     ) -> Result<TurnOutcome, Box<dyn Error + Send + Sync>>;
 }
 
+pub trait EmbeddingClient: Send + Sync {
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f64>>, Box<dyn Error + Send + Sync>>;
+}
+
 pub(crate) fn new_client(api_key: String, model: String) -> impl LlmClient {
     client::OpenRouterClient::new(api_key, model)
+}
+
+pub(crate) fn new_embed_client(api_key: String, model: String) -> impl EmbeddingClient {
+    embed::OpenRouterEmbedClient::new(api_key, model)
 }
