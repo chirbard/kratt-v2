@@ -564,7 +564,7 @@ pub fn register_dream_session(session_id: &str, created_at: &str) {
 }
 
 pub fn insert_message(session_id: &str, role: &str, content: &str, created_at: &str) -> String {
-    let message_id = format!("{session_id}:{created_at}");
+    let message_id = format!("{session_id}:{role}:{created_at}");
     let Ok(conn) = open_connection() else {
         return message_id;
     };
