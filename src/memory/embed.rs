@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::sync::Arc;
 
@@ -11,7 +12,9 @@ use super::db;
 pub const EMBED_BATCH: usize = 50;
 pub const TOP_K: usize = 60;
 pub const SMALL_GRAPH_THRESHOLD: usize = 100;
+pub const MAX_POOL: usize = 150;
 
+#[derive(Clone)]
 pub struct SemanticEdge {
     pub source: String,
     pub target: String,
@@ -43,7 +46,10 @@ pub fn embed_text(
     }
 }
 
-pub fn run_embed_pass(embed: Arc<dyn EmbeddingClient>, sender: &std::sync::mpsc::Sender<MemoryEvent>) {
+pub fn run_embed_pass(
+    embed: Arc<dyn EmbeddingClient>,
+    sender: &std::sync::mpsc::Sender<MemoryEvent>,
+) {
     let pending = db::load_unembedded_edges();
     let mut start = 0usize;
     let mut embedded = 0usize;
@@ -60,21 +66,13 @@ pub fn run_embed_pass(embed: Arc<dyn EmbeddingClient>, sender: &std::sync::mpsc:
 
 pub fn select_semantic_edges(embed: &dyn EmbeddingClient, query: &str) -> Vec<SemanticEdge> {
     if db::edge_count() < SMALL_GRAPH_THRESHOLD {
-        return all_semantic_edges();
+        return fallback_edges();
     }
-    let vector = match embed_text(embed, query) {
-        Ok(vector) => vector,
-        Err(_) => return all_semantic_edges(),
+    let Some(anchors) = anchor_edges(embed, query) else {
+        return fallback_edges();
     };
-    match db::query_edges_by_vector(&vector, TOP_K) {
-        Ok(rows) => {
-            if rows.is_empty() {
-                return all_semantic_edges();
-            }
-            rows_to_semantic_edges(rows)
-        }
-        Err(_) => all_semantic_edges(),
-    }
+    let all_edges = all_semantic_edges();
+    expand_hops(anchors, all_edges)
 }
 
 pub fn edges_to_toon(edges: &[SemanticEdge]) -> String {
@@ -131,9 +129,119 @@ fn all_semantic_edges() -> Vec<SemanticEdge> {
     rows_to_semantic_edges(db::load_all_edges_semantic())
 }
 
-fn rows_to_semantic_edges(
-    rows: Vec<db::SemanticEdgeRow>,
-) -> Vec<SemanticEdge> {
+fn fallback_edges() -> Vec<SemanticEdge> {
+    rank_and_cap(all_semantic_edges())
+}
+
+fn anchor_edges(embed: &dyn EmbeddingClient, query: &str) -> Option<Vec<SemanticEdge>> {
+    let vector = match embed_text(embed, query) {
+        Ok(vector) => vector,
+        Err(_) => return None,
+    };
+    let rows = match db::query_edges_by_vector(&vector, TOP_K) {
+        Ok(rows) => rows,
+        Err(_) => return None,
+    };
+    if rows.is_empty() {
+        return None;
+    }
+    Some(rows_to_semantic_edges(rows))
+}
+
+fn expand_hops(anchors: Vec<SemanticEdge>, all_edges: Vec<SemanticEdge>) -> Vec<SemanticEdge> {
+    let index = build_node_index(&all_edges);
+    let anchor_nodes = collect_anchor_nodes(&anchors);
+    let mut pool = Vec::new();
+    let mut seen = HashSet::new();
+    for edge in anchors {
+        insert_pool_edge(&mut seen, &mut pool, edge);
+    }
+    let mut hop1_nodes = hop_expand(&anchor_nodes, &index, &all_edges, &mut seen, &mut pool);
+    for node in &anchor_nodes {
+        hop1_nodes.remove(node);
+    }
+    let _ = hop_expand(&hop1_nodes, &index, &all_edges, &mut seen, &mut pool);
+    rank_and_cap(pool)
+}
+
+fn collect_anchor_nodes(edges: &[SemanticEdge]) -> HashSet<String> {
+    let mut nodes = HashSet::new();
+    for edge in edges {
+        nodes.insert(edge.source.clone());
+        nodes.insert(edge.target.clone());
+    }
+    nodes
+}
+
+fn build_node_index(all_edges: &[SemanticEdge]) -> HashMap<String, Vec<usize>> {
+    let mut index = HashMap::new();
+    let mut edge_index = 0usize;
+    while edge_index < all_edges.len() {
+        let edge = &all_edges[edge_index];
+        push_node_index(&mut index, &edge.source, edge_index);
+        push_node_index(&mut index, &edge.target, edge_index);
+        edge_index += 1;
+    }
+    index
+}
+
+fn push_node_index(index: &mut HashMap<String, Vec<usize>>, node: &str, edge_index: usize) {
+    if let Some(edge_indices) = index.get_mut(node) {
+        edge_indices.push(edge_index);
+        return;
+    }
+    index.insert(node.to_string(), vec![edge_index]);
+}
+
+fn hop_expand(
+    nodes: &HashSet<String>,
+    index: &HashMap<String, Vec<usize>>,
+    all_edges: &[SemanticEdge],
+    seen: &mut HashSet<(String, String)>,
+    pool: &mut Vec<SemanticEdge>,
+) -> HashSet<String> {
+    let mut new_nodes = HashSet::new();
+    for node in nodes {
+        let Some(edge_indices) = index.get(node) else {
+            continue;
+        };
+        for edge_index in edge_indices {
+            let edge = &all_edges[*edge_index];
+            if !mark_seen(seen, edge) {
+                continue;
+            }
+            pool.push(edge.clone());
+            new_nodes.insert(edge.source.clone());
+            new_nodes.insert(edge.target.clone());
+        }
+    }
+    new_nodes
+}
+
+fn mark_seen(seen: &mut HashSet<(String, String)>, edge: &SemanticEdge) -> bool {
+    seen.insert((edge.source.clone(), edge.target.clone()))
+}
+
+fn insert_pool_edge(
+    seen: &mut HashSet<(String, String)>,
+    pool: &mut Vec<SemanticEdge>,
+    edge: SemanticEdge,
+) {
+    if !mark_seen(seen, &edge) {
+        return;
+    }
+    pool.push(edge);
+}
+
+fn rank_and_cap(mut pool: Vec<SemanticEdge>) -> Vec<SemanticEdge> {
+    pool.sort_by(|left, right| right.importance.total_cmp(&left.importance));
+    if pool.len() > MAX_POOL {
+        pool.truncate(MAX_POOL);
+    }
+    pool
+}
+
+fn rows_to_semantic_edges(rows: Vec<db::SemanticEdgeRow>) -> Vec<SemanticEdge> {
     let mut edges = Vec::new();
     for (source, target, content, confidence, stability, importance, subject, date) in rows {
         edges.push(SemanticEdge {

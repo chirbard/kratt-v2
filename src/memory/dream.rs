@@ -17,7 +17,8 @@ use super::graph::{Edge, Node, graph_to_json, normalize_id};
 
 const DREAM_CONFIDENCE_CAP: f64 = 0.6;
 const DREAM_STABILITY: f64 = 0.3;
-const BIOLOGIST_ANCHOR: &str = "biology ecosystem evolution adaptation living organisms life systems";
+const BIOLOGIST_ANCHOR: &str =
+    "biology ecosystem evolution adaptation living organisms life systems";
 const HISTORIAN_ANCHOR: &str = "history timeline events temporal sequence causation past future";
 const ECONOMIST_ANCHOR: &str = "economics incentives trade-offs optimization value cost benefit";
 
@@ -63,8 +64,7 @@ fn execute_dream_pass(
     let abstract_outputs =
         run_abstract_agents(Arc::clone(&llm), &session_id, &global_toon, &domain, sender)?;
     let all_ctx = consolidation_context(&domain, &abstract_outputs);
-    let consolidation =
-        run_consolidation_agent(llm, &session_id, &global_toon, &all_ctx, sender)?;
+    let consolidation = run_consolidation_agent(llm, &session_id, &global_toon, &all_ctx, sender)?;
     let tool_calls = parse_tool_calls(&consolidation);
     let source_id = format!("dream:{session_id}");
     let conn = db::open_connection()?;
@@ -250,8 +250,7 @@ fn run_dream_agent(
         prompt,
         |text| send_append(sender, "think", text),
         |text| send_append(sender, phase, text),
-    )
-    {
+    ) {
         Ok(output) => output,
         Err(err) => {
             send_log(sender, phase, format!("error: {err}"));

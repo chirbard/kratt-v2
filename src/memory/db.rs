@@ -357,8 +357,7 @@ pub fn save_edge_embedding(
 pub fn query_edges_by_vector(
     vector: &[f64],
     limit: usize,
-) -> Result<Vec<SemanticEdgeRow>, Box<dyn Error + Send + Sync>>
-{
+) -> Result<Vec<SemanticEdgeRow>, Box<dyn Error + Send + Sync>> {
     let json_str = serde_json::to_string(vector)?;
     let conn = open_connection()?;
     runtime().block_on(query_edges_by_vector_async(&conn, &json_str, limit))
@@ -368,8 +367,7 @@ async fn query_edges_by_vector_async(
     conn: &Connection,
     json_str: &str,
     limit: usize,
-) -> Result<Vec<SemanticEdgeRow>, Box<dyn Error + Send + Sync>>
-{
+) -> Result<Vec<SemanticEdgeRow>, Box<dyn Error + Send + Sync>> {
     let limit_value = limit as i64;
     match query_edges_ann(conn, json_str, limit_value).await {
         Ok(rows) => Ok(rows),
@@ -381,8 +379,7 @@ async fn query_edges_ann(
     conn: &Connection,
     json_str: &str,
     limit: i64,
-) -> Result<Vec<SemanticEdgeRow>, Box<dyn Error + Send + Sync>>
-{
+) -> Result<Vec<SemanticEdgeRow>, Box<dyn Error + Send + Sync>> {
     execute_semantic_query(
         conn,
         "SELECT e.source, e.target, e.content, e.confidence, e.stability, e.importance, e.subject, e.date FROM vector_top_k('edges_vec', vector32(?1), ?2) AS vt JOIN edges AS e ON e.rowid = vt.id",
@@ -396,8 +393,7 @@ async fn query_edges_scan(
     conn: &Connection,
     json_str: &str,
     limit: i64,
-) -> Result<Vec<SemanticEdgeRow>, Box<dyn Error + Send + Sync>>
-{
+) -> Result<Vec<SemanticEdgeRow>, Box<dyn Error + Send + Sync>> {
     execute_semantic_query(
         conn,
         "SELECT source, target, content, confidence, stability, importance, subject, date FROM edges WHERE embedding IS NOT NULL ORDER BY vector_distance_cos(embedding, vector32(?1)) LIMIT ?2",
@@ -412,8 +408,7 @@ async fn execute_semantic_query(
     query: &str,
     json_str: &str,
     limit: i64,
-) -> Result<Vec<SemanticEdgeRow>, Box<dyn Error + Send + Sync>>
-{
+) -> Result<Vec<SemanticEdgeRow>, Box<dyn Error + Send + Sync>> {
     let mut rows = conn.query(query, params![json_str, limit]).await?;
     let mut edges = Vec::new();
     while let Some(row) = rows.next().await? {
@@ -434,7 +429,9 @@ fn parse_semantic_edge_row(row: &turso::Row) -> Option<SemanticEdgeRow> {
     let importance = real(row.get_value(5).ok()?);
     let subject = int(row.get_value(6).ok()?) != 0;
     let date = text(row.get_value(7).ok()?);
-    Some((source, target, content, confidence, stability, importance, subject, date))
+    Some((
+        source, target, content, confidence, stability, importance, subject, date,
+    ))
 }
 
 pub fn load_all_edges_semantic() -> Vec<SemanticEdgeRow> {
@@ -444,9 +441,7 @@ pub fn load_all_edges_semantic() -> Vec<SemanticEdgeRow> {
     runtime().block_on(load_all_edges_semantic_async(&conn))
 }
 
-async fn load_all_edges_semantic_async(
-    conn: &Connection,
-) -> Vec<SemanticEdgeRow> {
+async fn load_all_edges_semantic_async(conn: &Connection) -> Vec<SemanticEdgeRow> {
     let Ok(mut rows) = conn
         .query(
             "SELECT source, target, content, confidence, stability, importance, subject, date FROM edges",

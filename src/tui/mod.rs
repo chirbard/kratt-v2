@@ -16,8 +16,8 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use crate::api::LlmClient;
 use crate::api::EmbeddingClient;
+use crate::api::LlmClient;
 use crate::web::SearchClient;
 
 use app::{App, drain_dream, drain_embed, drain_memory, drain_stream};
