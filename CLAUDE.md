@@ -2,11 +2,13 @@
 
 ## Vision
 
-This is not just a personal assistant. If the memory system proves itself, it is a state-of-the-art in-context continual learning system — the kind of thing that does not exist yet.
+Every AI provider is racing to build the perfect system — more parameters, more compute, closer to flawless. This is not that race.
 
-The core idea: a weighted knowledge graph where every edge is a natural-language belief with confidence, provenance, and decay. A snapshot of that graph is a **knowledge crystal** — human-readable, versionable, portable, loadable by any base LLM without fine-tuning. The knowledge is separable from the model. That is a fundamentally different artifact from fine-tuned weights, RAG corpora, or prompt templates.
+This system is trying to mimic a human learner: imperfect, but extraordinarily sample-efficient. A person who decides to learn Go never plays a million games. They play once, remember what happened, dream about the positions overnight, read a book, play again — and gradually develop *wisdom* that no cold model possesses, because it was earned. The knowledge graph is long-term memory; dreaming is the overnight consolidation that prevents overfitting to recent experience; exploration is curiosity-driven acquisition; ingestion is focused study of a specific source. The core artifact is a **knowledge crystal** — a weighted graph of natural-language beliefs with confidence, provenance, and decay, portable and loadable by any base LLM without fine-tuning.
 
-Design for the endgame: **millions of edges**, semantic subgraph selection at retrieval time, agent specialization through repeated exploration, inference-time routing to the best-positioned expert for each query. The current graph size is a temporary convenience. Every architectural decision should hold at scale.
+At scale, many independent copies of this system run in parallel, each spending its time in a different domain — one learning an unknown game, one reading biology textbooks, one processing case law. No copy is the best in the world at anything. But together they resemble a large community of people with different experiences and hard-won wisdom rather than just accumulated knowledge. That community can put lightning into any stone: a knowledge crystal snapshot from any copy can be loaded into even a modest base LLM and make it reason with the depth of someone who has genuinely spent time in the domain.
+
+Design for the endgame: **millions of edges**, semantic subgraph selection at retrieval time, agent specialisation through repeated exploration, inference-time routing to the best-positioned expert for each query. The current graph size is a temporary convenience. Every architectural decision should hold at scale.
 
 ## Code rules
 

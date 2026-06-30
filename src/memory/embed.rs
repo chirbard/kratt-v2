@@ -13,6 +13,8 @@ pub const EMBED_BATCH: usize = 50;
 pub const TOP_K: usize = 60;
 pub const SMALL_GRAPH_THRESHOLD: usize = 100;
 pub const MAX_POOL: usize = 150;
+pub const EXPLORATION_CANDIDATES: usize = 200;
+pub const NOVELTY_WEIGHT: f64 = 0.3;
 
 #[derive(Clone)]
 pub struct SemanticEdge {
@@ -75,6 +77,30 @@ pub fn select_semantic_edges(embed: &dyn EmbeddingClient, query: &str) -> Vec<Se
     expand_hops(anchors, all_edges)
 }
 
+pub fn select_exploration_edges(
+    embed: &dyn EmbeddingClient,
+    anchor: &str,
+    agent_name: &str,
+) -> Vec<SemanticEdge> {
+    if db::edge_count() < SMALL_GRAPH_THRESHOLD {
+        return fallback_edges();
+    }
+    let vector = match embed_text(embed, anchor) {
+        Ok(vector) => vector,
+        Err(_) => return fallback_edges(),
+    };
+    let rows = match db::query_edges_by_vector(&vector, EXPLORATION_CANDIDATES) {
+        Ok(rows) => rows,
+        Err(_) => return select_semantic_edges(embed, anchor),
+    };
+    if rows.is_empty() {
+        return select_semantic_edges(embed, anchor);
+    }
+    let anchors = choose_exploration_anchors(rows_to_semantic_edges(rows), agent_name);
+    let all_edges = all_semantic_edges();
+    expand_hops(anchors, all_edges)
+}
+
 pub fn edges_to_toon(edges: &[SemanticEdge]) -> String {
     let mut edges_json = Vec::new();
     for edge in edges {
@@ -133,6 +159,17 @@ fn fallback_edges() -> Vec<SemanticEdge> {
     rank_and_cap(all_semantic_edges())
 }
 
+fn choose_exploration_anchors(
+    candidates: Vec<SemanticEdge>,
+    agent_name: &str,
+) -> Vec<SemanticEdge> {
+    if candidates.len() <= TOP_K {
+        return candidates;
+    }
+    let views = db::load_all_agent_views(agent_name);
+    rank_by_exploration(candidates, &views)
+}
+
 fn anchor_edges(embed: &dyn EmbeddingClient, query: &str) -> Option<Vec<SemanticEdge>> {
     let vector = match embed_text(embed, query) {
         Ok(vector) => vector,
@@ -146,6 +183,42 @@ fn anchor_edges(embed: &dyn EmbeddingClient, query: &str) -> Option<Vec<Semantic
         return None;
     }
     Some(rows_to_semantic_edges(rows))
+}
+
+fn novelty_score(source: &str, target: &str, views: &HashMap<String, i64>) -> f64 {
+    let source_views = *views.get(source).unwrap_or(&0) as f64;
+    let target_views = *views.get(target).unwrap_or(&0) as f64;
+    1.0 / (1.0 + (source_views + target_views) / 2.0)
+}
+
+fn rank_by_exploration(
+    candidates: Vec<SemanticEdge>,
+    views: &HashMap<String, i64>,
+) -> Vec<SemanticEdge> {
+    let mut scored = Vec::new();
+    let total = EXPLORATION_CANDIDATES as f64;
+    let mut rank = 0usize;
+    while rank < candidates.len() {
+        let edge = candidates[rank].clone();
+        let semantic_pos = EXPLORATION_CANDIDATES.saturating_sub(rank) as f64 / total;
+        let novelty = novelty_score(&edge.source, &edge.target, views);
+        let score = (1.0 - NOVELTY_WEIGHT) * semantic_pos + NOVELTY_WEIGHT * novelty;
+        scored.push(ScoredEdge { score, edge });
+        rank += 1;
+    }
+    scored.sort_by(|left, right| right.score.total_cmp(&left.score));
+    top_ranked_edges(scored)
+}
+
+fn top_ranked_edges(mut scored: Vec<ScoredEdge>) -> Vec<SemanticEdge> {
+    if scored.len() > TOP_K {
+        scored.truncate(TOP_K);
+    }
+    let mut edges = Vec::new();
+    for item in scored {
+        edges.push(item.edge);
+    }
+    edges
 }
 
 fn expand_hops(anchors: Vec<SemanticEdge>, all_edges: Vec<SemanticEdge>) -> Vec<SemanticEdge> {
@@ -239,6 +312,11 @@ fn rank_and_cap(mut pool: Vec<SemanticEdge>) -> Vec<SemanticEdge> {
         pool.truncate(MAX_POOL);
     }
     pool
+}
+
+struct ScoredEdge {
+    score: f64,
+    edge: SemanticEdge,
 }
 
 fn rows_to_semantic_edges(rows: Vec<db::SemanticEdgeRow>) -> Vec<SemanticEdge> {

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::sync::OnceLock;
 
@@ -46,6 +46,7 @@ async fn init_schema(conn: &Connection) -> Result<(), Box<dyn Error + Send + Syn
     create_history_tables(conn).await?;
     add_edge_provenance_column(conn).await;
     add_edge_embedding_column(conn).await;
+    add_node_agent_views_table(conn).await;
     Ok(())
 }
 
@@ -109,6 +110,15 @@ async fn add_edge_embedding_column(conn: &Connection) {
     let _ = conn
         .execute(
             "CREATE INDEX IF NOT EXISTS edges_vec ON edges (libsql_vector_idx(embedding, 1024))",
+            (),
+        )
+        .await;
+}
+
+async fn add_node_agent_views_table(conn: &Connection) {
+    let _ = conn
+        .execute(
+            "CREATE TABLE IF NOT EXISTS node_agent_views (node_id TEXT NOT NULL, agent_name TEXT NOT NULL, views INTEGER NOT NULL DEFAULT 0, last_visited_at TEXT NOT NULL DEFAULT '', PRIMARY KEY (node_id, agent_name))",
             (),
         )
         .await;
@@ -459,6 +469,75 @@ async fn load_all_edges_semantic_async(conn: &Connection) -> Vec<SemanticEdgeRow
         edges.push(edge);
     }
     edges
+}
+
+pub fn load_all_agent_views(agent_name: &str) -> HashMap<String, i64> {
+    let Ok(conn) = open_connection() else {
+        return HashMap::new();
+    };
+    runtime().block_on(load_all_agent_views_async(&conn, agent_name))
+}
+
+async fn load_all_agent_views_async(conn: &Connection, agent_name: &str) -> HashMap<String, i64> {
+    let Ok(mut rows) = conn
+        .query(
+            "SELECT node_id, views FROM node_agent_views WHERE agent_name = ?1",
+            params![agent_name],
+        )
+        .await
+    else {
+        return HashMap::new();
+    };
+    let mut views = HashMap::new();
+    while let Ok(Some(row)) = rows.next().await {
+        let Some((node_id, count)) = parse_agent_view_row(&row) else {
+            continue;
+        };
+        views.insert(node_id, count);
+    }
+    views
+}
+
+fn parse_agent_view_row(row: &turso::Row) -> Option<(String, i64)> {
+    let node_id = text(row.get_value(0).ok()?);
+    let count = int(row.get_value(1).ok()?);
+    Some((node_id, count))
+}
+
+pub fn record_agent_views(agent_name: &str, node_ids: &[String], date: &str) {
+    let Ok(conn) = open_connection() else { return };
+    let _ = runtime().block_on(record_agent_views_async(&conn, agent_name, node_ids, date));
+}
+
+async fn record_agent_views_async(
+    conn: &Connection,
+    agent_name: &str,
+    node_ids: &[String],
+    date: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    for node_id in node_ids {
+        increment_agent_view(conn, agent_name, node_id, date).await?;
+    }
+    Ok(())
+}
+
+async fn increment_agent_view(
+    conn: &Connection,
+    agent_name: &str,
+    node_id: &str,
+    date: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    conn.execute(
+        "INSERT INTO node_agent_views (node_id, agent_name, views, last_visited_at) VALUES (?1, ?2, 1, ?3) ON CONFLICT(node_id, agent_name) DO UPDATE SET views = views + 1, last_visited_at = ?3",
+        params![node_id, agent_name, date],
+    )
+    .await?;
+    conn.execute(
+        "UPDATE nodes SET views = views + 1 WHERE id = ?1",
+        params![node_id],
+    )
+    .await?;
+    Ok(())
 }
 
 pub fn edge_count() -> usize {

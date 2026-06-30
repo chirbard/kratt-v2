@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::error::Error;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -12,7 +13,7 @@ use crate::prompts::{
 
 use super::agent::{ToolCall, parse_tool_calls, stream_collect};
 use super::db;
-use super::embed::{edges_to_toon, select_semantic_edges};
+use super::embed::{self, SemanticEdge};
 use super::graph::{Edge, Node, graph_to_json, normalize_id};
 
 const DREAM_CONFIDENCE_CAP: f64 = 0.6;
@@ -133,17 +134,37 @@ fn run_domain_agents(
 }
 
 fn build_domain_toons(embed: &dyn EmbeddingClient, global_toon: &str) -> DomainToons {
+    let today = prompts::today_iso();
+    let biologist = exploration_subgraph(embed, BIOLOGIST_ANCHOR, "biologist");
+    record_domain_views("biologist", &biologist, &today);
+    let historian = exploration_subgraph(embed, HISTORIAN_ANCHOR, "historian");
+    record_domain_views("historian", &historian, &today);
+    let economist = exploration_subgraph(embed, ECONOMIST_ANCHOR, "economist");
+    record_domain_views("economist", &economist, &today);
     DomainToons {
-        biologist: focused_toon(embed, BIOLOGIST_ANCHOR),
-        historian: focused_toon(embed, HISTORIAN_ANCHOR),
-        economist: focused_toon(embed, ECONOMIST_ANCHOR),
+        biologist: embed::edges_to_toon(&biologist),
+        historian: embed::edges_to_toon(&historian),
+        economist: embed::edges_to_toon(&economist),
         child: global_toon.to_string(),
     }
 }
 
-fn focused_toon(embed: &dyn EmbeddingClient, anchor: &str) -> String {
-    let edges = select_semantic_edges(embed, anchor);
-    edges_to_toon(&edges)
+fn exploration_subgraph(
+    embed: &dyn EmbeddingClient,
+    anchor: &str,
+    agent_name: &str,
+) -> Vec<SemanticEdge> {
+    embed::select_exploration_edges(embed, anchor, agent_name)
+}
+
+fn record_domain_views(agent_name: &str, edges: &[SemanticEdge], date: &str) {
+    let mut seen = HashSet::new();
+    for edge in edges {
+        seen.insert(edge.source.clone());
+        seen.insert(edge.target.clone());
+    }
+    let node_ids: Vec<String> = seen.into_iter().collect();
+    db::record_agent_views(agent_name, &node_ids, date);
 }
 
 fn join_agent(
