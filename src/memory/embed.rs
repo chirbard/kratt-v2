@@ -72,6 +72,7 @@ pub fn run_embed_pass(
     embed: Arc<dyn EmbeddingClient>,
     sender: &std::sync::mpsc::Sender<MemoryEvent>,
 ) {
+    let _write_guard = db::acquire_write_lock();
     let pending = db::load_unembedded_edges();
     let mut start = 0usize;
     let mut embedded = 0usize;

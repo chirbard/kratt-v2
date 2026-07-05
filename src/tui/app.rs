@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::api::{Chunk, EmbeddingClient, LlmClient, Stats};
-use crate::memory::{self, DreamEvent, MemoryEvent};
+use crate::memory::{self, DreamEvent, ExploreEvent, MemoryEvent};
 use crate::session;
 use crate::web::SearchClient;
 
@@ -28,6 +28,13 @@ pub(crate) enum MemoryState {
 
 #[derive(PartialEq)]
 pub(crate) enum DreamState {
+    Idle,
+    Running,
+    Done,
+}
+
+#[derive(PartialEq)]
+pub(crate) enum ExploreState {
     Idle,
     Running,
     Done,
@@ -77,6 +84,10 @@ pub(crate) struct App {
     pub(crate) dream_rx: Option<std::sync::mpsc::Receiver<DreamEvent>>,
     pub(crate) dream_log: Vec<(String, String)>,
     pub(crate) dream_summary: String,
+    pub(crate) explore_state: ExploreState,
+    pub(crate) explore_rx: Option<std::sync::mpsc::Receiver<ExploreEvent>>,
+    pub(crate) explore_log: Vec<(String, String)>,
+    pub(crate) explore_summary: String,
 }
 
 impl App {
@@ -118,6 +129,10 @@ impl App {
             dream_rx: None,
             dream_log: Vec::new(),
             dream_summary: String::new(),
+            explore_state: ExploreState::Idle,
+            explore_rx: None,
+            explore_log: Vec::new(),
+            explore_summary: String::new(),
         }
     }
 }
@@ -275,6 +290,33 @@ pub(crate) fn drain_dream(app: &mut App) {
     }
 }
 
+pub(crate) fn drain_explore(app: &mut App) {
+    let explore_receiver = match app.explore_rx.take() {
+        Some(explore_receiver) => explore_receiver,
+        None => return,
+    };
+    loop {
+        match explore_receiver.try_recv() {
+            Ok(ExploreEvent::Log { phase, text }) => {
+                app.explore_log.push((phase.to_string(), text));
+            }
+            Ok(ExploreEvent::Done { events_recorded }) => {
+                app.explore_summary = format!("explore done — {events_recorded} events");
+                app.explore_state = ExploreState::Done;
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                app.explore_rx = Some(explore_receiver);
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                app.explore_state = ExploreState::Idle;
+                return;
+            }
+        }
+    }
+}
+
 fn start_memory_update(app: &mut App) {
     let assistant_content = last_assistant_content(app);
     let user_content = second_to_last_content(app);
@@ -307,6 +349,19 @@ pub(crate) fn start_dream(app: &mut App) {
     });
     app.dream_rx = Some(receiver);
     app.dream_state = DreamState::Running;
+}
+
+pub(crate) fn start_exploration(app: &mut App) {
+    app.explore_log.clear();
+    app.explore_summary.clear();
+    let (sender, receiver) = std::sync::mpsc::channel::<ExploreEvent>();
+    let llm = Arc::clone(&app.memory_llm);
+    let embed = Arc::clone(&app.embed);
+    std::thread::spawn(move || {
+        let _ = memory::run_exploration_pass(llm, embed, sender);
+    });
+    app.explore_rx = Some(receiver);
+    app.explore_state = ExploreState::Running;
 }
 
 pub(crate) fn start_recompute_positions(app: &mut App) {

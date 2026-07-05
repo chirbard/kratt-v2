@@ -1,0 +1,605 @@
+use std::error::Error;
+use std::sync::Arc;
+use std::sync::mpsc::{Sender, channel};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde_json::{Value, json};
+use turso::Connection;
+
+use crate::api::{Chunk, EmbeddingClient, LlmClient, ToolCallRequest, TurnOutcome};
+use crate::prompts::{
+    EXPLORE_BIOLOGIST, EXPLORE_ECONOMIST, EXPLORE_HISTORIAN, build_exploration_prompt,
+};
+use crate::runlog;
+
+use super::db;
+use super::dream::{self, DOMAIN_AGENT_NAMES};
+use super::embed::{self, SemanticEdge};
+use super::graph::{Edge, normalize_id};
+use super::ledger::{self, Actor, EdgeRef, Event, EventContext};
+
+const EXPLORATION_TURNS: usize = 4; // replay-tunable.
+const RETRIEVE_LIMIT: usize = 15; // replay-tunable.
+const TRAVERSE_LIMIT: usize = 20; // replay-tunable.
+const MAX_TOOL_ROUNDS: usize = 6; // per turn; runaway guard for the autonomous loop.
+
+pub enum ExploreEvent {
+    Log { phase: &'static str, text: String },
+    Done { events_recorded: usize },
+}
+
+struct TurnOutcomeInfo {
+    used_tools: bool,
+}
+
+struct ToolContext<'context> {
+    embed: &'context dyn EmbeddingClient,
+    conn: &'context Connection,
+    agent_name: &'context str,
+    session_id: &'context str,
+    turn_id: &'context str,
+    events: &'context mut Vec<Event>,
+}
+
+pub fn run_exploration_pass(
+    llm: Arc<dyn LlmClient>,
+    embed: Arc<dyn EmbeddingClient>,
+    sender: Sender<ExploreEvent>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    match execute_exploration_pass(Arc::clone(&llm), Arc::clone(&embed), &sender) {
+        Ok(events_recorded) => {
+            let _ = sender.send(ExploreEvent::Done { events_recorded });
+            Ok(())
+        }
+        Err(err) => {
+            send_log(
+                &sender,
+                "explore",
+                format!("pass failed — graph unchanged for active turn: {err}"),
+            );
+            let _ = sender.send(ExploreEvent::Done { events_recorded: 0 });
+            Err(err)
+        }
+    }
+}
+
+fn execute_exploration_pass(
+    llm: Arc<dyn LlmClient>,
+    embed: Arc<dyn EmbeddingClient>,
+    sender: &Sender<ExploreEvent>,
+) -> Result<usize, Box<dyn Error + Send + Sync>> {
+    let _write_guard = db::acquire_write_lock();
+    let session_id = exploration_session_id();
+    let created_at = crate::timeutil::timestamp_now();
+    db::register_exploration_session(&session_id, &created_at);
+    send_log(
+        sender,
+        "explore",
+        format!("pass start — session {session_id}"),
+    );
+    let mut total_events = 0usize;
+    for agent_name in DOMAIN_AGENT_NAMES {
+        total_events += run_agent_loop(
+            Arc::clone(&llm),
+            Arc::clone(&embed),
+            &session_id,
+            agent_name,
+            sender,
+        )?;
+    }
+    send_log(
+        sender,
+        "explore",
+        format!("pass complete — {total_events} events recorded"),
+    );
+    send_log(
+        sender,
+        "explore",
+        "pass complete — consider a dream pass to consolidate".to_string(),
+    );
+    Ok(total_events)
+}
+
+fn run_agent_loop(
+    llm: Arc<dyn LlmClient>,
+    embed: Arc<dyn EmbeddingClient>,
+    session_id: &str,
+    agent_name: &'static str,
+    sender: &Sender<ExploreEvent>,
+) -> Result<usize, Box<dyn Error + Send + Sync>> {
+    let conn = db::open_connection()?;
+    let seed_edges = seed_edges_for_agent(&*embed, agent_name);
+    let mut messages = initial_messages(agent_name, &seed_edges);
+    let tools = exploration_tools();
+    let mut total_events = 0usize;
+    let mut turns_used = 0usize;
+    send_log(sender, "explore", format!("{agent_name}: loop start"));
+    for turn_index in 0..EXPLORATION_TURNS {
+        let turn_id = format!("{agent_name}-turn-{}", turn_index + 1);
+        let outcome = run_agent_turn(
+            &*llm,
+            &*embed,
+            &conn,
+            agent_name,
+            session_id,
+            &turn_id,
+            turn_index,
+            &seed_edges,
+            &mut messages,
+            &tools,
+            sender,
+        )?;
+        total_events += outcome.0;
+        turns_used = turn_index + 1;
+        if !outcome.1.used_tools {
+            break;
+        }
+        messages.push(json!({
+            "role": "user",
+            "content": continuation_prompt(turn_index + 1)
+        }));
+    }
+    send_log(
+        sender,
+        "explore",
+        format!("{agent_name}: loop end — {turns_used} turns, {total_events} events"),
+    );
+    Ok(total_events)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_agent_turn(
+    llm: &dyn LlmClient,
+    embed: &dyn EmbeddingClient,
+    conn: &Connection,
+    agent_name: &'static str,
+    session_id: &str,
+    turn_id: &str,
+    turn_index: usize,
+    seed_edges: &[SemanticEdge],
+    messages: &mut Vec<Value>,
+    tools: &Value,
+    sender: &Sender<ExploreEvent>,
+) -> Result<(usize, TurnOutcomeInfo), Box<dyn Error + Send + Sync>> {
+    send_log(
+        sender,
+        "explore",
+        format!("{agent_name}: turn {} start", turn_index + 1),
+    );
+    let mut events = seed_events(agent_name, session_id, turn_id, turn_index, seed_edges);
+    let outcome = run_single_turn(
+        llm,
+        embed,
+        conn,
+        agent_name,
+        session_id,
+        turn_id,
+        messages,
+        tools,
+        &mut events,
+        sender,
+    )?;
+    let recorded = record_turn_events(&events);
+    send_log(
+        sender,
+        "explore",
+        format!(
+            "{agent_name}: turn {} done — {} events",
+            turn_index + 1,
+            recorded
+        ),
+    );
+    Ok((recorded, outcome))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_single_turn(
+    llm: &dyn LlmClient,
+    embed: &dyn EmbeddingClient,
+    conn: &Connection,
+    agent_name: &str,
+    session_id: &str,
+    turn_id: &str,
+    messages: &mut Vec<Value>,
+    tools: &Value,
+    events: &mut Vec<Event>,
+    sender: &Sender<ExploreEvent>,
+) -> Result<TurnOutcomeInfo, Box<dyn Error + Send + Sync>> {
+    let mut used_tools = false;
+    let mut rounds = 0usize;
+    loop {
+        // Autonomous loop: cap tool rounds per turn so a model that never
+        // stops calling tools cannot run away unattended.
+        if rounds >= MAX_TOOL_ROUNDS {
+            return Ok(TurnOutcomeInfo { used_tools });
+        }
+        rounds += 1;
+        let turn_outcome = stream_turn_noop_chunks(llm, messages, tools)?;
+        match turn_outcome {
+            TurnOutcome::Done(_) => return Ok(TurnOutcomeInfo { used_tools }),
+            TurnOutcome::ToolCalls(calls) => {
+                used_tools = true;
+                messages.push(build_tool_call_message(&calls));
+                for call in calls {
+                    let mut context = ToolContext {
+                        embed,
+                        conn,
+                        agent_name,
+                        session_id,
+                        turn_id,
+                        events,
+                    };
+                    let result = handle_tool_call(&call, &mut context, sender)?;
+                    messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "content": result
+                    }));
+                }
+            }
+        }
+    }
+}
+
+fn stream_turn_noop_chunks(
+    llm: &dyn LlmClient,
+    messages: &[Value],
+    tools: &Value,
+) -> Result<TurnOutcome, Box<dyn Error + Send + Sync>> {
+    let (chunk_sender, _chunk_receiver) = channel::<Chunk>();
+    llm.stream_turn(messages, Some(tools), &chunk_sender)
+}
+
+fn handle_tool_call(
+    call: &ToolCallRequest,
+    context: &mut ToolContext,
+    sender: &Sender<ExploreEvent>,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    send_log(
+        sender,
+        "explore",
+        format!(
+            "{}:{}: tool {} args={}",
+            context.agent_name, context.turn_id, call.name, call.args
+        ),
+    );
+    let result = execute_tool_call(call, context)?;
+    send_log(
+        sender,
+        "explore",
+        format!(
+            "{}:{}: result {}",
+            context.agent_name,
+            context.turn_id,
+            summarize_result(&call.name, &result)
+        ),
+    );
+    Ok(result)
+}
+
+fn execute_tool_call(
+    call: &ToolCallRequest,
+    context: &mut ToolContext,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    match call.name.as_str() {
+        "retrieve_memory" => retrieve_memory(&call.args, context),
+        "traverse_graph" => traverse_graph(&call.args, context),
+        "mark_interesting" => mark_interesting(&call.args, context),
+        _ => Ok("unknown tool".to_string()),
+    }
+}
+
+fn retrieve_memory(
+    args: &str,
+    context: &mut ToolContext,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let query = parse_string_arg(args, "query");
+    if query.trim().is_empty() {
+        return Ok("no edges found".to_string());
+    }
+    let mut edges = embed::select_semantic_edges(context.embed, &query);
+    if edges.len() > RETRIEVE_LIMIT {
+        edges.truncate(RETRIEVE_LIMIT);
+    }
+    append_retrieved_events(context, &edges);
+    if edges.is_empty() {
+        return Ok("no edges found".to_string());
+    }
+    Ok(embed::edges_to_toon(&edges))
+}
+
+fn traverse_graph(
+    args: &str,
+    context: &mut ToolContext,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let node = parse_string_arg(args, "node");
+    let _ = parse_usize_arg(args, "depth");
+    if node.trim().is_empty() {
+        return Ok("no edges found".to_string());
+    }
+    let normalized = normalize_id(&node);
+    let mut edges = live_edges(db::load_edges_for_node(context.conn, &normalized)?);
+    if edges.len() > TRAVERSE_LIMIT {
+        edges.truncate(TRAVERSE_LIMIT);
+    }
+    if edges.is_empty() {
+        return Ok("no edges found".to_string());
+    }
+    let semantic_edges = semantic_edges_from_graph(&edges);
+    append_retrieved_graph_events(context, &edges);
+    Ok(embed::edges_to_toon(&semantic_edges))
+}
+
+fn mark_interesting(
+    args: &str,
+    context: &mut ToolContext,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let source = normalize_id(&parse_string_arg(args, "source"));
+    let target = normalize_id(&parse_string_arg(args, "target"));
+    let reason = parse_string_arg(args, "reason");
+    if source.is_empty() || target.is_empty() {
+        return Ok("edge not found".to_string());
+    }
+    let edge = db::load_edge(context.conn, &source, &target)?;
+    if !is_live_edge(edge.as_ref()) {
+        return Ok("edge not found".to_string());
+    }
+    context.events.push(Event::marked(
+        Actor::new("agent", context.agent_name),
+        EdgeRef::new(&source, &target),
+        EventContext::new(context.session_id, context.turn_id),
+        &reason,
+    ));
+    Ok("marked".to_string())
+}
+
+fn append_retrieved_events(context: &mut ToolContext, edges: &[SemanticEdge]) {
+    for edge in edges {
+        context.events.push(Event::retrieved(
+            Actor::new("agent", context.agent_name),
+            EdgeRef::new(&edge.source, &edge.target),
+            EventContext::new(context.session_id, context.turn_id),
+        ));
+    }
+}
+
+fn append_retrieved_graph_events(context: &mut ToolContext, edges: &[Edge]) {
+    for edge in edges {
+        context.events.push(Event::retrieved(
+            Actor::new("agent", context.agent_name),
+            EdgeRef::new(&edge.source, &edge.target),
+            EventContext::new(context.session_id, context.turn_id),
+        ));
+    }
+}
+
+fn semantic_edges_from_graph(edges: &[Edge]) -> Vec<SemanticEdge> {
+    let mut semantic_edges = Vec::new();
+    for edge in edges {
+        semantic_edges.push(SemanticEdge {
+            source: edge.source.clone(),
+            target: edge.target.clone(),
+            content: edge.content.clone(),
+            confidence: edge.confidence,
+            stability: edge.stability,
+            importance: edge.importance,
+            subject: edge.subject,
+            date: edge.date.clone(),
+            occurred_at: edge.occurred_at.clone(),
+            expired_at: edge.expired_at.clone(),
+            embedding: None,
+        });
+    }
+    semantic_edges
+}
+
+fn live_edges(edges: Vec<Edge>) -> Vec<Edge> {
+    let mut live = Vec::new();
+    for edge in edges {
+        if is_live_edge(Some(&edge)) {
+            live.push(edge);
+        }
+    }
+    live
+}
+
+fn is_live_edge(edge: Option<&Edge>) -> bool {
+    let Some(edge) = edge else {
+        return false;
+    };
+    edge.expired_at.is_none()
+}
+
+fn record_turn_events(events: &[Event]) -> usize {
+    if events.is_empty() {
+        return 0;
+    }
+    match ledger::record_events(events) {
+        Ok(()) => events.len(),
+        Err(err) => {
+            runlog::log("ledger", &format!("write failed: {err}"));
+            0
+        }
+    }
+}
+
+fn seed_edges_for_agent(embed: &dyn EmbeddingClient, agent_name: &str) -> Vec<SemanticEdge> {
+    let anchor = dream::domain_anchor(agent_name).unwrap_or_default();
+    embed::select_exploration_edges(embed, anchor, agent_name)
+}
+
+fn initial_messages(agent_name: &str, seed_edges: &[SemanticEdge]) -> Vec<Value> {
+    let explanation = exploration_explanation(agent_name);
+    let seed_toon = embed::edges_to_toon(seed_edges);
+    let prompt = build_exploration_prompt(explanation, &seed_toon, 0);
+    vec![
+        json!({"role": "system", "content": prompt}),
+        json!({"role": "user", "content": "Start exploration. Retrieve memory, traverse nodes, and mark specific edges as significant."}),
+    ]
+}
+
+fn seed_events(
+    agent_name: &str,
+    session_id: &str,
+    turn_id: &str,
+    turn_index: usize,
+    seed_edges: &[SemanticEdge],
+) -> Vec<Event> {
+    if turn_index != 0 {
+        return Vec::new();
+    }
+    let mut events = Vec::new();
+    for edge in seed_edges {
+        events.push(Event::injected(
+            Actor::new("agent", agent_name),
+            EdgeRef::new(&edge.source, &edge.target),
+            EventContext::new(session_id, turn_id),
+        ));
+    }
+    events
+}
+
+fn continuation_prompt(turn_index: usize) -> String {
+    format!(
+        "Continue exploration turn {}. Stop without tool calls if no high-value lead remains.",
+        turn_index + 1
+    )
+}
+
+fn build_tool_call_message(calls: &[ToolCallRequest]) -> Value {
+    let mut tool_calls_json = Vec::new();
+    for call in calls {
+        tool_calls_json.push(json!({
+            "id": call.id,
+            "type": "function",
+            "function": {"name": call.name, "arguments": call.args}
+        }));
+    }
+    json!({
+        "role": "assistant",
+        "content": Value::Null,
+        "tool_calls": tool_calls_json
+    })
+}
+
+fn summarize_result(tool_name: &str, result: &str) -> String {
+    format!("{tool_name}: {}", shorten_text(result, 120))
+}
+
+fn shorten_text(text: &str, max_chars: usize) -> String {
+    let mut output = String::new();
+    for (index, character) in text.trim().chars().enumerate() {
+        if index >= max_chars {
+            output.push('…');
+            break;
+        }
+        output.push(character);
+    }
+    output
+}
+
+fn parse_string_arg(args: &str, key: &str) -> String {
+    let Ok(root) = serde_json::from_str::<Value>(args) else {
+        return String::new();
+    };
+    let Some(value) = root.get(key) else {
+        return String::new();
+    };
+    match value.as_str() {
+        Some(text) => text.to_string(),
+        None => String::new(),
+    }
+}
+
+fn parse_usize_arg(args: &str, key: &str) -> Option<usize> {
+    let Ok(root) = serde_json::from_str::<Value>(args) else {
+        return None;
+    };
+    let value = root.get(key)?;
+    let number = value.as_u64()?;
+    usize::try_from(number).ok()
+}
+
+fn exploration_explanation(agent_name: &str) -> &'static str {
+    match agent_name {
+        "biologist" => EXPLORE_BIOLOGIST,
+        "historian" => EXPLORE_HISTORIAN,
+        "economist" => EXPLORE_ECONOMIST,
+        _ => EXPLORE_BIOLOGIST,
+    }
+}
+
+fn exploration_tools() -> Value {
+    Value::Array(vec![
+        retrieve_memory_tool(),
+        traverse_graph_tool(),
+        mark_interesting_tool(),
+    ])
+}
+
+fn retrieve_memory_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "retrieve_memory",
+            "description": "Retrieve memory edges for a query.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"}
+                },
+                "required": ["query"]
+            }
+        }
+    })
+}
+
+fn traverse_graph_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "traverse_graph",
+            "description": "Load graph edges incident to a node (depth is fixed to 1).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string"},
+                    "depth": {"type": "integer", "enum": [1]}
+                },
+                "required": ["node", "depth"]
+            }
+        }
+    })
+}
+
+fn mark_interesting_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "mark_interesting",
+            "description": "Mark an existing edge as significant, with a specific reason.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string"},
+                    "target": {"type": "string"},
+                    "reason": {"type": "string"}
+                },
+                "required": ["source", "target", "reason"]
+            }
+        }
+    })
+}
+
+fn exploration_session_id() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!("explore-{seconds}")
+}
+
+fn send_log(sender: &Sender<ExploreEvent>, phase: &'static str, text: String) {
+    runlog::log(phase, &text);
+    let _ = sender.send(ExploreEvent::Log { phase, text });
+}

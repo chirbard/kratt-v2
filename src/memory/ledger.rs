@@ -11,6 +11,8 @@ const HALF_LIFE_CYCLES: f64 = 20.0; // replay-tunable.
 const POSITION_EPSILON: f64 = 0.05; // replay-tunable.
 const DIRECTION_SNAPSHOTS: usize = 5; // replay-tunable.
 const DIRECTION_NORM_EPSILON: f64 = 1e-9; // replay-tunable.
+const TIER_ACTIVE: f64 = 2.0; // replay-tunable.
+const TIER_MARKED: f64 = 3.0; // replay-tunable.
 
 #[derive(Clone)]
 pub struct Event {
@@ -76,6 +78,27 @@ impl Event {
             edge,
             context,
             EventBody::new(1.0, String::new()),
+        )
+    }
+
+    pub fn retrieved(actor: Actor, edge: EdgeRef, context: EventContext) -> Self {
+        Self::new(
+            actor,
+            "retrieved",
+            edge,
+            context,
+            EventBody::new(TIER_ACTIVE, String::new()),
+        )
+    }
+
+    pub fn marked(actor: Actor, edge: EdgeRef, context: EventContext, reason: &str) -> Self {
+        let payload = serde_json::json!({"reason": reason}).to_string();
+        Self::new(
+            actor,
+            "marked",
+            edge,
+            context,
+            EventBody::new(TIER_MARKED, payload),
         )
     }
 
@@ -409,6 +432,10 @@ async fn edge_info<'cache>(
     }
 }
 
+// NULL-embedding columns must be guarded with CASE WHEN everywhere:
+// turso's vector_extract(NULL) throws "Expected blob value" AND aborts the
+// enclosing transaction — this silently killed every memory/dream write
+// batch containing a freshly created (not-yet-embedded) edge.
 async fn load_edge_info(
     conn: &Connection,
     source: &str,
@@ -416,7 +443,7 @@ async fn load_edge_info(
 ) -> Result<EdgeInfo, Box<dyn Error + Send + Sync>> {
     let mut rows = conn
         .query(
-            "SELECT vector_extract(embedding) FROM edges WHERE source = ?1 AND target = ?2 AND expired_at IS NULL LIMIT 1",
+            "SELECT CASE WHEN embedding IS NULL THEN NULL ELSE vector_extract(embedding) END FROM edges WHERE source = ?1 AND target = ?2 AND expired_at IS NULL LIMIT 1",
             params![source, target],
         )
         .await?;
@@ -550,7 +577,7 @@ async fn load_position_state(
 ) -> Result<PositionState, Box<dyn Error + Send + Sync>> {
     let mut rows = conn
         .query(
-            "SELECT vector_extract(sum_vector), total_weight, updated_at FROM actor_positions WHERE actor_type = ?1 AND actor_id = ?2 LIMIT 1",
+            "SELECT CASE WHEN sum_vector IS NULL THEN NULL ELSE vector_extract(sum_vector) END, total_weight, updated_at FROM actor_positions WHERE actor_type = ?1 AND actor_id = ?2 LIMIT 1",
             params![actor_type, actor_id],
         )
         .await?;
@@ -596,7 +623,7 @@ async fn load_actor_direction_async(
 ) -> Result<Option<Vec<f64>>, Box<dyn Error + Send + Sync>> {
     let mut rows = conn
         .query(
-            "SELECT vector_extract(embedding) FROM actor_position_history WHERE actor_type = ?1 AND actor_id = ?2 ORDER BY recorded_at DESC LIMIT ?3",
+            "SELECT CASE WHEN embedding IS NULL THEN NULL ELSE vector_extract(embedding) END FROM actor_position_history WHERE actor_type = ?1 AND actor_id = ?2 ORDER BY recorded_at DESC LIMIT ?3",
             params![actor_type, actor_id, DIRECTION_SNAPSHOTS as i64],
         )
         .await?;
@@ -735,7 +762,7 @@ async fn load_last_snapshot(
 ) -> Result<Option<Vec<f64>>, Box<dyn Error + Send + Sync>> {
     let mut rows = conn
         .query(
-            "SELECT vector_extract(embedding) FROM actor_position_history WHERE actor_type = ?1 AND actor_id = ?2 ORDER BY recorded_at DESC LIMIT 1",
+            "SELECT CASE WHEN embedding IS NULL THEN NULL ELSE vector_extract(embedding) END FROM actor_position_history WHERE actor_type = ?1 AND actor_id = ?2 ORDER BY recorded_at DESC LIMIT 1",
             params![actor_type, actor_id],
         )
         .await?;
@@ -860,7 +887,7 @@ async fn load_current_positions(
 ) -> Result<HashMap<(String, String), PositionState>, Box<dyn Error + Send + Sync>> {
     let mut rows = conn
         .query(
-            "SELECT actor_type, actor_id, vector_extract(sum_vector), total_weight, updated_at FROM actor_positions",
+            "SELECT actor_type, actor_id, CASE WHEN sum_vector IS NULL THEN NULL ELSE vector_extract(sum_vector) END, total_weight, updated_at FROM actor_positions",
             (),
         )
         .await?;

@@ -25,6 +25,15 @@ const BIOLOGIST_ANCHOR: &str =
 const HISTORIAN_ANCHOR: &str = "history timeline events temporal sequence causation past future";
 const ECONOMIST_ANCHOR: &str = "economics incentives trade-offs optimization value cost benefit";
 
+pub fn domain_anchor(agent_name: &str) -> Option<&'static str> {
+    match agent_name {
+        "biologist" => Some(BIOLOGIST_ANCHOR),
+        "historian" => Some(HISTORIAN_ANCHOR),
+        "economist" => Some(ECONOMIST_ANCHOR),
+        _ => None,
+    }
+}
+
 pub enum DreamEvent {
     Log { phase: &'static str, text: String },
     Append { phase: &'static str, text: String },
@@ -36,6 +45,7 @@ pub fn run_dream_pass(
     embed: Arc<dyn EmbeddingClient>,
     sender: std::sync::mpsc::Sender<DreamEvent>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let _write_guard = db::acquire_write_lock();
     match execute_dream_pass(Arc::clone(&llm), Arc::clone(&embed), &sender) {
         Ok(edges_added) => {
             let _ = sender.send(DreamEvent::Done { edges_added });

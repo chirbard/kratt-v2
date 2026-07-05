@@ -6,7 +6,7 @@ use ratatui::widgets::{
     Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
 
-use super::app::{App, DreamState, MemoryState, Message, Mode, Role, State};
+use super::app::{App, DreamState, ExploreState, MemoryState, Message, Mode, Role, State};
 
 pub(crate) const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -61,41 +61,50 @@ fn render_output(frame: &mut Frame, area: Rect, app: &mut App) {
 
 fn build_memory_text(app: &App) -> Text<'static> {
     let mut lines: Vec<Line> = Vec::new();
-    for (phase, text) in &app.memory_log {
-        if phase == "think" && !app.show_reasoning {
-            continue;
-        }
-        if phase == "debug" && !app.show_debug {
-            continue;
-        }
-        let label = format!("[{phase}] ");
-        lines.push(Line::from(vec![
-            Span::styled(label, Style::default().fg(phase_color(phase))),
-            Span::raw(text.clone()),
-        ]));
-    }
-    if !app.dream_log.is_empty() {
-        if !app.memory_log.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "── dream ──".to_string(),
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
-        for (phase, text) in &app.dream_log {
-            if phase == "think" && !app.show_reasoning {
-                continue;
-            }
-            if phase == "debug" && !app.show_debug {
-                continue;
-            }
-            let label = format!("[{phase}] ");
-            lines.push(Line::from(vec![
-                Span::styled(label, Style::default().fg(phase_color(phase))),
-                Span::raw(text.clone()),
-            ]));
-        }
-    }
+    append_log_section(&mut lines, &app.memory_log, None, app);
+    append_log_section(&mut lines, &app.dream_log, Some("dream"), app);
+    append_log_section(&mut lines, &app.explore_log, Some("explore"), app);
     Text::from(lines)
+}
+
+fn append_log_section(
+    lines: &mut Vec<Line<'static>>,
+    entries: &[(String, String)],
+    title: Option<&str>,
+    app: &App,
+) {
+    if entries.is_empty() {
+        return;
+    }
+    if let Some(title_text) = title
+        && !lines.is_empty()
+    {
+        lines.push(Line::from(Span::styled(
+            format!("── {title_text} ──"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    for (phase, text) in entries {
+        if should_hide_phase(phase, app) {
+            continue;
+        }
+        push_phase_line(lines, phase, text);
+    }
+}
+
+fn should_hide_phase(phase: &str, app: &App) -> bool {
+    if phase == "think" && !app.show_reasoning {
+        return true;
+    }
+    phase == "debug" && !app.show_debug
+}
+
+fn push_phase_line(lines: &mut Vec<Line<'static>>, phase: &str, text: &str) {
+    let label = format!("[{phase}] ");
+    lines.push(Line::from(vec![
+        Span::styled(label, Style::default().fg(phase_color(phase))),
+        Span::raw(text.to_string()),
+    ]));
 }
 
 fn render_memory_panel(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -171,7 +180,16 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_stats(frame: &mut Frame, area: Rect, app: &App) {
-    let mut text = match &app.stats {
+    let mut text = stats_line(app);
+    append_memory_status(&mut text, app);
+    append_dream_status(&mut text, app);
+    append_explore_status(&mut text, app);
+    let widget = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(widget, area);
+}
+
+fn stats_line(app: &App) -> String {
+    match &app.stats {
         Some(stats) => {
             let cost = match stats.cost_usd {
                 Some(value) => format!("${value:.6}"),
@@ -183,71 +201,101 @@ fn render_stats(frame: &mut Frame, area: Rect, app: &App) {
             )
         }
         None => String::new(),
-    };
-    if app.memory_state == MemoryState::Updating {
-        let spinner = SPINNER[((app.tick / 6) as usize) % SPINNER.len()];
-        if !text.is_empty() {
-            text.push_str("  ");
-        }
-        text.push_str(&format!("mem {spinner}"));
     }
+}
+
+fn append_memory_status(text: &mut String, app: &App) {
+    if app.memory_state != MemoryState::Updating {
+        return;
+    }
+    append_status_text(text, format!("mem {}", spinner_char(app.tick)));
+}
+
+fn append_dream_status(text: &mut String, app: &App) {
     if app.dream_state == DreamState::Running {
-        let spinner = SPINNER[((app.tick / 6) as usize) % SPINNER.len()];
-        if !text.is_empty() {
-            text.push_str("  ");
-        }
-        text.push_str(&format!("dream {spinner}"));
-    } else if app.dream_state == DreamState::Done && !app.dream_summary.is_empty() {
-        if !text.is_empty() {
-            text.push_str("  ");
-        }
-        text.push_str(&app.dream_summary);
+        append_status_text(text, format!("dream {}", spinner_char(app.tick)));
+        return;
     }
-    let widget = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(widget, area);
+    if app.dream_state == DreamState::Done && !app.dream_summary.is_empty() {
+        append_status_text(text, app.dream_summary.clone());
+    }
+}
+
+fn append_explore_status(text: &mut String, app: &App) {
+    if app.explore_state == ExploreState::Running {
+        append_status_text(text, format!("explore {}", spinner_char(app.tick)));
+        return;
+    }
+    if app.explore_state == ExploreState::Done && !app.explore_summary.is_empty() {
+        append_status_text(text, app.explore_summary.clone());
+    }
+}
+
+fn append_status_text(text: &mut String, status: String) {
+    if !text.is_empty() {
+        text.push_str("  ");
+    }
+    text.push_str(&status);
+}
+
+fn spinner_char(tick: u64) -> &'static str {
+    SPINNER[((tick / 6) as usize) % SPINNER.len()]
 }
 
 fn render_mode(frame: &mut Frame, area: Rect, app: &App) {
     let text = match app.mode {
         Mode::Insert => "-- INSERT --".to_string(),
-        Mode::Normal => {
-            let mem_hint = if app.show_memory_panel {
-                "[m] mem ✓"
-            } else {
-                "[m] mem"
-            };
-            let rea_hint = if app.show_reasoning {
-                "[R] reasoning ✓"
-            } else {
-                "[R] reasoning"
-            };
-            let dbg_hint = if app.show_debug {
-                "[d] debug ✓"
-            } else {
-                "[d] debug"
-            };
-            let tool_hint = if app.show_tools {
-                "[t] tools ✓"
-            } else {
-                "[t] tools"
-            };
-            let attr_hint = if app.show_attribution {
-                "[a] attribution ✓"
-            } else {
-                "[a] attribution"
-            };
-            let dream_hint = match app.dream_state {
-                DreamState::Idle => "[D] dream",
-                DreamState::Running => "[D] dreaming…",
-                DreamState::Done => "[D] dream ✓",
-            };
-            format!(
-                "-- NORMAL --  {mem_hint}  {rea_hint}  {dbg_hint}  {tool_hint}  {attr_hint}  {dream_hint}"
-            )
-        }
+        Mode::Normal => normal_mode_hint(app),
     };
     let widget = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(widget, area);
+}
+
+fn normal_mode_hint(app: &App) -> String {
+    let mem_hint = toggle_hint("m", "mem", app.show_memory_panel);
+    let rea_hint = toggle_hint("R", "reasoning", app.show_reasoning);
+    let dbg_hint = toggle_hint("d", "debug", app.show_debug);
+    let tool_hint = toggle_hint("t", "tools", app.show_tools);
+    let attr_hint = toggle_hint("a", "attribution", app.show_attribution);
+    let dream_hint = dream_hint(
+        app.dream_state == DreamState::Running,
+        app.dream_state == DreamState::Done,
+    );
+    let explore_hint = explore_hint(
+        app.explore_state == ExploreState::Running,
+        app.explore_state == ExploreState::Done,
+    );
+    format!(
+        "-- NORMAL --  {mem_hint}  {rea_hint}  {dbg_hint}  {tool_hint}  {attr_hint}  {dream_hint}  {explore_hint}"
+    )
+}
+
+fn toggle_hint(key: &str, label: &str, enabled: bool) -> String {
+    if enabled {
+        format!("[{key}] {label} ✓")
+    } else {
+        format!("[{key}] {label}")
+    }
+}
+
+fn dream_hint(running: bool, done: bool) -> &'static str {
+    if running {
+        return "[D] dreaming…";
+    }
+    if done {
+        return "[D] dream ✓";
+    }
+    "[D] dream"
+}
+
+fn explore_hint(running: bool, done: bool) -> &'static str {
+    if running {
+        return "[E] exploring…";
+    }
+    if done {
+        return "[E] explore ✓";
+    }
+    "[E] explore"
 }
 
 fn build_output_text(app: &App) -> Text<'static> {
@@ -366,6 +414,7 @@ fn phase_color(phase: &str) -> Color {
         "lateral" => Color::Magenta,
         "consolidation" => Color::Yellow,
         "dream" => Color::Green,
+        "explore" => Color::Green,
         "think" => Color::Magenta,
         "debug" => Color::DarkGray,
         _ => Color::White,

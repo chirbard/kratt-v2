@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use super::app::{self, App, DreamState, MemoryState, Mode, State};
+use super::app::{self, App, DreamState, ExploreState, MemoryState, Mode, State};
 use super::stream::start_stream;
 
 pub(crate) fn handle_key(key: KeyEvent, app: &mut App) -> bool {
@@ -42,16 +42,26 @@ fn handle_normal_key(key: KeyEvent, app: &mut App) -> bool {
         KeyCode::Char('P')
             if app.state == State::Idle
                 && app.memory_state == MemoryState::Idle
-                && app.dream_state != DreamState::Running =>
+                && app.dream_state != DreamState::Running
+                && app.explore_state != ExploreState::Running =>
         {
             app::start_recompute_positions(app);
         }
         KeyCode::Char('D')
             if app.state == State::Idle
                 && app.memory_state == MemoryState::Idle
-                && app.dream_state != DreamState::Running =>
+                && app.dream_state != DreamState::Running
+                && app.explore_state != ExploreState::Running =>
         {
             app::start_dream(app);
+        }
+        KeyCode::Char('E')
+            if app.state == State::Idle
+                && app.memory_state == MemoryState::Idle
+                && app.dream_state != DreamState::Running
+                && app.explore_state != ExploreState::Running =>
+        {
+            app::start_exploration(app);
         }
         _ => {}
     }

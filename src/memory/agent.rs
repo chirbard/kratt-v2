@@ -73,6 +73,7 @@ pub fn run_memory_agent(
 
 impl<'run> AgentRun<'run> {
     fn run(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let _write_guard = db::acquire_write_lock();
         let conn = db::open_connection()?;
         let mut graph = db::load_graph();
         let decay_ran = decay::apply_decay_if_needed(&mut graph);

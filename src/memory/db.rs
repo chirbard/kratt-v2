@@ -61,6 +61,19 @@ pub fn open_connection() -> Result<Connection, Box<dyn Error + Send + Sync>> {
     Ok(database().connect()?)
 }
 
+// Turso aborts an open transaction when another connection commits — a
+// concurrent embed pass killed a consolidate transaction mid-flight
+// ("cannot commit - no transaction is active"). Background write passes
+// (memory agent, dream, explore, embed) serialize on this lock.
+static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub fn acquire_write_lock() -> std::sync::MutexGuard<'static, ()> {
+    match WRITE_LOCK.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 async fn init_schema(conn: &Connection) -> Result<(), Box<dyn Error + Send + Sync>> {
     create_base_tables(conn).await?;
     create_history_tables(conn).await?;
@@ -152,7 +165,7 @@ async fn add_edge_time_columns(conn: &Connection) {
 }
 
 async fn add_events_table(conn: &Connection) {
-    // event_type values: created, updated, pruned, injected, routed
+    // event_type values: created, updated, pruned, injected, retrieved, marked, routed
     let _ = conn.execute("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL, actor_id TEXT NOT NULL, event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')", ()).await;
     let _ = conn
         .execute(
@@ -604,7 +617,7 @@ pub fn load_all_edges_semantic() -> Vec<SemanticEdgeRow> {
 async fn load_all_edges_semantic_async(conn: &Connection) -> Vec<SemanticEdgeRow> {
     let Ok(mut rows) = conn
         .query(
-            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, vector_extract(embedding) FROM edges WHERE expired_at IS NULL",
+            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, CASE WHEN embedding IS NULL THEN NULL ELSE vector_extract(embedding) END FROM edges WHERE expired_at IS NULL",
             (),
         )
         .await
@@ -767,6 +780,19 @@ pub fn register_dream_session(session_id: &str, created_at: &str) {
     runtime().block_on(async {
         let _ = conn.execute(
             "INSERT OR IGNORE INTO sessions (id, session_type, created_at) VALUES (?1, 'dream', ?2)",
+            params![session_id, created_at],
+        )
+        .await;
+    });
+}
+
+pub fn register_exploration_session(session_id: &str, created_at: &str) {
+    let Ok(conn) = open_connection() else {
+        return;
+    };
+    runtime().block_on(async {
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO sessions (id, session_type, created_at) VALUES (?1, 'exploration', ?2)",
             params![session_id, created_at],
         )
         .await;
