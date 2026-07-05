@@ -39,33 +39,22 @@ fn handle_normal_key(key: KeyEvent, app: &mut App) -> bool {
         KeyCode::Char('d') => app.show_debug = !app.show_debug,
         KeyCode::Char('t') => app.show_tools = !app.show_tools,
         KeyCode::Char('a') => app.show_attribution = !app.show_attribution,
-        KeyCode::Char('P')
-            if app.state == State::Idle
-                && app.memory_state == MemoryState::Idle
-                && app.dream_state != DreamState::Running
-                && app.explore_state != ExploreState::Running =>
-        {
-            app::start_recompute_positions(app);
-        }
-        KeyCode::Char('D')
-            if app.state == State::Idle
-                && app.memory_state == MemoryState::Idle
-                && app.dream_state != DreamState::Running
-                && app.explore_state != ExploreState::Running =>
-        {
-            app::start_dream(app);
-        }
-        KeyCode::Char('E')
-            if app.state == State::Idle
-                && app.memory_state == MemoryState::Idle
-                && app.dream_state != DreamState::Running
-                && app.explore_state != ExploreState::Running =>
-        {
-            app::start_exploration(app);
-        }
+        KeyCode::Char('P') if maintenance_allowed(app) => app::start_recompute_positions(app),
+        KeyCode::Char('D') if maintenance_allowed(app) => app::start_dream(app),
+        KeyCode::Char('E') if maintenance_allowed(app) => app::start_exploration(app),
+        KeyCode::Char('S') if maintenance_allowed(app) => app::start_sync(app),
         _ => {}
     }
     false
+}
+
+// Background maintenance actions (recompute, dream, explore, sync) are
+// mutually exclusive and must not run during streaming or memory updates.
+fn maintenance_allowed(app: &App) -> bool {
+    app.state == State::Idle
+        && app.memory_state == MemoryState::Idle
+        && app.dream_state != DreamState::Running
+        && app.explore_state != ExploreState::Running
 }
 
 fn scroll_down(app: &mut App) {

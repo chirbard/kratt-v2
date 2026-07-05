@@ -266,7 +266,7 @@ fn normal_mode_hint(app: &App) -> String {
         app.explore_state == ExploreState::Done,
     );
     format!(
-        "-- NORMAL --  {mem_hint}  {rea_hint}  {dbg_hint}  {tool_hint}  {attr_hint}  {dream_hint}  {explore_hint}"
+        "-- NORMAL --  {mem_hint}  {rea_hint}  {dbg_hint}  {tool_hint}  {attr_hint}  {dream_hint}  {explore_hint}  [S] sync"
     )
 }
 

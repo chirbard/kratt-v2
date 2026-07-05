@@ -110,12 +110,16 @@ pub fn open_connection() -> Result<Connection, Box<dyn Error + Send + Sync>> {
 }
 
 // Push local changes to Turso Cloud. No-op in local mode. Best-effort at all
-// call sites — sync must never break the app.
+// call sites — sync must never break the app. Checkpoints afterwards to keep
+// the local WAL bounded (it grows quickly with embedding blobs).
 pub fn sync_push() -> Result<(), Box<dyn Error + Send + Sync>> {
     match database() {
         DbHandle::Local(_) => Ok(()),
         DbHandle::Synced(database) => {
             runtime().block_on(database.push())?;
+            if let Err(err) = runtime().block_on(database.checkpoint()) {
+                crate::runlog::log("sync", &format!("checkpoint failed: {err}"));
+            }
             Ok(())
         }
     }
@@ -153,6 +157,25 @@ pub fn sync_pull_best_effort() {
         Ok(changed) => crate::runlog::log("sync", &format!("pull ok — changed: {changed}")),
         Err(err) => crate::runlog::log("sync", &format!("pull failed: {err}")),
     }
+}
+
+// Manual full sync (TUI 'S' key): pull remote changes, push local ones.
+// Returns a human-readable summary line.
+pub fn sync_now() -> String {
+    if !sync_enabled() {
+        return "sync disabled (no Turso Cloud credentials)".to_string();
+    }
+    let pull_summary = match sync_pull() {
+        Ok(changed) => format!("pull ok (changed: {changed})"),
+        Err(err) => format!("pull failed: {err}"),
+    };
+    let push_summary = match sync_push() {
+        Ok(()) => "push ok".to_string(),
+        Err(err) => format!("push failed: {err}"),
+    };
+    let summary = format!("{pull_summary} · {push_summary}");
+    crate::runlog::log("sync", &summary);
+    summary
 }
 
 // Explicit column lists: the legacy file gained columns via ALTERs in a

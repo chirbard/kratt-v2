@@ -394,6 +394,25 @@ pub(crate) fn start_recompute_positions(app: &mut App) {
     app.memory_state = MemoryState::Updating;
 }
 
+pub(crate) fn start_sync(app: &mut App) {
+    app.memory_log.clear();
+    let (sender, receiver) = std::sync::mpsc::channel::<MemoryEvent>();
+    let _ = sender.send(MemoryEvent::Log {
+        phase: "sync",
+        text: "syncing with Turso Cloud…".to_string(),
+    });
+    std::thread::spawn(move || {
+        let summary = memory::sync_now();
+        let _ = sender.send(MemoryEvent::Log {
+            phase: "sync",
+            text: summary,
+        });
+        let _ = sender.send(MemoryEvent::MaintenanceDone);
+    });
+    app.memory_rx = Some(receiver);
+    app.memory_state = MemoryState::Updating;
+}
+
 pub(crate) fn last_assistant_content(app: &App) -> String {
     match app.history.last() {
         Some(message) => message.content.clone(),
