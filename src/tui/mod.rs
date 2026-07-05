@@ -18,6 +18,7 @@ use ratatui::backend::CrosstermBackend;
 
 use crate::api::EmbeddingClient;
 use crate::api::LlmClient;
+use crate::runlog;
 use crate::web::SearchClient;
 
 use app::{App, drain_dream, drain_embed, drain_memory, drain_stream};
@@ -31,6 +32,7 @@ pub fn run(
     search: Option<Arc<dyn SearchClient>>,
     session_path: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    runlog::log("app", &format!("start {}", app_version_line()));
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     tui_enter(&mut stdout)?;
@@ -41,6 +43,10 @@ pub fn run(
     disable_raw_mode()?;
     tui_exit(&mut terminal)?;
     terminal.show_cursor()?;
+    match &result {
+        Ok(()) => runlog::log("app", "stop clean"),
+        Err(err) => runlog::log("app", &format!("stop with error: {err}")),
+    }
     result
 }
 
@@ -71,4 +77,10 @@ fn tui_enter(stdout: &mut Stdout) -> std::io::Result<()> {
 #[allow(clippy::disallowed_methods)]
 fn tui_exit(terminal: &mut Term) -> std::io::Result<()> {
     execute!(terminal.backend_mut(), LeaveAlternateScreen)
+}
+
+fn app_version_line() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    let commit = option_env!("GIT_COMMIT_HASH").unwrap_or("unknown");
+    format!("v{version} commit={commit}")
 }

@@ -16,6 +16,7 @@ pub enum Chunk {
     Content(String),
     ToolCall(String),
     MemoryLog { phase: &'static str, text: String },
+    Attribution(String),
     Done(Stats),
     Err(String),
 }

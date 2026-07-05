@@ -1,9 +1,12 @@
 use super::dream::DOMAIN_AGENT_NAMES;
 use super::ledger;
 
-const W_QUERY: f64 = 0.5; // replay-tunable.
-const W_USER_POS: f64 = 0.3; // replay-tunable.
-const W_USER_DIR: f64 = 0.2; // replay-tunable.
+// Query dominates until interest tiers (phase 19+) make the user position
+// reflect salience instead of bulk exposure — at ×1-only weighting the
+// position is close to the graph centroid and blending it dilutes recall.
+const W_QUERY: f64 = 0.8; // replay-tunable.
+const W_USER_POS: f64 = 0.15; // replay-tunable.
+const W_USER_DIR: f64 = 0.05; // replay-tunable.
 const DIRECTION_WEIGHT: f64 = 0.3; // replay-tunable.
 
 #[derive(Clone)]

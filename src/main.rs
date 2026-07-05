@@ -13,6 +13,7 @@
 mod api;
 mod memory;
 mod prompts;
+mod runlog;
 mod session;
 mod timeutil;
 mod tui;

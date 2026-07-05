@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 
+use serde_json::Value as JsonValue;
 use turso::{Connection, Value, params};
 
 use crate::memory::db;
@@ -41,6 +42,14 @@ pub struct EdgeRef {
 pub struct EventContext {
     pub session_id: String,
     pub turn_id: String,
+}
+
+#[derive(Default)]
+pub struct Attribution {
+    pub expert: Option<String>,
+    pub expert_score: f64,
+    pub injected_edges: usize,
+    pub top_edges: Vec<String>,
 }
 
 struct EventBody {
@@ -227,6 +236,9 @@ pub fn recompute_positions() -> Result<Vec<String>, Box<dyn Error + Send + Sync>
         let recomputed = load_recomputed_positions(&conn).await?;
         let mut logs = audit_positions(&conn, recomputed).await?;
         logs.sort();
+        for line in &logs {
+            crate::runlog::log("recompute", line);
+        }
         Ok(logs)
     })
 }
@@ -245,6 +257,14 @@ pub fn load_actor_direction(actor_type: &str, actor_id: &str) -> Option<Vec<f64>
         Err(_) => return None,
     };
     db::block_on(load_actor_direction_async(&conn, actor_type, actor_id)).unwrap_or_default()
+}
+
+pub fn turn_attribution(turn_id: &str) -> Attribution {
+    let conn = match db::open_connection() {
+        Ok(conn) => conn,
+        Err(_) => return Attribution::default(),
+    };
+    db::block_on(turn_attribution_async(&conn, turn_id)).unwrap_or_default()
 }
 
 pub(crate) fn cosine_similarity(
@@ -272,6 +292,69 @@ pub(crate) fn normalized_vector(vector: &[f64]) -> Option<Vec<f64>> {
         normalize_index += 1;
     }
     Some(normalized)
+}
+
+async fn turn_attribution_async(
+    conn: &Connection,
+    turn_id: &str,
+) -> Result<Attribution, Box<dyn Error + Send + Sync>> {
+    let mut attribution = Attribution::default();
+    let mut rows = conn
+        .query(
+            "SELECT event_type, payload FROM events WHERE turn_id = ?1 ORDER BY id",
+            params![turn_id],
+        )
+        .await?;
+    while let Some(row) = rows.next().await? {
+        let event_type = db::text(row.get_value(0)?);
+        if event_type == "injected" {
+            attribution.injected_edges += 1;
+            continue;
+        }
+        if event_type != "routed" {
+            continue;
+        }
+        parse_routed_payload(&db::text(row.get_value(1)?), &mut attribution);
+    }
+    attribution.top_edges = load_top_injected_edges(conn, turn_id).await?;
+    Ok(attribution)
+}
+
+fn parse_routed_payload(payload: &str, attribution: &mut Attribution) {
+    let Ok(json) = serde_json::from_str::<JsonValue>(payload) else {
+        return;
+    };
+    let mut expert = None;
+    if let Some(value) = json.get("expert")
+        && let Some(text) = value.as_str()
+    {
+        expert = Some(text.to_string());
+    }
+    attribution.expert = expert;
+    attribution.expert_score = match json.get("score") {
+        Some(value) => value.as_f64().unwrap_or(0.0),
+        None => 0.0,
+    };
+}
+
+async fn load_top_injected_edges(
+    conn: &Connection,
+    turn_id: &str,
+) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+    let mut rows = conn
+        .query(
+            "SELECT ed.content, MAX(ed.confidence) FROM events ev JOIN edges ed ON ed.source = ev.source AND ed.target = ev.target WHERE ev.turn_id = ?1 AND ev.event_type = 'injected' AND ed.expired_at IS NULL GROUP BY ed.source, ed.target, ed.content ORDER BY MAX(ed.confidence) DESC LIMIT 3",
+            params![turn_id],
+        )
+        .await?;
+    let mut top = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let content = db::text(row.get_value(0)?);
+        if !content.trim().is_empty() {
+            top.push(content);
+        }
+    }
+    Ok(top)
 }
 
 struct ActorBatch {

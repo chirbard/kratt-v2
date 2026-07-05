@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::api::{Chunk, LlmClient};
 use crate::prompts::{CONSOLIDATE_EXPLANATION, EXTRACT_EXPLANATION, build_agent_prompt};
+use crate::runlog;
 use turso::Connection;
 
 use super::db;
@@ -148,6 +149,7 @@ impl<'run> AgentRun<'run> {
     }
 
     fn send_log(&self, phase: &'static str, text: String) {
+        runlog::log(phase, &text);
         let _ = self.sender.send(MemoryEvent::Log { phase, text });
     }
 
@@ -182,7 +184,7 @@ pub(super) fn stream_collect(
                 err = Some(error.into());
                 break;
             }
-            Chunk::ToolCall(_) | Chunk::MemoryLog { .. } => {}
+            Chunk::ToolCall(_) | Chunk::MemoryLog { .. } | Chunk::Attribution(_) => {}
         }
     }
     if let Some(error) = err {
@@ -349,7 +351,9 @@ fn apply_tool_calls<'agent_run>(
         db::block_on(ledger::record_events_in_tx(conn, &events))
     })();
     if let Err(err) = result {
-        let _ = db::block_on(async { conn.execute("ROLLBACK", ()).await });
+        if let Err(rollback_err) = db::block_on(async { conn.execute("ROLLBACK", ()).await }) {
+            runlog::log("ledger", &format!("rollback failed: {rollback_err}"));
+        }
         return Err(err);
     }
     db::commit_transaction(conn)?;

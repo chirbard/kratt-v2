@@ -231,12 +231,19 @@ fn render_mode(frame: &mut Frame, area: Rect, app: &App) {
             } else {
                 "[t] tools"
             };
+            let attr_hint = if app.show_attribution {
+                "[a] attribution ✓"
+            } else {
+                "[a] attribution"
+            };
             let dream_hint = match app.dream_state {
                 DreamState::Idle => "[D] dream",
                 DreamState::Running => "[D] dreaming…",
                 DreamState::Done => "[D] dream ✓",
             };
-            format!("-- NORMAL --  {mem_hint}  {rea_hint}  {dbg_hint}  {tool_hint}  {dream_hint}")
+            format!(
+                "-- NORMAL --  {mem_hint}  {rea_hint}  {dbg_hint}  {tool_hint}  {attr_hint}  {dream_hint}"
+            )
         }
     };
     let widget = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
@@ -325,6 +332,12 @@ fn push_assistant_lines(lines: &mut Vec<Line>, msg: &Message, is_streaming: bool
     }
     for line in msg.content.lines() {
         lines.push(Line::from(line.to_string()));
+    }
+    if app.show_attribution && !msg.attribution.is_empty() {
+        lines.push(Line::from(Span::styled(
+            msg.attribution.clone(),
+            Style::default().fg(Color::DarkGray),
+        )));
     }
 }
 

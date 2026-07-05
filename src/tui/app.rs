@@ -43,6 +43,7 @@ pub(crate) struct Message {
     pub(crate) reasoning: String,
     pub(crate) content: String,
     pub(crate) tool_call: String,
+    pub(crate) attribution: String,
 }
 
 pub(crate) struct App {
@@ -69,6 +70,7 @@ pub(crate) struct App {
     pub(crate) show_reasoning: bool,
     pub(crate) show_debug: bool,
     pub(crate) show_tools: bool,
+    pub(crate) show_attribution: bool,
     pub(crate) session_path: PathBuf,
     pub(crate) last_user_message_id: String,
     pub(crate) dream_state: DreamState,
@@ -109,6 +111,7 @@ impl App {
             show_reasoning: true,
             show_debug: false,
             show_tools: false,
+            show_attribution: true,
             session_path,
             last_user_message_id: String::new(),
             dream_state: DreamState::Idle,
@@ -125,41 +128,60 @@ pub(crate) fn drain_stream(app: &mut App) {
         None => return,
     };
     while let Ok(chunk) = recv.try_recv() {
-        match chunk {
-            Chunk::Reasoning(text) => {
-                if let Some(msg) = app.history.last_mut() {
-                    msg.reasoning.push_str(&text);
-                }
-            }
-            Chunk::Content(text) => {
-                if let Some(msg) = app.history.last_mut() {
-                    msg.content.push_str(&text);
-                }
-            }
-            Chunk::ToolCall(desc) => {
-                if let Some(msg) = app.history.last_mut() {
-                    msg.tool_call = desc;
-                }
-            }
-            Chunk::MemoryLog { phase, text } => {
-                app.memory_log.push((phase.to_string(), text));
-            }
-            Chunk::Done(stats) => {
-                app.stats = Some(stats);
-                app.state = State::Idle;
-                start_memory_update(app);
-            }
-            Chunk::Err(err) => {
-                if let Some(msg) = app.history.last_mut() {
-                    msg.content = format!("Error: {err}");
-                }
-                app.state = State::Idle;
-            }
-        }
+        apply_stream_chunk(app, chunk);
     }
     if app.state == State::Streaming {
         app.stream_rx = Some(recv);
     }
+}
+
+fn apply_stream_chunk(app: &mut App, chunk: Chunk) {
+    match chunk {
+        Chunk::Reasoning(text) => append_reasoning(app, &text),
+        Chunk::Content(text) => append_content(app, &text),
+        Chunk::ToolCall(desc) => set_tool_call(app, desc),
+        Chunk::Attribution(text) => set_attribution(app, text),
+        Chunk::MemoryLog { phase, text } => app.memory_log.push((phase.to_string(), text)),
+        Chunk::Done(stats) => complete_stream(app, stats),
+        Chunk::Err(err) => set_stream_error(app, &err),
+    }
+}
+
+fn append_reasoning(app: &mut App, text: &str) {
+    if let Some(msg) = app.history.last_mut() {
+        msg.reasoning.push_str(text);
+    }
+}
+
+fn append_content(app: &mut App, text: &str) {
+    if let Some(msg) = app.history.last_mut() {
+        msg.content.push_str(text);
+    }
+}
+
+fn set_tool_call(app: &mut App, desc: String) {
+    if let Some(msg) = app.history.last_mut() {
+        msg.tool_call = desc;
+    }
+}
+
+fn set_attribution(app: &mut App, text: String) {
+    if let Some(msg) = app.history.last_mut() {
+        msg.attribution = text;
+    }
+}
+
+fn complete_stream(app: &mut App, stats: Stats) {
+    app.stats = Some(stats);
+    app.state = State::Idle;
+    start_memory_update(app);
+}
+
+fn set_stream_error(app: &mut App, err: &str) {
+    if let Some(msg) = app.history.last_mut() {
+        msg.content = format!("Error: {err}");
+    }
+    app.state = State::Idle;
 }
 
 pub(crate) fn drain_memory(app: &mut App) {

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use serde_json::json;
 
 use crate::api::EmbeddingClient;
+use crate::runlog;
 use crate::timeutil;
 
 use super::MemoryEvent;
@@ -18,10 +19,13 @@ pub const SMALL_GRAPH_THRESHOLD: usize = 100;
 pub const MAX_POOL: usize = 150;
 pub const EXPLORATION_CANDIDATES: usize = 200;
 pub const NOVELTY_WEIGHT: f64 = 0.3;
-const W_SIM: f64 = 0.5; // replay-tunable.
+const W_SIM: f64 = 0.65; // replay-tunable.
 const W_CONF: f64 = 0.2; // replay-tunable.
 const W_RECENCY: f64 = 0.15; // replay-tunable.
-const W_NOVELTY: f64 = 0.15; // replay-tunable.
+// Novelty is an exploration signal, not a recall signal: penalizing
+// often-seen edges suppresses exactly the beliefs a follow-up question
+// needs. Keep at 0 for chat; exploration ranking has its own novelty.
+const W_NOVELTY: f64 = 0.0; // replay-tunable.
 
 #[derive(Clone)]
 pub struct RoutedSemanticSelection {
@@ -538,5 +542,6 @@ fn rows_to_semantic_edges(rows: Vec<db::SemanticEdgeRow>) -> Vec<SemanticEdge> {
 }
 
 fn send_log(sender: &std::sync::mpsc::Sender<MemoryEvent>, phase: &'static str, text: String) {
+    runlog::log(phase, &text);
     let _ = sender.send(MemoryEvent::Log { phase, text });
 }

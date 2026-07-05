@@ -90,7 +90,7 @@ impl LlmClient for OpenRouterClient {
                 Ok(Chunk::Content(text)) => content.push_str(&text),
                 Ok(Chunk::Reasoning(text)) => reasoning.push_str(&text),
                 Ok(Chunk::ToolCall(_)) => {}
-                Ok(Chunk::MemoryLog { .. }) => {}
+                Ok(Chunk::MemoryLog { .. }) | Ok(Chunk::Attribution(_)) => {}
                 Ok(Chunk::Done(_)) => break,
                 Ok(Chunk::Err(err)) => return Err(err.into()),
                 Err(err) => return Err(err.into()),

@@ -9,6 +9,7 @@ use crate::prompts::{
     self, DREAM_BIOLOGIST, DREAM_CHILD, DREAM_CONNECTOR, DREAM_CONSOLIDATION, DREAM_ECONOMIST,
     DREAM_HISTORIAN, DREAM_LATERAL, DREAM_SKEPTIC,
 };
+use crate::runlog;
 
 use super::agent::{ToolCall, parse_tool_calls, stream_collect};
 use super::db;
@@ -174,7 +175,9 @@ fn record_domain_views(agent_name: &str, edges: &[SemanticEdge], session_id: &st
     if events.is_empty() {
         return;
     }
-    let _ = ledger::record_events(&events);
+    if let Err(err) = ledger::record_events(&events) {
+        runlog::log("ledger", &format!("write failed: {err}"));
+    }
 }
 
 fn join_agent(
@@ -316,7 +319,9 @@ fn apply_dream_tool_calls(
         db::block_on(ledger::record_events_in_tx(conn, &events))
     })();
     if let Err(err) = result {
-        let _ = db::block_on(async { conn.execute("ROLLBACK", ()).await });
+        if let Err(rollback_err) = db::block_on(async { conn.execute("ROLLBACK", ()).await }) {
+            runlog::log("ledger", &format!("rollback failed: {rollback_err}"));
+        }
         return Err(err);
     }
     db::commit_transaction(conn)?;
@@ -499,6 +504,7 @@ fn dream_timestamp() -> String {
 }
 
 fn send_log(sender: &std::sync::mpsc::Sender<DreamEvent>, phase: &'static str, text: String) {
+    runlog::log(phase, &text);
     let _ = sender.send(DreamEvent::Log { phase, text });
 }
 

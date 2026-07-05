@@ -1,11 +1,13 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde_json::{Value, json};
 
 use crate::api::{Chunk, EmbeddingClient, LlmClient, Stats, ToolCallRequest, TurnOutcome};
 use crate::memory;
 use crate::prompts;
+use crate::runlog;
 use crate::session;
 use crate::web::SearchClient;
 
@@ -31,6 +33,8 @@ struct StatsAgg {
 struct MemoryBuild {
     block: String,
     debug_log: String,
+    injected_edges: usize,
+    elapsed_ms: u128,
 }
 
 pub(crate) fn start_stream(app: &mut App) {
@@ -41,12 +45,14 @@ pub(crate) fn start_stream(app: &mut App) {
         reasoning: String::new(),
         content: prompt.clone(),
         tool_call: String::new(),
+        attribution: String::new(),
     });
     app.history.push(Message {
         role: Role::Assistant,
         reasoning: String::new(),
         content: String::new(),
         tool_call: String::new(),
+        attribution: String::new(),
     });
     app.stats = None;
     app.auto_scroll = true;
@@ -73,13 +79,14 @@ fn clone_search_client(app: &App) -> Option<Arc<dyn SearchClient>> {
 }
 
 fn run_stream_worker(job: StreamJob) {
-    let (mut messages, tools, routing_debug) = match prepare_stream_context(&job) {
+    let (mut messages, tools, memory_build) = match prepare_stream_context(&job) {
         Ok(result) => result,
         Err(err) => {
             let _ = job.sender.send(Chunk::Err(err.to_string()));
             return;
         }
     };
+    log_memory_context(&memory_build);
     let mut stats_agg = StatsAgg {
         tokens_in: 0,
         tokens_out: 0,
@@ -88,15 +95,10 @@ fn run_stream_worker(job: StreamJob) {
     };
     let mut first_turn = true;
     loop {
-        match job.llm.stream_turn(&messages, Some(&tools), &job.sender) {
+        let turn = job.llm.stream_turn(&messages, Some(&tools), &job.sender);
+        match turn {
             Ok(TurnOutcome::Done(stats)) => {
-                send_final_stats(&job.sender, stats, &mut stats_agg, first_turn);
-                if !routing_debug.is_empty() {
-                    let _ = job.sender.send(Chunk::MemoryLog {
-                        phase: "debug",
-                        text: routing_debug.clone(),
-                    });
-                }
+                finish_stream(&job, &memory_build, stats, &mut stats_agg, first_turn);
                 return;
             }
             Ok(TurnOutcome::ToolCalls(calls)) => {
@@ -111,9 +113,53 @@ fn run_stream_worker(job: StreamJob) {
     }
 }
 
+fn finish_stream(
+    job: &StreamJob,
+    memory_build: &MemoryBuild,
+    stats: Stats,
+    stats_agg: &mut StatsAgg,
+    first_turn: bool,
+) {
+    // Done must be sent last: the app drops the stream receiver once it
+    // leaves the Streaming state, so anything sent after Done is lost.
+    emit_routing_debug(&job.sender, &memory_build.debug_log);
+    emit_attribution(job);
+    let final_stats = send_final_stats(&job.sender, stats, stats_agg, first_turn);
+    runlog::log("chat", &format_stats_line(&final_stats));
+}
+
+fn log_memory_context(memory_build: &MemoryBuild) {
+    runlog::log("routing", &memory_build.debug_log);
+    runlog::log(
+        "chat",
+        &format!("injected edges: {}", memory_build.injected_edges),
+    );
+    runlog::log(
+        "chat",
+        &format!("memory context built in {}ms", memory_build.elapsed_ms),
+    );
+}
+
+fn emit_routing_debug(sender: &std::sync::mpsc::Sender<Chunk>, routing_debug: &str) {
+    if routing_debug.is_empty() {
+        return;
+    }
+    let _ = sender.send(Chunk::MemoryLog {
+        phase: "debug",
+        text: routing_debug.to_string(),
+    });
+}
+
+fn emit_attribution(job: &StreamJob) {
+    let attribution = memory::turn_attribution(&job.turn_id);
+    let _ = job
+        .sender
+        .send(Chunk::Attribution(format_attribution_line(&attribution)));
+}
+
 fn prepare_stream_context(
     job: &StreamJob,
-) -> Result<(Vec<Value>, Value, String), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(Vec<Value>, Value, MemoryBuild), Box<dyn std::error::Error + Send + Sync>> {
     let recent_entries = session::load_recent_entries(&job.session_path, super::app::RECENT_TURNS);
     let session_id = session::session_id_from_path(&job.session_path);
     let memory = build_memory_block(&*job.embed, &job.prompt, &session_id, &job.turn_id);
@@ -126,7 +172,7 @@ fn prepare_stream_context(
     Ok((
         build_initial_messages(&job.prompt, system_opt.as_deref()),
         build_tools(job.search.is_some()),
-        memory.debug_log,
+        memory,
     ))
 }
 
@@ -136,6 +182,7 @@ fn build_memory_block(
     session_id: &str,
     turn_id: &str,
 ) -> MemoryBuild {
+    let started = Instant::now();
     let selection = memory::select_semantic_edges_routed(embed, query);
     let edges = selection.edges;
     let mut events = Vec::new();
@@ -151,7 +198,9 @@ fn build_memory_block(
         ));
     }
     // Best-effort bookkeeping: a failed ledger write must never abort the turn.
-    let _ = memory::record_events(&events);
+    if let Err(err) = memory::record_events(&events) {
+        runlog::log("ledger", &format!("write failed: {err}"));
+    }
     let block = if edges.is_empty() {
         String::new()
     } else {
@@ -160,6 +209,8 @@ fn build_memory_block(
     MemoryBuild {
         block,
         debug_log: routing_debug_line(&selection.routing),
+        injected_edges: edges.len(),
+        elapsed_ms: started.elapsed().as_millis(),
     }
 }
 
@@ -197,7 +248,7 @@ fn send_final_stats(
     stats: Stats,
     stats_agg: &mut StatsAgg,
     first_turn: bool,
-) {
+) -> Stats {
     stats_agg.tokens_in += stats.tokens_in;
     stats_agg.tokens_out += stats.tokens_out;
     stats_agg.cost_usd += stats.cost_usd.unwrap_or(0.0);
@@ -209,12 +260,73 @@ fn send_final_stats(
     } else {
         None
     };
-    let _ = sender.send(Chunk::Done(Stats {
+    let final_stats = Stats {
         tokens_in: stats_agg.tokens_in,
         tokens_out: stats_agg.tokens_out,
         cost_usd,
         ttft_ms: stats_agg.ttft_ms,
+    };
+    let _ = sender.send(Chunk::Done(Stats {
+        tokens_in: final_stats.tokens_in,
+        tokens_out: final_stats.tokens_out,
+        cost_usd: final_stats.cost_usd,
+        ttft_ms: final_stats.ttft_ms,
     }));
+    final_stats
+}
+
+fn format_stats_line(stats: &Stats) -> String {
+    let cost = match stats.cost_usd {
+        Some(value) => format!("${value:.6}"),
+        None => "N/A".to_string(),
+    };
+    format!(
+        "final stats: in={} out={} cost={} ttft={}ms",
+        stats.tokens_in, stats.tokens_out, cost, stats.ttft_ms
+    )
+}
+
+fn format_attribution_line(attribution: &memory::Attribution) -> String {
+    if attribution.injected_edges == 0 {
+        return "memory: none — answered from model knowledge".to_string();
+    }
+    let expert = match &attribution.expert {
+        Some(expert) => expert.clone(),
+        None => "none".to_string(),
+    };
+    let mut line = format!(
+        "memory: {} beliefs consulted · lens: {} ({:.2})",
+        attribution.injected_edges, expert, attribution.expert_score
+    );
+    if !attribution.top_edges.is_empty() {
+        line.push_str(" · top: ");
+        line.push_str(&format_top_edges(&attribution.top_edges));
+    }
+    line
+}
+
+fn format_top_edges(edges: &[String]) -> String {
+    let mut parts = Vec::new();
+    for edge in edges {
+        let short = shorten_belief(edge, 72);
+        parts.push(format!("\"{short}\""));
+    }
+    parts.join(", ")
+}
+
+fn shorten_belief(text: &str, max_chars: usize) -> String {
+    let mut output = String::new();
+    let chars: Vec<char> = text.trim().chars().collect();
+    let mut index = 0usize;
+    while index < chars.len() {
+        if index >= max_chars {
+            output.push('…');
+            break;
+        }
+        output.push(chars[index]);
+        index += 1;
+    }
+    output
 }
 
 fn execute_tool_turn(job: &StreamJob, calls: &[ToolCallRequest], messages: &mut Vec<Value>) {
