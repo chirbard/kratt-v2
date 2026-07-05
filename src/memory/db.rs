@@ -313,14 +313,31 @@ async fn create_history_tables(conn: &Connection) -> Result<(), Box<dyn Error + 
         (),
     )
     .await?;
-    // fts index has no IF NOT EXISTS in turso — try and ignore if already exists
-    let _ = conn
-        .execute(
-            "CREATE INDEX fts_messages_content ON messages USING fts (content)",
+    // fts index has no IF NOT EXISTS in turso — and re-running the CREATE
+    // pollutes the sync change log with DDL the cloud server cannot parse
+    // (every first push after app start failed on it). Check first.
+    if !fts_index_exists(conn).await {
+        let _ = conn
+            .execute(
+                "CREATE INDEX fts_messages_content ON messages USING fts (content)",
+                (),
+            )
+            .await;
+    }
+    Ok(())
+}
+
+async fn fts_index_exists(conn: &Connection) -> bool {
+    let Ok(mut rows) = conn
+        .query(
+            "SELECT name FROM sqlite_schema WHERE name = 'fts_messages_content' LIMIT 1",
             (),
         )
-        .await;
-    Ok(())
+        .await
+    else {
+        return false;
+    };
+    matches!(rows.next().await, Ok(Some(_)))
 }
 
 async fn add_edge_provenance_column(conn: &Connection) {
