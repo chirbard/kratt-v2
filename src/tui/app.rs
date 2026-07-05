@@ -141,6 +141,9 @@ pub(crate) fn drain_stream(app: &mut App) {
                     msg.tool_call = desc;
                 }
             }
+            Chunk::MemoryLog { phase, text } => {
+                app.memory_log.push((phase.to_string(), text));
+            }
             Chunk::Done(stats) => {
                 app.stats = Some(stats);
                 app.state = State::Idle;

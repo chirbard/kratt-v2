@@ -5,9 +5,12 @@ use std::sync::Arc;
 use serde_json::json;
 
 use crate::api::EmbeddingClient;
+use crate::timeutil;
 
 use super::MemoryEvent;
 use super::db;
+use super::ledger;
+use super::routing;
 
 pub const EMBED_BATCH: usize = 50;
 pub const TOP_K: usize = 60;
@@ -15,6 +18,16 @@ pub const SMALL_GRAPH_THRESHOLD: usize = 100;
 pub const MAX_POOL: usize = 150;
 pub const EXPLORATION_CANDIDATES: usize = 200;
 pub const NOVELTY_WEIGHT: f64 = 0.3;
+const W_SIM: f64 = 0.5; // replay-tunable.
+const W_CONF: f64 = 0.2; // replay-tunable.
+const W_RECENCY: f64 = 0.15; // replay-tunable.
+const W_NOVELTY: f64 = 0.15; // replay-tunable.
+
+#[derive(Clone)]
+pub struct RoutedSemanticSelection {
+    pub edges: Vec<SemanticEdge>,
+    pub routing: routing::Routing,
+}
 
 #[derive(Clone)]
 pub struct SemanticEdge {
@@ -28,6 +41,7 @@ pub struct SemanticEdge {
     pub date: String,
     pub occurred_at: Option<String>,
     pub expired_at: Option<String>,
+    pub embedding: Option<Vec<f64>>,
 }
 
 pub fn embedding_string(source: &str, content: &str, target: &str) -> String {
@@ -72,11 +86,52 @@ pub fn select_semantic_edges(embed: &dyn EmbeddingClient, query: &str) -> Vec<Se
     if db::edge_count() < SMALL_GRAPH_THRESHOLD {
         return fallback_edges();
     }
-    let Some(anchors) = anchor_edges(embed, query) else {
+    let Some(vector) = query_embedding(embed, query) else {
+        return fallback_edges();
+    };
+    let Some(anchors) = anchor_edges_for_vector(&vector) else {
         return fallback_edges();
     };
     let all_edges = all_semantic_edges();
     expand_hops(anchors, all_edges)
+}
+
+pub fn select_semantic_edges_routed(
+    embed: &dyn EmbeddingClient,
+    query: &str,
+) -> RoutedSemanticSelection {
+    let query_embedding = match query_embedding(embed, query) {
+        Some(vector) => vector,
+        None => {
+            return RoutedSemanticSelection {
+                edges: fallback_edges(),
+                routing: routing::Routing {
+                    routing_vector: Vec::new(),
+                    expert: None,
+                    expert_score: 0.0,
+                    expert_with_direction: false,
+                },
+            };
+        }
+    };
+    let routing = routing::route(&query_embedding);
+    if db::edge_count() < SMALL_GRAPH_THRESHOLD {
+        return RoutedSemanticSelection {
+            edges: fallback_edges(),
+            routing,
+        };
+    }
+    let Some(anchors) = anchor_edges_for_vector(&routing.routing_vector) else {
+        return RoutedSemanticSelection {
+            edges: fallback_edges(),
+            routing,
+        };
+    };
+    let all_edges = all_semantic_edges();
+    let pool = expand_hops_pool(anchors, all_edges);
+    let user_views = db::load_edge_actor_views("user", "local");
+    let edges = rank_pool_for_chat(pool, &routing.routing_vector, &user_views);
+    RoutedSemanticSelection { edges, routing }
 }
 
 pub fn select_exploration_edges(
@@ -174,12 +229,12 @@ fn choose_exploration_anchors(
     rank_by_exploration(candidates, &views)
 }
 
-fn anchor_edges(embed: &dyn EmbeddingClient, query: &str) -> Option<Vec<SemanticEdge>> {
-    let vector = match embed_text(embed, query) {
-        Ok(vector) => vector,
-        Err(_) => return None,
-    };
-    let rows = match db::query_edges_by_vector(&vector, TOP_K) {
+fn query_embedding(embed: &dyn EmbeddingClient, query: &str) -> Option<Vec<f64>> {
+    embed_text(embed, query).ok()
+}
+
+fn anchor_edges_for_vector(vector: &[f64]) -> Option<Vec<SemanticEdge>> {
+    let rows = match db::query_edges_by_vector(vector, TOP_K) {
         Ok(rows) => rows,
         Err(_) => return None,
     };
@@ -245,6 +300,10 @@ fn top_ranked_edges(mut scored: Vec<ScoredEdge>) -> Vec<SemanticEdge> {
 }
 
 fn expand_hops(anchors: Vec<SemanticEdge>, all_edges: Vec<SemanticEdge>) -> Vec<SemanticEdge> {
+    rank_and_cap(expand_hops_pool(anchors, all_edges))
+}
+
+fn expand_hops_pool(anchors: Vec<SemanticEdge>, all_edges: Vec<SemanticEdge>) -> Vec<SemanticEdge> {
     let index = build_node_index(&all_edges);
     let anchor_nodes = collect_anchor_nodes(&anchors);
     let mut pool = Vec::new();
@@ -257,7 +316,7 @@ fn expand_hops(anchors: Vec<SemanticEdge>, all_edges: Vec<SemanticEdge>) -> Vec<
         hop1_nodes.remove(node);
     }
     let _ = hop_expand(&hop1_nodes, &index, &all_edges, &mut seen, &mut pool);
-    rank_and_cap(pool)
+    pool
 }
 
 fn collect_anchor_nodes(edges: &[SemanticEdge]) -> HashSet<String> {
@@ -337,8 +396,111 @@ fn rank_and_cap(mut pool: Vec<SemanticEdge>) -> Vec<SemanticEdge> {
     pool
 }
 
+fn rank_pool_for_chat(
+    pool: Vec<SemanticEdge>,
+    routing_vector: &[f64],
+    user_views: &HashMap<(String, String), f64>,
+) -> Vec<SemanticEdge> {
+    let mut scored = Vec::new();
+    let mut index = 0usize;
+    while index < pool.len() {
+        let edge = pool[index].clone();
+        let has_embedding = edge.embedding.is_some();
+        let score = rank_score(&edge, routing_vector, user_views);
+        scored.push(ChatScoredEdge {
+            has_embedding,
+            score,
+            original_index: index,
+            edge,
+        });
+        index += 1;
+    }
+    scored.sort_by(chat_rank_cmp);
+    if scored.len() > MAX_POOL {
+        scored.truncate(MAX_POOL);
+    }
+    let mut edges = Vec::new();
+    for row in scored {
+        edges.push(row.edge);
+    }
+    edges
+}
+
+fn rank_score(
+    edge: &SemanticEdge,
+    routing_vector: &[f64],
+    user_views: &HashMap<(String, String), f64>,
+) -> f64 {
+    let sim = similarity_term(routing_vector, edge.embedding.as_deref());
+    let recency = recency_term(&edge.date);
+    let novelty = novelty_term(edge, user_views);
+    W_SIM * sim + W_CONF * edge.confidence + W_RECENCY * recency + W_NOVELTY * novelty
+}
+
+fn similarity_term(routing_vector: &[f64], edge_embedding: Option<&[f64]>) -> f64 {
+    let Some(embedding) = edge_embedding else {
+        return 0.0;
+    };
+    if embedding.len() != routing_vector.len() {
+        return 0.0;
+    }
+    ledger::cosine_similarity(routing_vector, embedding).unwrap_or(0.0)
+}
+
+fn novelty_term(edge: &SemanticEdge, user_views: &HashMap<(String, String), f64>) -> f64 {
+    let key = (edge.source.clone(), edge.target.clone());
+    let views = *user_views.get(&key).unwrap_or(&0.0);
+    1.0 / (1.0 + views)
+}
+
+fn recency_term(date: &str) -> f64 {
+    let Some(days) = days_since_edge_date(date) else {
+        return 0.0;
+    };
+    1.0 / (1.0 + days)
+}
+
+fn days_since_edge_date(date: &str) -> Option<f64> {
+    let trimmed = date.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let epoch = if trimmed.contains('T') {
+        timeutil::timestamp_to_epoch_seconds(trimmed)?
+    } else {
+        let stamped = format!("{trimmed}T00:00:00");
+        timeutil::timestamp_to_epoch_seconds(&stamped)?
+    };
+    let now = timeutil::epoch_seconds_now() as i64;
+    let seconds = now.saturating_sub(epoch);
+    if seconds <= 0 {
+        return Some(0.0);
+    }
+    Some(seconds as f64 / 86_400.0)
+}
+
+fn chat_rank_cmp(left: &ChatScoredEdge, right: &ChatScoredEdge) -> std::cmp::Ordering {
+    if left.has_embedding != right.has_embedding {
+        return right.has_embedding.cmp(&left.has_embedding);
+    }
+    if !left.has_embedding {
+        return left.original_index.cmp(&right.original_index);
+    }
+    right
+        .score
+        .total_cmp(&left.score)
+        .then_with(|| left.original_index.cmp(&right.original_index))
+}
+
 struct ScoredEdge {
     score: f64,
+    edge: SemanticEdge,
+}
+
+struct ChatScoredEdge {
+    has_embedding: bool,
+    score: f64,
+    original_index: usize,
     edge: SemanticEdge,
 }
 
@@ -355,6 +517,7 @@ fn rows_to_semantic_edges(rows: Vec<db::SemanticEdgeRow>) -> Vec<SemanticEdge> {
         date,
         occurred_at,
         expired_at,
+        embedding,
     ) in rows
     {
         edges.push(SemanticEdge {
@@ -368,6 +531,7 @@ fn rows_to_semantic_edges(rows: Vec<db::SemanticEdgeRow>) -> Vec<SemanticEdge> {
             date,
             occurred_at,
             expired_at,
+            embedding,
         });
     }
     edges

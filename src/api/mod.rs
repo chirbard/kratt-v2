@@ -15,6 +15,7 @@ pub enum Chunk {
     Reasoning(String),
     Content(String),
     ToolCall(String),
+    MemoryLog { phase: &'static str, text: String },
     Done(Stats),
     Err(String),
 }

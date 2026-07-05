@@ -28,6 +28,11 @@ struct StatsAgg {
     ttft_ms: u128,
 }
 
+struct MemoryBuild {
+    block: String,
+    debug_log: String,
+}
+
 pub(crate) fn start_stream(app: &mut App) {
     let prompt = std::mem::take(&mut app.input);
     app.last_user_message_id = session::append_entry(&app.session_path, "user", &prompt);
@@ -68,7 +73,7 @@ fn clone_search_client(app: &App) -> Option<Arc<dyn SearchClient>> {
 }
 
 fn run_stream_worker(job: StreamJob) {
-    let (mut messages, tools) = match prepare_stream_context(&job) {
+    let (mut messages, tools, routing_debug) = match prepare_stream_context(&job) {
         Ok(result) => result,
         Err(err) => {
             let _ = job.sender.send(Chunk::Err(err.to_string()));
@@ -86,6 +91,12 @@ fn run_stream_worker(job: StreamJob) {
         match job.llm.stream_turn(&messages, Some(&tools), &job.sender) {
             Ok(TurnOutcome::Done(stats)) => {
                 send_final_stats(&job.sender, stats, &mut stats_agg, first_turn);
+                if !routing_debug.is_empty() {
+                    let _ = job.sender.send(Chunk::MemoryLog {
+                        phase: "debug",
+                        text: routing_debug.clone(),
+                    });
+                }
                 return;
             }
             Ok(TurnOutcome::ToolCalls(calls)) => {
@@ -102,11 +113,11 @@ fn run_stream_worker(job: StreamJob) {
 
 fn prepare_stream_context(
     job: &StreamJob,
-) -> Result<(Vec<Value>, Value), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(Vec<Value>, Value, String), Box<dyn std::error::Error + Send + Sync>> {
     let recent_entries = session::load_recent_entries(&job.session_path, super::app::RECENT_TURNS);
     let session_id = session::session_id_from_path(&job.session_path);
-    let memory_block = build_memory_block(&*job.embed, &job.prompt, &session_id, &job.turn_id);
-    let system = prompts::build_chat_system_prompt(&memory_block, &recent_entries);
+    let memory = build_memory_block(&*job.embed, &job.prompt, &session_id, &job.turn_id);
+    let system = prompts::build_chat_system_prompt(&memory.block, &recent_entries);
     let system_opt = if system.is_empty() {
         None
     } else {
@@ -115,6 +126,7 @@ fn prepare_stream_context(
     Ok((
         build_initial_messages(&job.prompt, system_opt.as_deref()),
         build_tools(job.search.is_some()),
+        memory.debug_log,
     ))
 }
 
@@ -123,12 +135,14 @@ fn build_memory_block(
     query: &str,
     session_id: &str,
     turn_id: &str,
-) -> String {
-    let edges = memory::select_semantic_edges(embed, query);
-    if edges.is_empty() {
-        return String::new();
-    }
+) -> MemoryBuild {
+    let selection = memory::select_semantic_edges_routed(embed, query);
+    let edges = selection.edges;
     let mut events = Vec::new();
+    events.push(memory::Event::routed(
+        memory::EventContext::new(session_id, turn_id),
+        routed_payload(&selection.routing.expert, selection.routing.expert_score),
+    ));
     for edge in &edges {
         events.push(memory::Event::injected(
             memory::Actor::new("user", "local"),
@@ -138,7 +152,35 @@ fn build_memory_block(
     }
     // Best-effort bookkeeping: a failed ledger write must never abort the turn.
     let _ = memory::record_events(&events);
-    memory::edges_to_toon(&edges)
+    let block = if edges.is_empty() {
+        String::new()
+    } else {
+        memory::edges_to_toon(&edges)
+    };
+    MemoryBuild {
+        block,
+        debug_log: routing_debug_line(&selection.routing),
+    }
+}
+
+fn routed_payload(expert: &Option<String>, score: f64) -> String {
+    json!({
+        "expert": expert,
+        "score": score,
+    })
+    .to_string()
+}
+
+fn routing_debug_line(routing: &memory::Routing) -> String {
+    let Some(expert) = &routing.expert else {
+        return "routing: none (no positions)".to_string();
+    };
+    let suffix = if routing.expert_with_direction {
+        " (pos+dir)"
+    } else {
+        " (pos)"
+    };
+    format!("routing: {expert} {:.2}{suffix}", routing.expert_score)
 }
 
 fn build_initial_messages(prompt: &str, system_opt: Option<&str>) -> Vec<Value> {

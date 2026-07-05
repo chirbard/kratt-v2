@@ -182,7 +182,7 @@ pub(super) fn stream_collect(
                 err = Some(error.into());
                 break;
             }
-            Chunk::ToolCall(_) => {}
+            Chunk::ToolCall(_) | Chunk::MemoryLog { .. } => {}
         }
     }
     if let Some(error) = err {
@@ -342,7 +342,8 @@ fn apply_tool_calls<'agent_run>(
     let mut events: Vec<Event> = Vec::new();
     let result = (|| {
         for call in tool_calls {
-            let description = apply_tool(call, conn, agent_run.user_message_id, phase, &mut events)?;
+            let description =
+                apply_tool(call, conn, agent_run.user_message_id, phase, &mut events)?;
             agent_run.send_log(phase, description);
         }
         db::block_on(ledger::record_events_in_tx(conn, &events))
@@ -355,51 +356,51 @@ fn apply_tool_calls<'agent_run>(
     Ok(())
 }
 
-fn apply_tool(
-    call: ToolCall,
+#[rustfmt::skip]
+fn apply_tool(call: ToolCall, conn: &Connection, source_message_id: &str, phase: &str, events: &mut Vec<Event>) -> Result<String, Box<dyn Error + Send + Sync>> {
+    match call {
+        ToolCall::UpsertNode { name, node_type, body, date } =>
+            apply_upsert_node(conn, name, node_type, body, date),
+        ToolCall::UpsertEdge { source, target, content, stability, confidence, importance, subject, date } =>
+            apply_upsert_edge_call(conn, source_message_id, phase, events, UpsertEdgeCall { source, target, content, stability, confidence, importance, subject, date }),
+        ToolCall::DeleteNode { name } =>
+            apply_delete_node(conn, name, source_message_id, phase, events),
+        ToolCall::DeleteEdge { source, target } =>
+            apply_delete_edge(conn, EdgeRef::new(&source, &target), source_message_id, phase, events),
+    }
+}
+
+struct UpsertEdgeCall {
+    source: String,
+    target: String,
+    content: String,
+    stability: f64,
+    confidence: f64,
+    importance: f64,
+    subject: bool,
+    date: String,
+}
+
+fn apply_upsert_edge_call(
     conn: &Connection,
     source_message_id: &str,
     phase: &str,
     events: &mut Vec<Event>,
+    call: UpsertEdgeCall,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
-    match call {
-        ToolCall::UpsertNode {
-            name,
-            node_type,
-            body,
-            date,
-        } => apply_upsert_node(conn, name, node_type, body, date),
-        ToolCall::UpsertEdge {
-            source,
-            target,
-            content,
-            stability,
-            confidence,
-            importance,
-            subject,
-            date,
-        } => {
-            let edge = Edge {
-                source: normalize_id(&source),
-                target: normalize_id(&target),
-                content,
-                stability,
-                confidence,
-                importance,
-                subject,
-                date,
-                occurred_at: None,
-                expired_at: None,
-            };
-            apply_upsert_edge(conn, edge, source_message_id, phase, events)
-        }
-        ToolCall::DeleteNode { name } => {
-            apply_delete_node(conn, name, source_message_id, phase, events)
-        }
-        ToolCall::DeleteEdge { source, target } => {
-            apply_delete_edge(conn, EdgeRef::new(&source, &target), source_message_id, phase, events)
-        }
-    }
+    let edge = Edge {
+        source: normalize_id(&call.source),
+        target: normalize_id(&call.target),
+        content: call.content,
+        stability: call.stability,
+        confidence: call.confidence,
+        importance: call.importance,
+        subject: call.subject,
+        date: call.date,
+        occurred_at: None,
+        expired_at: None,
+    };
+    apply_upsert_edge(conn, edge, source_message_id, phase, events)
 }
 
 fn apply_upsert_node(

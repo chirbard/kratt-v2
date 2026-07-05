@@ -8,6 +8,8 @@ use crate::memory::graph::Edge;
 
 const HALF_LIFE_CYCLES: f64 = 20.0; // replay-tunable.
 const POSITION_EPSILON: f64 = 0.05; // replay-tunable.
+const DIRECTION_SNAPSHOTS: usize = 5; // replay-tunable.
+const DIRECTION_NORM_EPSILON: f64 = 1e-9; // replay-tunable.
 
 #[derive(Clone)]
 pub struct Event {
@@ -48,19 +50,47 @@ struct EventBody {
 
 impl Event {
     pub fn injected(actor: Actor, edge: EdgeRef, context: EventContext) -> Self {
-        Self::new(actor, "injected", edge, context, EventBody::new(1.0, String::new()))
+        Self::new(
+            actor,
+            "injected",
+            edge,
+            context,
+            EventBody::new(1.0, String::new()),
+        )
     }
 
     pub fn upsert(actor: Actor, edge: EdgeRef, context: EventContext, existed: bool) -> Self {
         let event_type = if existed { "updated" } else { "created" };
-        Self::new(actor, event_type, edge, context, EventBody::new(1.0, String::new()))
+        Self::new(
+            actor,
+            event_type,
+            edge,
+            context,
+            EventBody::new(1.0, String::new()),
+        )
     }
 
     pub fn pruned(actor: Actor, edge: EdgeRef, context: EventContext, payload: String) -> Self {
         Self::new(actor, "pruned", edge, context, EventBody::new(1.0, payload))
     }
 
-    fn new(actor: Actor, event_type: &str, edge: EdgeRef, context: EventContext, body: EventBody) -> Self {
+    pub fn routed(context: EventContext, payload: String) -> Self {
+        Self::new(
+            Actor::new("system", "router"),
+            "routed",
+            EdgeRef::new("", ""),
+            context,
+            EventBody::new(1.0, payload),
+        )
+    }
+
+    fn new(
+        actor: Actor,
+        event_type: &str,
+        edge: EdgeRef,
+        context: EventContext,
+        body: EventBody,
+    ) -> Self {
         Self {
             timestamp: db::timestamp_now(),
             session_id: context.session_id,
@@ -169,7 +199,10 @@ pub(crate) async fn record_events_in_tx(
             continue;
         }
         push_actor_event(&mut batches, event.clone());
-        if !edge_info(conn, &mut cache, &event.source, &event.target).await?.live {
+        if !edge_info(conn, &mut cache, &event.source, &event.target)
+            .await?
+            .live
+        {
             continue;
         }
         upsert_edge_view(conn, event).await?;
@@ -198,6 +231,49 @@ pub fn recompute_positions() -> Result<Vec<String>, Box<dyn Error + Send + Sync>
     })
 }
 
+pub fn load_actor_position(actor_type: &str, actor_id: &str) -> Option<Vec<f64>> {
+    let conn = match db::open_connection() {
+        Ok(conn) => conn,
+        Err(_) => return None,
+    };
+    db::block_on(load_actor_position_async(&conn, actor_type, actor_id)).unwrap_or_default()
+}
+
+pub fn load_actor_direction(actor_type: &str, actor_id: &str) -> Option<Vec<f64>> {
+    let conn = match db::open_connection() {
+        Ok(conn) => conn,
+        Err(_) => return None,
+    };
+    db::block_on(load_actor_direction_async(&conn, actor_type, actor_id)).unwrap_or_default()
+}
+
+pub(crate) fn cosine_similarity(
+    left: &[f64],
+    right: &[f64],
+) -> Result<f64, Box<dyn Error + Send + Sync>> {
+    Ok(1.0 - cosine_distance(left, right)?)
+}
+
+pub(crate) fn normalized_vector(vector: &[f64]) -> Option<Vec<f64>> {
+    let mut norm = 0.0;
+    let mut index = 0usize;
+    while index < vector.len() {
+        norm += vector[index] * vector[index];
+        index += 1;
+    }
+    if norm <= DIRECTION_NORM_EPSILON {
+        return None;
+    }
+    let scale = norm.sqrt();
+    let mut normalized = Vec::with_capacity(vector.len());
+    let mut normalize_index = 0usize;
+    while normalize_index < vector.len() {
+        normalized.push(vector[normalize_index] / scale);
+        normalize_index += 1;
+    }
+    Some(normalized)
+}
+
 struct ActorBatch {
     actor_type: String,
     actor_id: String,
@@ -210,7 +286,10 @@ struct PositionState {
     updated_at: String,
 }
 
-async fn insert_event(conn: &Connection, event: &Event) -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn insert_event(
+    conn: &Connection,
+    event: &Event,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     conn.execute(
         "INSERT INTO events (ts, session_id, turn_id, actor_type, actor_id, event_type, source, target, weight, payload) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
@@ -274,7 +353,10 @@ async fn load_edge_info(
     })
 }
 
-async fn upsert_edge_view(conn: &Connection, event: &Event) -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn upsert_edge_view(
+    conn: &Connection,
+    event: &Event,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     conn.execute(
         "INSERT INTO edge_actor_views (actor_type, actor_id, source, target, views, last_visited_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(actor_type, actor_id, source, target) DO UPDATE SET views = views + excluded.views, last_visited_at = excluded.last_visited_at",
         params![
@@ -321,7 +403,14 @@ async fn update_actor_position(
     state.updated_at = db::timestamp_now();
     let position = position_from_state(&state);
     persist_position(conn, &batch.actor_type, &batch.actor_id, &state, &position).await?;
-    maybe_snapshot_position(conn, &batch.actor_type, &batch.actor_id, &position, &state.updated_at).await?;
+    maybe_snapshot_position(
+        conn,
+        &batch.actor_type,
+        &batch.actor_id,
+        &position,
+        &state.updated_at,
+    )
+    .await?;
     Ok(())
 }
 
@@ -406,6 +495,53 @@ async fn load_position_state(
         total_weight: 0.0,
         updated_at: db::timestamp_now(),
     })
+}
+
+async fn load_actor_position_async(
+    conn: &Connection,
+    actor_type: &str,
+    actor_id: &str,
+) -> Result<Option<Vec<f64>>, Box<dyn Error + Send + Sync>> {
+    let state = load_position_state(conn, actor_type, actor_id).await?;
+    Ok(position_from_state(&state))
+}
+
+async fn load_actor_direction_async(
+    conn: &Connection,
+    actor_type: &str,
+    actor_id: &str,
+) -> Result<Option<Vec<f64>>, Box<dyn Error + Send + Sync>> {
+    let mut rows = conn
+        .query(
+            "SELECT vector_extract(embedding) FROM actor_position_history WHERE actor_type = ?1 AND actor_id = ?2 ORDER BY recorded_at DESC LIMIT ?3",
+            params![actor_type, actor_id, DIRECTION_SNAPSHOTS as i64],
+        )
+        .await?;
+    let mut snapshots: Vec<Vec<f64>> = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let embedding = match row.get_value(0).ok() {
+            Some(value) => parse_vector_blob(value),
+            None => None,
+        };
+        if let Some(vector) = embedding {
+            snapshots.push(vector);
+        }
+    }
+    if snapshots.len() < 2 {
+        return Ok(None);
+    }
+    let newest = &snapshots[0];
+    let oldest = &snapshots[snapshots.len() - 1];
+    if newest.len() != oldest.len() {
+        return Ok(None);
+    }
+    let mut delta = Vec::with_capacity(newest.len());
+    let mut index = 0usize;
+    while index < newest.len() {
+        delta.push(newest[index] - oldest[index]);
+        index += 1;
+    }
+    Ok(normalized_vector(&delta))
 }
 
 fn parse_vector_blob(value: Value) -> Option<Vec<f64>> {
@@ -614,18 +750,24 @@ async fn audit_positions(
         match current_rows.remove(&(actor_type.clone(), actor_id.clone())) {
             Some(current) => {
                 let current_position = position_from_state(&current);
-                if let (Some(left), Some(right)) = (current_position.as_ref(), folded_position.as_ref()) {
+                if let (Some(left), Some(right)) =
+                    (current_position.as_ref(), folded_position.as_ref())
+                {
                     let distance = cosine_distance(left, right)?;
                     logs.push(format!(
                         "{actor_type}:{actor_id} undecayed-fold distance {distance:.4}"
                     ));
                 }
             }
-            None => logs.push(format!("{actor_type}:{actor_id} has events but no position row")),
+            None => logs.push(format!(
+                "{actor_type}:{actor_id} has events but no position row"
+            )),
         }
     }
     for ((actor_type, actor_id), _) in current_rows {
-        logs.push(format!("{actor_type}:{actor_id} has a position but no embedded events"));
+        logs.push(format!(
+            "{actor_type}:{actor_id} has a position but no embedded events"
+        ));
     }
     Ok(logs)
 }

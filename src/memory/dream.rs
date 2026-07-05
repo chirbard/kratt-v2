@@ -13,11 +13,12 @@ use crate::prompts::{
 use super::agent::{ToolCall, parse_tool_calls, stream_collect};
 use super::db;
 use super::embed::{self, SemanticEdge};
-use super::ledger::{self, Actor, EdgeRef, Event, EventContext};
 use super::graph::{Edge, Node, graph_to_json, normalize_id};
+use super::ledger::{self, Actor, EdgeRef, Event, EventContext};
 
 const DREAM_CONFIDENCE_CAP: f64 = 0.6;
 const DREAM_STABILITY: f64 = 0.3;
+pub const DOMAIN_AGENT_NAMES: [&str; 3] = ["biologist", "historian", "economist"];
 const BIOLOGIST_ANCHOR: &str =
     "biology ecosystem evolution adaptation living organisms life systems";
 const HISTORIAN_ANCHOR: &str = "history timeline events temporal sequence causation past future";
@@ -102,9 +103,9 @@ fn run_domain_agents(
     type AgentHandle = std::thread::JoinHandle<Result<String, Box<dyn Error + Send + Sync>>>;
     let toons = build_domain_toons(&*embed, global_toon, session_id);
     let specs = [
-        ("biologist", DREAM_BIOLOGIST, toons.biologist),
-        ("historian", DREAM_HISTORIAN, toons.historian),
-        ("economist", DREAM_ECONOMIST, toons.economist),
+        (DOMAIN_AGENT_NAMES[0], DREAM_BIOLOGIST, toons.biologist),
+        (DOMAIN_AGENT_NAMES[1], DREAM_HISTORIAN, toons.historian),
+        (DOMAIN_AGENT_NAMES[2], DREAM_ECONOMIST, toons.economist),
         ("child", DREAM_CHILD, toons.child),
     ];
     let mut handles: Vec<AgentHandle> = Vec::new();
@@ -138,12 +139,12 @@ fn build_domain_toons(
     global_toon: &str,
     session_id: &str,
 ) -> DomainToons {
-    let biologist = exploration_subgraph(embed, BIOLOGIST_ANCHOR, "biologist");
-    record_domain_views("biologist", &biologist, session_id);
-    let historian = exploration_subgraph(embed, HISTORIAN_ANCHOR, "historian");
-    record_domain_views("historian", &historian, session_id);
-    let economist = exploration_subgraph(embed, ECONOMIST_ANCHOR, "economist");
-    record_domain_views("economist", &economist, session_id);
+    let biologist = exploration_subgraph(embed, BIOLOGIST_ANCHOR, DOMAIN_AGENT_NAMES[0]);
+    record_domain_views(DOMAIN_AGENT_NAMES[0], &biologist, session_id);
+    let historian = exploration_subgraph(embed, HISTORIAN_ANCHOR, DOMAIN_AGENT_NAMES[1]);
+    record_domain_views(DOMAIN_AGENT_NAMES[1], &historian, session_id);
+    let economist = exploration_subgraph(embed, ECONOMIST_ANCHOR, DOMAIN_AGENT_NAMES[2]);
+    record_domain_views(DOMAIN_AGENT_NAMES[2], &economist, session_id);
     DomainToons {
         biologist: embed::edges_to_toon(&biologist),
         historian: embed::edges_to_toon(&historian),

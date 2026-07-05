@@ -21,6 +21,7 @@ pub type SemanticEdgeRow = (
     String,
     Option<String>,
     Option<String>,
+    Option<Vec<f64>>,
 );
 
 #[allow(clippy::expect_used)]
@@ -151,10 +152,26 @@ async fn add_edge_time_columns(conn: &Connection) {
 }
 
 async fn add_events_table(conn: &Connection) {
+    // event_type values: created, updated, pruned, injected, routed
     let _ = conn.execute("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL, actor_id TEXT NOT NULL, event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')", ()).await;
-    let _ = conn.execute("CREATE INDEX IF NOT EXISTS events_actor_idx ON events (actor_type, actor_id, id)", ()).await;
-    let _ = conn.execute("CREATE INDEX IF NOT EXISTS events_turn_idx ON events (turn_id)", ()).await;
-    let _ = conn.execute("CREATE INDEX IF NOT EXISTS events_session_idx ON events (session_id)", ()).await;
+    let _ = conn
+        .execute(
+            "CREATE INDEX IF NOT EXISTS events_actor_idx ON events (actor_type, actor_id, id)",
+            (),
+        )
+        .await;
+    let _ = conn
+        .execute(
+            "CREATE INDEX IF NOT EXISTS events_turn_idx ON events (turn_id)",
+            (),
+        )
+        .await;
+    let _ = conn
+        .execute(
+            "CREATE INDEX IF NOT EXISTS events_session_idx ON events (session_id)",
+            (),
+        )
+        .await;
 }
 
 async fn add_edge_actor_views_table(conn: &Connection) {
@@ -171,7 +188,9 @@ async fn add_actor_position_history_table(conn: &Connection) {
 }
 
 async fn drop_node_agent_views_table(conn: &Connection) {
-    let _ = conn.execute("DROP TABLE IF EXISTS node_agent_views", ()).await;
+    let _ = conn
+        .execute("DROP TABLE IF EXISTS node_agent_views", ())
+        .await;
 }
 
 pub fn vector32_json(vector: &[f64]) -> Result<String, Box<dyn Error + Send + Sync>> {
@@ -519,7 +538,7 @@ async fn query_edges_ann(
 ) -> Result<Vec<SemanticEdgeRow>, Box<dyn Error + Send + Sync>> {
     execute_semantic_query(
         conn,
-        "SELECT e.source, e.target, e.content, e.stability, e.confidence, e.importance, e.subject, e.date, e.occurred_at, e.expired_at FROM vector_top_k('edges_vec', vector32(?1), ?2) AS vt JOIN edges AS e ON e.rowid = vt.id WHERE e.expired_at IS NULL",
+        "SELECT e.source, e.target, e.content, e.stability, e.confidence, e.importance, e.subject, e.date, e.occurred_at, e.expired_at, vector_extract(e.embedding) FROM vector_top_k('edges_vec', vector32(?1), ?2) AS vt JOIN edges AS e ON e.rowid = vt.id WHERE e.expired_at IS NULL",
         json_str,
         limit,
     )
@@ -533,7 +552,7 @@ async fn query_edges_scan(
 ) -> Result<Vec<SemanticEdgeRow>, Box<dyn Error + Send + Sync>> {
     execute_semantic_query(
         conn,
-        "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at FROM edges WHERE embedding IS NOT NULL AND expired_at IS NULL ORDER BY vector_distance_cos(embedding, vector32(?1)) LIMIT ?2",
+        "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, vector_extract(embedding) FROM edges WHERE embedding IS NOT NULL AND expired_at IS NULL ORDER BY vector_distance_cos(embedding, vector32(?1)) LIMIT ?2",
         json_str,
         limit,
     )
@@ -559,6 +578,7 @@ async fn execute_semantic_query(
 
 fn parse_semantic_edge_row(row: &turso::Row) -> Option<SemanticEdgeRow> {
     let edge = parse_edge_row(row)?;
+    let embedding = parse_optional_vector32(row.get_value(10).ok());
     Some((
         edge.source,
         edge.target,
@@ -570,6 +590,7 @@ fn parse_semantic_edge_row(row: &turso::Row) -> Option<SemanticEdgeRow> {
         edge.date,
         edge.occurred_at,
         edge.expired_at,
+        embedding,
     ))
 }
 
@@ -583,7 +604,7 @@ pub fn load_all_edges_semantic() -> Vec<SemanticEdgeRow> {
 async fn load_all_edges_semantic_async(conn: &Connection) -> Vec<SemanticEdgeRow> {
     let Ok(mut rows) = conn
         .query(
-            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at FROM edges WHERE expired_at IS NULL",
+            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, vector_extract(embedding) FROM edges WHERE expired_at IS NULL",
             (),
         )
         .await
@@ -600,10 +621,7 @@ async fn load_all_edges_semantic_async(conn: &Connection) -> Vec<SemanticEdgeRow
     edges
 }
 
-pub fn load_edge_actor_views(
-    actor_type: &str,
-    actor_id: &str,
-) -> HashMap<(String, String), f64> {
+pub fn load_edge_actor_views(actor_type: &str, actor_id: &str) -> HashMap<(String, String), f64> {
     let Ok(conn) = open_connection() else {
         return HashMap::new();
     };
@@ -1051,6 +1069,14 @@ fn optional_text(value: Option<Value>) -> Option<String> {
         Value::Null => None,
         _ => None,
     }
+}
+
+fn parse_optional_vector32(value: Option<Value>) -> Option<Vec<f64>> {
+    let json_text = optional_text(value)?;
+    if json_text.is_empty() {
+        return None;
+    }
+    parse_vector32_json(&json_text).ok()
 }
 
 pub(crate) fn text(val: Value) -> String {
