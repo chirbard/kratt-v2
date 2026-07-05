@@ -7,6 +7,7 @@ mod explore;
 mod graph;
 mod ledger;
 mod routing;
+mod synthesis;
 
 pub use agent::{MemoryEvent, run_memory_agent};
 pub use db::{

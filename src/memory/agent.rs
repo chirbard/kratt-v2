@@ -50,6 +50,11 @@ pub(super) enum ToolCall {
         source: String,
         target: String,
     },
+    ExpireEdge {
+        source: String,
+        target: String,
+        rewritten_content: String,
+    },
 }
 
 pub fn run_memory_agent(
@@ -242,6 +247,7 @@ fn parse_single_tool(obj: &serde_json::Value) -> Option<ToolCall> {
         "upsert_edge" => parse_upsert_edge(args),
         "delete_node" => parse_delete_node(args),
         "delete_edge" => parse_delete_edge(args),
+        "expire_edge" => parse_expire_edge(args),
         _ => None,
     }
 }
@@ -311,6 +317,20 @@ fn parse_delete_edge(args: &serde_json::Value) -> Option<ToolCall> {
     Some(ToolCall::DeleteEdge { source, target })
 }
 
+fn parse_expire_edge(args: &serde_json::Value) -> Option<ToolCall> {
+    let source = json_str(args, "source");
+    let target = json_str(args, "target");
+    let rewritten_content = json_str(args, "rewritten_content");
+    if source.is_empty() || target.is_empty() || rewritten_content.is_empty() {
+        return None;
+    }
+    Some(ToolCall::ExpireEdge {
+        source,
+        target,
+        rewritten_content,
+    })
+}
+
 fn json_str(obj: &serde_json::Value, key: &str) -> String {
     let Some(value) = obj.get(key) else {
         return String::new();
@@ -372,7 +392,45 @@ fn apply_tool(call: ToolCall, conn: &Connection, source_message_id: &str, phase:
             apply_delete_node(conn, name, source_message_id, phase, events),
         ToolCall::DeleteEdge { source, target } =>
             apply_delete_edge(conn, EdgeRef::new(&source, &target), source_message_id, phase, events),
+        ToolCall::ExpireEdge { source, target, rewritten_content } =>
+            apply_expire_edge(conn, ExpireEdgeCall { source, target, rewritten_content }, source_message_id, phase, events),
     }
+}
+
+struct ExpireEdgeCall {
+    source: String,
+    target: String,
+    rewritten_content: String,
+}
+
+fn apply_expire_edge(
+    conn: &Connection,
+    call: ExpireEdgeCall,
+    source_message_id: &str,
+    phase: &str,
+    events: &mut Vec<Event>,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let ExpireEdgeCall {
+        source,
+        target,
+        rewritten_content,
+    } = call;
+    let normalized_source = normalize_id(&source);
+    let normalized_target = normalize_id(&target);
+    let Some(mut edge) = db::load_edge(conn, &normalized_source, &normalized_target)? else {
+        return Ok(format!("expire_edge skipped: {source} → {target} (not found)"));
+    };
+    edge.content = rewritten_content;
+    edge.expired_at = Some(crate::timeutil::timestamp_now());
+    db::write_edge(conn, &edge, source_message_id)?;
+    let payload = serde_json::json!({"expired": true}).to_string();
+    events.push(Event::updated(
+        Actor::new("system", phase),
+        EdgeRef::new(&edge.source, &edge.target),
+        mutation_context(source_message_id),
+        payload,
+    ));
+    Ok(format!("expire_edge: {source} → {target}"))
 }
 
 struct UpsertEdgeCall {

@@ -50,7 +50,11 @@ delete_node — remove a node.
 {"tool":"delete_node","args":{"name":"string"}}
 
 delete_edge — remove a directed edge.
-{"tool":"delete_edge","args":{"source":"string","target":"string"}}"#;
+{"tool":"delete_edge","args":{"source":"string","target":"string"}}
+
+expire_edge — mark an edge historical instead of deleting it.
+- Use expiry for superseded-but-true-then beliefs; use delete only for absorbed scaffolding.
+{"tool":"expire_edge","args":{"source":"string","target":"string","rewritten_content":"string"}}"#;
 
 pub const MEMORY_RULES: &str = r#"Node types: entity (person, place, technology, named concept; body and date always empty) or fact (one atomic claim; body is one sentence, no period; date YYYY-MM-DD when event occurred, empty if unknown; use today for current events; resolve relative dates to YYYY-MM-DD).
 
@@ -196,8 +200,43 @@ Rules:
 - If the skeptic proposed lower confidence on an existing edge, apply it.
 - You may create concept nodes: if you see fifteen or more edges that all relate to the same high-level theme, create a node with type="concept" and a one-sentence body, then add edges with content="summarizes" from the concept node to the key nodes in the cluster.
 - Apply today's date to all edges.
+- Synthesis proposals identify higher-order facts. When you accept a synthesis proposal, forward its upsert_node AND its upsert_edge calls together — a synthesis edge without its node is invalid. Never create edges pointing at nodes that do not exist and are not being created in this same response. Keep synthesis nodes as type="synthesis" and preserve their support-based confidence.
+- Prefer expire_edge when a belief was once true but is now superseded. Use delete_edge only for absorbed scaffolding; keep deletions conservative.
 
 Respond with raw JSON tool calls only. Use the standard format. These will be applied immediately."#;
+
+pub const SYNTHESIS_DRIFTER: &str = r#"You are the Drifter in a synthesis brainstorm. Generate surprising hypotheses from this cluster.
+
+- Seek non-obvious links across multiple edges, not restatements of a single edge.
+- Include a few bold options that might be wrong.
+- Mention distant nodes from the cluster neighborhood only when the chain is plausible.
+
+Output plain text hypotheses, concise but specific."#;
+
+pub const SYNTHESIS_ADVOCATE: &str = r#"You are the Rational Advocate in a synthesis brainstorm.
+
+- Evaluate each hypothesis strictly against the provided cluster edges.
+- Keep only claims that can be supported by multi-edge evidence.
+- Drop unsupported claims explicitly.
+
+Output plain text with supported claims and evidence."#;
+
+pub const SYNTHESIS_DEVIL: &str = r#"You are the Devil's Advocate in a synthesis brainstorm.
+
+- Attack each proposed claim for hallucination, contradiction, or trivial restatement.
+- Reject claims that just paraphrase one input edge.
+- Keep only claims that survive hard criticism.
+
+Output plain text explaining which claims survive and why."#;
+
+pub const SYNTHESIS_CHAIRMAN: &str = r#"You are the Chairman in a synthesis brainstorm.
+
+- Convert only surviving insights into JSON tool calls.
+- Propose one synthesis fact node via upsert_node and supporting upsert_edge links.
+- Optional pruning is allowed via delete_edge or expire_edge when justified.
+- Do not include anything that failed Devil's Advocate scrutiny.
+
+Respond with raw JSON tool calls only."#;
 
 pub const EXPLORE_BIOLOGIST: &str = r#"You are a biologist in exploration mode. You are curious and acquisition-focused: follow what seems significant and verify it by retrieving more context.
 

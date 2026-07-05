@@ -81,6 +81,10 @@ impl Event {
         )
     }
 
+    pub fn updated(actor: Actor, edge: EdgeRef, context: EventContext, payload: String) -> Self {
+        Self::new(actor, "updated", edge, context, EventBody::new(1.0, payload))
+    }
+
     pub fn retrieved(actor: Actor, edge: EdgeRef, context: EventContext) -> Self {
         Self::new(
             actor,

@@ -16,9 +16,12 @@ use super::db;
 use super::embed::{self, SemanticEdge};
 use super::graph::{Edge, Node, graph_to_json, normalize_id};
 use super::ledger::{self, Actor, EdgeRef, Event, EventContext};
+use super::synthesis::{self, SynthesisPolicy};
 
 const DREAM_CONFIDENCE_CAP: f64 = 0.6;
 const DREAM_STABILITY: f64 = 0.3;
+const MAX_PRUNES_PER_PASS: usize = 3; // replay-tunable.
+const PRUNE_GUARD_THRESHOLD: f64 = 0.7; // replay-tunable.
 pub const DOMAIN_AGENT_NAMES: [&str; 3] = ["biologist", "historian", "economist"];
 const BIOLOGIST_ANCHOR: &str =
     "biology ecosystem evolution adaptation living organisms life systems";
@@ -52,10 +55,13 @@ pub fn run_dream_pass(
             Ok(())
         }
         Err(err) => {
+            // Not necessarily "graph unchanged": turso has been observed to
+            // dissolve a transaction mid-pass, auto-committing statements —
+            // the final COMMIT then fails but writes are already durable.
             send_log(
                 &sender,
                 "dream",
-                format!("pass failed — graph unchanged: {err}"),
+                format!("pass failed — writes may be partial: {err}"),
             );
             let _ = sender.send(DreamEvent::Done { edges_added: 0 });
             Err(err)
@@ -76,12 +82,24 @@ fn execute_dream_pass(
     let domain = run_domain_agents(Arc::clone(&llm), embed, &session_id, &global_toon, sender)?;
     let abstract_outputs =
         run_abstract_agents(Arc::clone(&llm), &session_id, &global_toon, &domain, sender)?;
-    let all_ctx = consolidation_context(&domain, &abstract_outputs);
+    let conn = db::open_connection()?;
+    let synthesis = synthesis::run_synthesis_stage(
+        Arc::clone(&llm),
+        &conn,
+        |text| send_log(sender, "synthesis", text),
+        |text| send_append(sender, "synthesis", text),
+    )?;
+    let all_ctx = consolidation_context(&domain, &abstract_outputs, &synthesis.proposal_text);
     let consolidation = run_consolidation_agent(llm, &session_id, &global_toon, &all_ctx, sender)?;
     let tool_calls = parse_tool_calls(&consolidation);
     let source_id = format!("dream:{session_id}");
-    let conn = db::open_connection()?;
-    let edges_added = apply_dream_tool_calls(&conn, tool_calls, &source_id, sender)?;
+    let edges_added = apply_dream_tool_calls(
+        &conn,
+        tool_calls,
+        &source_id,
+        &synthesis.policy,
+        sender,
+    )?;
     send_log(
         sender,
         "dream",
@@ -268,8 +286,12 @@ fn domain_context(domain: &DomainOutputs) -> String {
     ])
 }
 
-fn consolidation_context(domain: &DomainOutputs, abstract_outputs: &AbstractOutputs) -> String {
-    format_proposals(&[
+fn consolidation_context(
+    domain: &DomainOutputs,
+    abstract_outputs: &AbstractOutputs,
+    synthesis: &str,
+) -> String {
+    let mut proposals: Vec<(&str, &str)> = vec![
         ("biologist", &domain.biologist),
         ("historian", &domain.historian),
         ("economist", &domain.economist),
@@ -277,7 +299,11 @@ fn consolidation_context(domain: &DomainOutputs, abstract_outputs: &AbstractOutp
         ("connector", &abstract_outputs.connector),
         ("skeptic", &abstract_outputs.skeptic),
         ("lateral", &abstract_outputs.lateral),
-    ])
+    ];
+    if !synthesis.trim().is_empty() {
+        proposals.push(("synthesis", synthesis));
+    }
+    format_proposals(&proposals)
 }
 
 fn run_dream_agent(
@@ -311,14 +337,22 @@ fn apply_dream_tool_calls(
     conn: &Connection,
     tool_calls: Vec<ToolCall>,
     source_id: &str,
+    synthesis_policy: &SynthesisPolicy,
     sender: &std::sync::mpsc::Sender<DreamEvent>,
 ) -> Result<usize, Box<dyn Error + Send + Sync>> {
     db::begin_transaction(conn)?;
     let mut edge_count = 0usize;
     let mut events: Vec<Event> = Vec::new();
+    let mut apply_state = DreamApplyState::new(synthesis_policy);
     let result = (|| {
+        let mut call_ctx = DreamCallContext {
+            conn,
+            source_id,
+            events: &mut events,
+            apply_state: &mut apply_state,
+        };
         for call in tool_calls {
-            let (description, added_edge) = apply_dream_call(conn, call, source_id, &mut events)?;
+            let (description, added_edge) = apply_dream_call(&mut call_ctx, call)?;
             if !description.is_empty() {
                 send_log(sender, "dream", description);
             }
@@ -326,7 +360,7 @@ fn apply_dream_tool_calls(
                 edge_count += 1;
             }
         }
-        db::block_on(ledger::record_events_in_tx(conn, &events))
+        db::block_on(ledger::record_events_in_tx(conn, call_ctx.events))
     })();
     if let Err(err) = result {
         if let Err(rollback_err) = db::block_on(async { conn.execute("ROLLBACK", ()).await }) {
@@ -338,11 +372,9 @@ fn apply_dream_tool_calls(
     Ok(edge_count)
 }
 
-fn apply_dream_call(
-    conn: &Connection,
+fn apply_dream_call<'scope, 'policy>(
+    ctx: &mut DreamCallContext<'scope, 'policy>,
     call: ToolCall,
-    source_id: &str,
-    events: &mut Vec<Event>,
 ) -> Result<(String, bool), Box<dyn Error + Send + Sync>> {
     match call {
         ToolCall::UpsertEdge {
@@ -355,7 +387,7 @@ fn apply_dream_call(
             subject,
             date,
         } => apply_dream_upsert_edge(
-            conn,
+            ctx,
             DreamEdgeCall {
                 source,
                 target,
@@ -365,19 +397,36 @@ fn apply_dream_call(
                 subject,
                 date,
             },
-            source_id,
-            events,
         ),
         ToolCall::UpsertNode {
             name,
             node_type,
             body,
             date,
-        } => apply_dream_upsert_node(conn, name, node_type, body, date),
+        } => apply_dream_upsert_node(ctx, DreamNodeCall::new(name, node_type, body, date)),
         ToolCall::DeleteEdge { source, target } => {
-            apply_dream_delete_edge(conn, source, target, source_id, events)
+            apply_dream_delete_edge(ctx, DreamDeleteEdgeCall::new(source, target))
         }
-        ToolCall::DeleteNode { name } => apply_dream_delete_node(conn, name, source_id, events),
+        ToolCall::DeleteNode { name } => apply_dream_delete_node(ctx, name),
+        ToolCall::ExpireEdge {
+            source,
+            target,
+            rewritten_content,
+        } => apply_dream_expire_edge(ctx, DreamExpireEdgeCall::new(source, target, rewritten_content)),
+    }
+}
+
+struct DreamApplyState<'policy> {
+    prunes_used: usize,
+    synthesis_policy: &'policy SynthesisPolicy,
+}
+
+impl<'policy> DreamApplyState<'policy> {
+    fn new(synthesis_policy: &'policy SynthesisPolicy) -> Self {
+        Self {
+            prunes_used: 0,
+            synthesis_policy,
+        }
     }
 }
 
@@ -391,34 +440,93 @@ struct DreamEdgeCall {
     date: String,
 }
 
-fn apply_dream_upsert_edge(
-    conn: &Connection,
+struct DreamNodeCall {
+    name: String,
+    node_type: String,
+    body: String,
+    date: String,
+}
+
+struct DreamDeleteEdgeCall {
+    source: String,
+    target: String,
+}
+
+struct DreamExpireEdgeCall {
+    source: String,
+    target: String,
+    rewritten_content: String,
+}
+
+struct DreamCallContext<'scope, 'policy> {
+    conn: &'scope Connection,
+    source_id: &'scope str,
+    events: &'scope mut Vec<Event>,
+    apply_state: &'scope mut DreamApplyState<'policy>,
+}
+
+impl DreamNodeCall {
+    fn new(name: String, node_type: String, body: String, date: String) -> Self {
+        Self {
+            name,
+            node_type,
+            body,
+            date,
+        }
+    }
+}
+
+impl DreamDeleteEdgeCall {
+    fn new(source: String, target: String) -> Self {
+        Self { source, target }
+    }
+}
+
+impl DreamExpireEdgeCall {
+    fn new(source: String, target: String, rewritten_content: String) -> Self {
+        Self {
+            source,
+            target,
+            rewritten_content,
+        }
+    }
+}
+
+fn apply_dream_upsert_edge<'scope, 'policy>(
+    ctx: &mut DreamCallContext<'scope, 'policy>,
     edge_call: DreamEdgeCall,
-    source_id: &str,
-    events: &mut Vec<Event>,
 ) -> Result<(String, bool), Box<dyn Error + Send + Sync>> {
-    let existing = db::load_edge(
-        conn,
-        &normalize_id(&edge_call.source),
-        &normalize_id(&edge_call.target),
-    )?;
+    let source = normalize_id(&edge_call.source);
+    let target = normalize_id(&edge_call.target);
+    let existing = db::load_edge(ctx.conn, &source, &target)?;
+    let mut stability = DREAM_STABILITY;
+    let mut confidence = edge_call.confidence.min(DREAM_CONFIDENCE_CAP);
+    if let Some(override_values) = ctx
+        .apply_state
+        .synthesis_policy
+        .edge_overrides
+        .get(&(source.clone(), target.clone()))
+    {
+        stability = override_values.stability;
+        confidence = override_values.confidence;
+    }
     let edge = Edge {
-        source: normalize_id(&edge_call.source),
-        target: normalize_id(&edge_call.target),
+        source: source.clone(),
+        target: target.clone(),
         content: edge_call.content,
-        stability: DREAM_STABILITY,
-        confidence: edge_call.confidence.min(DREAM_CONFIDENCE_CAP),
+        stability,
+        confidence,
         importance: edge_call.importance,
         subject: edge_call.subject,
         date: edge_call.date,
         occurred_at: None,
         expired_at: None,
     };
-    db::write_edge(conn, &edge, source_id)?;
-    events.push(Event::upsert(
+    db::write_edge(ctx.conn, &edge, ctx.source_id)?;
+    ctx.events.push(Event::upsert(
         Actor::new("system", "consolidation"),
         EdgeRef::new(&edge.source, &edge.target),
-        EventContext::new(source_id, ""),
+        EventContext::new(ctx.source_id, ""),
         existing.is_some(),
     ));
     Ok((
@@ -427,61 +535,163 @@ fn apply_dream_upsert_edge(
     ))
 }
 
-fn apply_dream_upsert_node(
-    conn: &Connection,
-    name: String,
-    node_type: String,
-    body: String,
-    date: String,
+fn apply_dream_upsert_node<'scope, 'policy>(
+    ctx: &DreamCallContext<'scope, 'policy>,
+    node_call: DreamNodeCall,
 ) -> Result<(String, bool), Box<dyn Error + Send + Sync>> {
-    let normalized = normalize_id(&name);
+    let normalized = normalize_id(&node_call.name);
+    let node_type = resolved_node_type(&normalized, &node_call.node_type, ctx.apply_state);
     let node = Node {
         node_type: node_type.clone(),
-        body,
-        date,
+        body: node_call.body,
+        date: node_call.date,
     };
-    db::write_node(conn, &normalized, &node)?;
-    Ok((format!("upsert_node: {name} ({node_type})"), false))
+    db::write_node(ctx.conn, &normalized, &node)?;
+    Ok((format!("upsert_node: {} ({node_type})", node_call.name), false))
 }
 
-fn apply_dream_delete_edge(
-    conn: &Connection,
-    source: String,
-    target: String,
-    source_id: &str,
-    events: &mut Vec<Event>,
-) -> Result<(String, bool), Box<dyn Error + Send + Sync>> {
-    let normalized_source = normalize_id(&source);
-    let normalized_target = normalize_id(&target);
-    let deleted_edge = db::load_edge(conn, &normalized_source, &normalized_target)?;
-    db::erase_edge(conn, &normalized_source, &normalized_target)?;
-    if let Some(edge) = deleted_edge {
-        let pruned = ledger::pruned_events(
-            Actor::new("system", "consolidation"),
-            EventContext::new(source_id, ""),
-            &[edge],
-        )?;
-        events.extend(pruned);
+fn resolved_node_type<'policy>(
+    node_id: &str,
+    requested: &str,
+    state: &DreamApplyState<'policy>,
+) -> String {
+    if state.synthesis_policy.synthesis_nodes.contains(node_id) {
+        return "synthesis".to_string();
     }
-    Ok((format!("delete_edge: {source} → {target}"), false))
+    requested.to_string()
 }
 
-fn apply_dream_delete_node(
-    conn: &Connection,
-    name: String,
-    source_id: &str,
-    events: &mut Vec<Event>,
+fn apply_dream_delete_edge<'scope, 'policy>(
+    ctx: &mut DreamCallContext<'scope, 'policy>,
+    edge_call: DreamDeleteEdgeCall,
 ) -> Result<(String, bool), Box<dyn Error + Send + Sync>> {
-    let normalized = normalize_id(&name);
-    let deleted_edges = db::load_edges_for_node(conn, &normalized)?;
-    db::erase_node(conn, &normalized)?;
+    let normalized_source = normalize_id(&edge_call.source);
+    let normalized_target = normalize_id(&edge_call.target);
+    let deleted_edge = db::load_edge(ctx.conn, &normalized_source, &normalized_target)?;
+    match deleted_edge {
+        Some(edge) => delete_existing_edge(ctx, edge_call, edge),
+        None => Ok((
+            format!(
+                "delete_edge skipped: {} → {} (not found)",
+                edge_call.source, edge_call.target
+            ),
+            false,
+        )),
+    }
+}
+
+fn delete_existing_edge<'scope, 'policy>(
+    ctx: &mut DreamCallContext<'scope, 'policy>,
+    edge_call: DreamDeleteEdgeCall,
+    edge: Edge,
+) -> Result<(String, bool), Box<dyn Error + Send + Sync>> {
+    if let Some(reason) = prune_block_reason(&edge, ctx.apply_state.prunes_used) {
+        return Ok((
+            format!(
+                "delete_edge skipped: {} → {} ({reason})",
+                edge_call.source, edge_call.target
+            ),
+            false,
+        ));
+    }
+    let source = normalize_id(&edge_call.source);
+    let target = normalize_id(&edge_call.target);
+    db::erase_edge(ctx.conn, &source, &target)?;
+    ctx.apply_state.prunes_used += 1;
     let pruned = ledger::pruned_events(
         Actor::new("system", "consolidation"),
-        EventContext::new(source_id, ""),
+        EventContext::new(ctx.source_id, ""),
+        &[edge],
+    )?;
+    ctx.events.extend(pruned);
+    Ok((
+        format!("delete_edge: {} → {}", edge_call.source, edge_call.target),
+        false,
+    ))
+}
+
+fn apply_dream_delete_node<'scope, 'policy>(
+    ctx: &mut DreamCallContext<'scope, 'policy>,
+    name: String,
+) -> Result<(String, bool), Box<dyn Error + Send + Sync>> {
+    let normalized = normalize_id(&name);
+    let deleted_edges = db::load_edges_for_node(ctx.conn, &normalized)?;
+    if deleted_edges.is_empty() {
+        return Ok((format!("delete_node skipped: {name} (not found)"), false));
+    }
+    if let Some(reason) = delete_node_block_reason(&deleted_edges, ctx.apply_state.prunes_used) {
+        return Ok((format!("delete_node skipped: {name} ({reason})"), false));
+    }
+    db::erase_node(ctx.conn, &normalized)?;
+    ctx.apply_state.prunes_used += deleted_edges.len();
+    let pruned = ledger::pruned_events(
+        Actor::new("system", "consolidation"),
+        EventContext::new(ctx.source_id, ""),
         &deleted_edges,
     )?;
-    events.extend(pruned);
+    ctx.events.extend(pruned);
     Ok((format!("delete_node: {name}"), false))
+}
+
+fn delete_node_block_reason(edges: &[Edge], used_prunes: usize) -> Option<String> {
+    let mut idx = 0usize;
+    while idx < edges.len() {
+        if let Some(reason) = prune_block_reason(&edges[idx], used_prunes + idx) {
+            return Some(reason);
+        }
+        idx += 1;
+    }
+    if used_prunes + edges.len() > MAX_PRUNES_PER_PASS {
+        return Some(format!("prune cap {}", MAX_PRUNES_PER_PASS));
+    }
+    None
+}
+
+fn apply_dream_expire_edge<'scope, 'policy>(
+    ctx: &mut DreamCallContext<'scope, 'policy>,
+    edge_call: DreamExpireEdgeCall,
+) -> Result<(String, bool), Box<dyn Error + Send + Sync>> {
+    let normalized_source = normalize_id(&edge_call.source);
+    let normalized_target = normalize_id(&edge_call.target);
+    let Some(mut edge) = db::load_edge(ctx.conn, &normalized_source, &normalized_target)? else {
+        return Ok((
+            format!(
+                "expire_edge skipped: {} → {} (not found)",
+                edge_call.source, edge_call.target
+            ),
+            false,
+        ));
+    };
+    edge.content = edge_call.rewritten_content;
+    edge.expired_at = Some(crate::timeutil::timestamp_now());
+    db::write_edge(ctx.conn, &edge, ctx.source_id)?;
+    let payload = serde_json::json!({"expired": true}).to_string();
+    ctx.events.push(Event::updated(
+        Actor::new("system", "consolidation"),
+        EdgeRef::new(&edge.source, &edge.target),
+        EventContext::new(ctx.source_id, ""),
+        payload,
+    ));
+    Ok((
+        format!("expire_edge: {} → {}", edge_call.source, edge_call.target),
+        false,
+    ))
+}
+
+fn prune_block_reason(edge: &Edge, prunes_used: usize) -> Option<String> {
+    if prunes_used >= MAX_PRUNES_PER_PASS {
+        return Some(format!("prune cap {}", MAX_PRUNES_PER_PASS));
+    }
+    if edge.importance >= 1.0 {
+        return Some("importance >= 1.0".to_string());
+    }
+    if edge.confidence >= PRUNE_GUARD_THRESHOLD {
+        return Some(format!("confidence >= {}", PRUNE_GUARD_THRESHOLD));
+    }
+    if edge.stability >= PRUNE_GUARD_THRESHOLD {
+        return Some(format!("stability >= {}", PRUNE_GUARD_THRESHOLD));
+    }
+    None
 }
 
 fn format_proposals(agents: &[(&str, &str)]) -> String {
