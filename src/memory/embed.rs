@@ -26,6 +26,8 @@ pub struct SemanticEdge {
     pub importance: f64,
     pub subject: bool,
     pub date: String,
+    pub occurred_at: Option<String>,
+    pub expired_at: Option<String>,
 }
 
 pub fn embedding_string(source: &str, content: &str, target: &str) -> String {
@@ -113,6 +115,8 @@ pub fn edges_to_toon(edges: &[SemanticEdge]) -> String {
             "importance": edge.importance,
             "subject": edge.subject,
             "date": edge.date,
+            "occurred_at": edge.occurred_at,
+            "expired_at": edge.expired_at,
         }));
     }
     toon::encode(&json!({"nodes": [], "edges": edges_json}), None)
@@ -166,7 +170,7 @@ fn choose_exploration_anchors(
     if candidates.len() <= TOP_K {
         return candidates;
     }
-    let views = db::load_all_agent_views(agent_name);
+    let views = db::load_edge_actor_views("agent", agent_name);
     rank_by_exploration(candidates, &views)
 }
 
@@ -185,23 +189,42 @@ fn anchor_edges(embed: &dyn EmbeddingClient, query: &str) -> Option<Vec<Semantic
     Some(rows_to_semantic_edges(rows))
 }
 
-fn novelty_score(source: &str, target: &str, views: &HashMap<String, i64>) -> f64 {
-    let source_views = *views.get(source).unwrap_or(&0) as f64;
-    let target_views = *views.get(target).unwrap_or(&0) as f64;
-    1.0 / (1.0 + (source_views + target_views) / 2.0)
+// Blend per-edge novelty with endpoint exposure so an unseen edge on an
+// already-exhausted hub does not score maximum novelty.
+fn novelty_score(
+    edge: &SemanticEdge,
+    views: &HashMap<(String, String), f64>,
+    node_totals: &HashMap<String, f64>,
+) -> f64 {
+    let key = (edge.source.clone(), edge.target.clone());
+    let edge_views = *views.get(&key).unwrap_or(&0.0);
+    let source_views = *node_totals.get(&edge.source).unwrap_or(&0.0);
+    let target_views = *node_totals.get(&edge.target).unwrap_or(&0.0);
+    let endpoint_views = (source_views + target_views) / 2.0;
+    0.5 / (1.0 + edge_views) + 0.5 / (1.0 + endpoint_views)
+}
+
+fn node_view_totals(views: &HashMap<(String, String), f64>) -> HashMap<String, f64> {
+    let mut totals: HashMap<String, f64> = HashMap::new();
+    for ((source, target), count) in views {
+        *totals.entry(source.clone()).or_insert(0.0) += *count;
+        *totals.entry(target.clone()).or_insert(0.0) += *count;
+    }
+    totals
 }
 
 fn rank_by_exploration(
     candidates: Vec<SemanticEdge>,
-    views: &HashMap<String, i64>,
+    views: &HashMap<(String, String), f64>,
 ) -> Vec<SemanticEdge> {
+    let node_totals = node_view_totals(views);
     let mut scored = Vec::new();
     let total = EXPLORATION_CANDIDATES as f64;
     let mut rank = 0usize;
     while rank < candidates.len() {
         let edge = candidates[rank].clone();
         let semantic_pos = EXPLORATION_CANDIDATES.saturating_sub(rank) as f64 / total;
-        let novelty = novelty_score(&edge.source, &edge.target, views);
+        let novelty = novelty_score(&edge, views, &node_totals);
         let score = (1.0 - NOVELTY_WEIGHT) * semantic_pos + NOVELTY_WEIGHT * novelty;
         scored.push(ScoredEdge { score, edge });
         rank += 1;
@@ -321,7 +344,19 @@ struct ScoredEdge {
 
 fn rows_to_semantic_edges(rows: Vec<db::SemanticEdgeRow>) -> Vec<SemanticEdge> {
     let mut edges = Vec::new();
-    for (source, target, content, confidence, stability, importance, subject, date) in rows {
+    for (
+        source,
+        target,
+        content,
+        confidence,
+        stability,
+        importance,
+        subject,
+        date,
+        occurred_at,
+        expired_at,
+    ) in rows
+    {
         edges.push(SemanticEdge {
             source,
             target,
@@ -331,6 +366,8 @@ fn rows_to_semantic_edges(rows: Vec<db::SemanticEdgeRow>) -> Vec<SemanticEdge> {
             importance,
             subject,
             date,
+            occurred_at,
+            expired_at,
         });
     }
     edges

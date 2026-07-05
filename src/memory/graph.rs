@@ -1,15 +1,17 @@
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 const TOON_PATH: &str = "kratt-data/kratt-graph.toon";
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Node {
     pub node_type: String,
     pub body: String,
     pub date: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Edge {
     pub source: String,
     pub target: String,
@@ -19,6 +21,8 @@ pub struct Edge {
     pub importance: f64,
     pub date: String,
     pub subject: bool,
+    pub occurred_at: Option<String>,
+    pub expired_at: Option<String>,
 }
 
 #[derive(Clone)]
@@ -105,6 +109,8 @@ fn parse_toon_edge(fields: &[String]) -> Option<Edge> {
         stability: fields[col + 1].parse().unwrap_or(0.0),
         subject: fields[col + 2] == "true",
         target: normalize_id(&fields[col + 3]),
+        occurred_at: None,
+        expired_at: None,
     })
 }
 
@@ -192,6 +198,8 @@ pub fn graph_to_json(graph: &Graph) -> serde_json::Value {
             "confidence": round2(edge.confidence),
             "content": edge.content,
             "date": edge.date,
+            "expired_at": edge.expired_at,
+            "occurred_at": edge.occurred_at,
             "importance": round2(edge.importance),
             "source": edge.source,
             "stability": round2(edge.stability),

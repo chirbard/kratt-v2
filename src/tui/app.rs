@@ -181,6 +181,10 @@ pub(crate) fn drain_memory(app: &mut App) {
                 app.embed_rx = Some(embed_rx);
                 return;
             }
+            Ok(MemoryEvent::MaintenanceDone) => {
+                app.memory_state = MemoryState::Idle;
+                return;
+            }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 app.memory_rx = Some(memory_receiver);
                 return;
@@ -203,7 +207,9 @@ pub(crate) fn drain_embed(app: &mut App) {
             Ok(MemoryEvent::Log { phase, text }) => {
                 app.memory_log.push((phase.to_string(), text));
             }
-            Ok(MemoryEvent::Append { .. }) | Ok(MemoryEvent::Done) => {}
+            Ok(MemoryEvent::Append { .. })
+            | Ok(MemoryEvent::Done)
+            | Ok(MemoryEvent::MaintenanceDone) => {}
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 app.embed_rx = Some(embed_receiver);
                 return;
@@ -276,6 +282,36 @@ pub(crate) fn start_dream(app: &mut App) {
     });
     app.dream_rx = Some(receiver);
     app.dream_state = DreamState::Running;
+}
+
+pub(crate) fn start_recompute_positions(app: &mut App) {
+    app.memory_log.clear();
+    let (sender, receiver) = std::sync::mpsc::channel::<MemoryEvent>();
+    let _ = sender.send(MemoryEvent::Log {
+        phase: "memory",
+        text: "recomputing positions…".to_string(),
+    });
+    std::thread::spawn(move || {
+        match memory::recompute_positions() {
+            Ok(logs) => {
+                for log in logs {
+                    let _ = sender.send(MemoryEvent::Log {
+                        phase: "memory",
+                        text: log,
+                    });
+                }
+            }
+            Err(err) => {
+                let _ = sender.send(MemoryEvent::Log {
+                    phase: "memory",
+                    text: format!("error: {err}"),
+                });
+            }
+        }
+        let _ = sender.send(MemoryEvent::MaintenanceDone);
+    });
+    app.memory_rx = Some(receiver);
+    app.memory_state = MemoryState::Updating;
 }
 
 pub(crate) fn last_assistant_content(app: &App) -> String {

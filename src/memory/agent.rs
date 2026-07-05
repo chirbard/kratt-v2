@@ -8,11 +8,13 @@ use turso::Connection;
 use super::db;
 use super::decay;
 use super::graph::{Edge, Node, graph_to_json, normalize_id};
+use super::ledger::{self, Actor, EdgeRef, Event, EventContext};
 
 pub enum MemoryEvent {
     Log { phase: &'static str, text: String },
     Append { phase: &'static str, text: String },
     Done,
+    MaintenanceDone,
 }
 
 struct AgentRun<'run> {
@@ -337,9 +339,17 @@ fn apply_tool_calls<'agent_run>(
     tool_calls: Vec<ToolCall>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     db::begin_transaction(conn)?;
-    for call in tool_calls {
-        let description = apply_tool(call, conn, agent_run.user_message_id)?;
-        agent_run.send_log(phase, description);
+    let mut events: Vec<Event> = Vec::new();
+    let result = (|| {
+        for call in tool_calls {
+            let description = apply_tool(call, conn, agent_run.user_message_id, phase, &mut events)?;
+            agent_run.send_log(phase, description);
+        }
+        db::block_on(ledger::record_events_in_tx(conn, &events))
+    })();
+    if let Err(err) = result {
+        let _ = db::block_on(async { conn.execute("ROLLBACK", ()).await });
+        return Err(err);
     }
     db::commit_transaction(conn)?;
     Ok(())
@@ -349,6 +359,8 @@ fn apply_tool(
     call: ToolCall,
     conn: &Connection,
     source_message_id: &str,
+    phase: &str,
+    events: &mut Vec<Event>,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
     match call {
         ToolCall::UpsertNode {
@@ -376,11 +388,17 @@ fn apply_tool(
                 importance,
                 subject,
                 date,
+                occurred_at: None,
+                expired_at: None,
             };
-            apply_upsert_edge(conn, source, target, edge, source_message_id)
+            apply_upsert_edge(conn, edge, source_message_id, phase, events)
         }
-        ToolCall::DeleteNode { name } => apply_delete_node(conn, name),
-        ToolCall::DeleteEdge { source, target } => apply_delete_edge(conn, source, target),
+        ToolCall::DeleteNode { name } => {
+            apply_delete_node(conn, name, source_message_id, phase, events)
+        }
+        ToolCall::DeleteEdge { source, target } => {
+            apply_delete_edge(conn, EdgeRef::new(&source, &target), source_message_id, phase, events)
+        }
     }
 }
 
@@ -403,31 +421,67 @@ fn apply_upsert_node(
 
 fn apply_upsert_edge(
     conn: &Connection,
-    source: String,
-    target: String,
     edge: Edge,
     source_message_id: &str,
+    phase: &str,
+    events: &mut Vec<Event>,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let existing = db::load_edge(conn, &edge.source, &edge.target)?;
     db::write_edge(conn, &edge, source_message_id)?;
-    Ok(format!("upsert_edge: {source} → {target}"))
+    events.push(Event::upsert(
+        Actor::new("system", phase),
+        EdgeRef::new(&edge.source, &edge.target),
+        mutation_context(source_message_id),
+        existing.is_some(),
+    ));
+    Ok(format!("upsert_edge: {} → {}", edge.source, edge.target))
 }
 
 fn apply_delete_node(
     conn: &Connection,
     name: String,
+    source_message_id: &str,
+    phase: &str,
+    events: &mut Vec<Event>,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
     let normalized = normalize_id(&name);
+    let deleted_edges = db::load_edges_for_node(conn, &normalized)?;
     db::erase_node(conn, &normalized)?;
+    let pruned = ledger::pruned_events(
+        Actor::new("system", phase),
+        mutation_context(source_message_id),
+        &deleted_edges,
+    )?;
+    events.extend(pruned);
     Ok(format!("delete_node: {name}"))
 }
 
 fn apply_delete_edge(
     conn: &Connection,
-    source: String,
-    target: String,
+    edge_ref: EdgeRef,
+    source_message_id: &str,
+    phase: &str,
+    events: &mut Vec<Event>,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
-    let normalized_source = normalize_id(&source);
-    let normalized_target = normalize_id(&target);
+    let normalized_source = normalize_id(&edge_ref.source);
+    let normalized_target = normalize_id(&edge_ref.target);
+    let deleted_edge = db::load_edge(conn, &normalized_source, &normalized_target)?;
     db::erase_edge(conn, &normalized_source, &normalized_target)?;
-    Ok(format!("delete_edge: {source} → {target}"))
+    if let Some(edge) = deleted_edge {
+        let pruned = ledger::pruned_events(
+            Actor::new("system", phase),
+            mutation_context(source_message_id),
+            &[edge],
+        )?;
+        events.extend(pruned);
+    }
+    Ok(format!(
+        "delete_edge: {} → {}",
+        edge_ref.source, edge_ref.target
+    ))
+}
+
+fn mutation_context(source_message_id: &str) -> EventContext {
+    let session_id = db::source_session_id(source_message_id).unwrap_or_default();
+    EventContext::new(session_id.as_str(), source_message_id)
 }

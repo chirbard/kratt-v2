@@ -38,6 +38,13 @@ fn handle_normal_key(key: KeyEvent, app: &mut App) -> bool {
         KeyCode::Char('R') => app.show_reasoning = !app.show_reasoning,
         KeyCode::Char('d') => app.show_debug = !app.show_debug,
         KeyCode::Char('t') => app.show_tools = !app.show_tools,
+        KeyCode::Char('P')
+            if app.state == State::Idle
+                && app.memory_state == MemoryState::Idle
+                && app.dream_state != DreamState::Running =>
+        {
+            app::start_recompute_positions(app);
+        }
         KeyCode::Char('D')
             if app.state == State::Idle
                 && app.memory_state == MemoryState::Idle

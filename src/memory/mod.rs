@@ -2,9 +2,13 @@ mod agent;
 mod db;
 mod decay;
 mod dream;
+mod ledger;
 mod embed;
 mod graph;
 
+pub use ledger::{
+    Actor, EdgeRef, Event, EventContext, record_events, recompute_positions,
+};
 pub use agent::{MemoryEvent, run_memory_agent};
 pub use db::{
     db_init, insert_message, read_message_context, register_session, search_messages_fts,

@@ -17,6 +17,7 @@ pub(crate) struct StreamJob {
     pub(crate) search: Option<Arc<dyn SearchClient>>,
     pub(crate) prompt: String,
     pub(crate) session_path: std::path::PathBuf,
+    pub(crate) turn_id: String,
     pub(crate) sender: std::sync::mpsc::Sender<Chunk>,
 }
 
@@ -53,6 +54,7 @@ pub(crate) fn start_stream(app: &mut App) {
         search: clone_search_client(app),
         prompt,
         session_path: app.session_path.clone(),
+        turn_id: app.last_user_message_id.clone(),
         sender,
     };
     std::thread::spawn(move || run_stream_worker(job));
@@ -66,16 +68,13 @@ fn clone_search_client(app: &App) -> Option<Arc<dyn SearchClient>> {
 }
 
 fn run_stream_worker(job: StreamJob) {
-    let recent_entries = session::load_recent_entries(&job.session_path, super::app::RECENT_TURNS);
-    let memory_block = build_memory_block(&*job.embed, &job.prompt);
-    let system = prompts::build_chat_system_prompt(&memory_block, &recent_entries);
-    let system_opt = if system.is_empty() {
-        None
-    } else {
-        Some(system)
+    let (mut messages, tools) = match prepare_stream_context(&job) {
+        Ok(result) => result,
+        Err(err) => {
+            let _ = job.sender.send(Chunk::Err(err.to_string()));
+            return;
+        }
     };
-    let mut messages = build_initial_messages(&job.prompt, system_opt.as_deref());
-    let tools = build_tools(job.search.is_some());
     let mut stats_agg = StatsAgg {
         tokens_in: 0,
         tokens_out: 0,
@@ -101,11 +100,44 @@ fn run_stream_worker(job: StreamJob) {
     }
 }
 
-fn build_memory_block(embed: &dyn EmbeddingClient, query: &str) -> String {
+fn prepare_stream_context(
+    job: &StreamJob,
+) -> Result<(Vec<Value>, Value), Box<dyn std::error::Error + Send + Sync>> {
+    let recent_entries = session::load_recent_entries(&job.session_path, super::app::RECENT_TURNS);
+    let session_id = session::session_id_from_path(&job.session_path);
+    let memory_block = build_memory_block(&*job.embed, &job.prompt, &session_id, &job.turn_id);
+    let system = prompts::build_chat_system_prompt(&memory_block, &recent_entries);
+    let system_opt = if system.is_empty() {
+        None
+    } else {
+        Some(system)
+    };
+    Ok((
+        build_initial_messages(&job.prompt, system_opt.as_deref()),
+        build_tools(job.search.is_some()),
+    ))
+}
+
+fn build_memory_block(
+    embed: &dyn EmbeddingClient,
+    query: &str,
+    session_id: &str,
+    turn_id: &str,
+) -> String {
     let edges = memory::select_semantic_edges(embed, query);
     if edges.is_empty() {
         return String::new();
     }
+    let mut events = Vec::new();
+    for edge in &edges {
+        events.push(memory::Event::injected(
+            memory::Actor::new("user", "local"),
+            memory::EdgeRef::new(&edge.source, &edge.target),
+            memory::EventContext::new(session_id, turn_id),
+        ));
+    }
+    // Best-effort bookkeeping: a failed ledger write must never abort the turn.
+    let _ = memory::record_events(&events);
     memory::edges_to_toon(&edges)
 }
 

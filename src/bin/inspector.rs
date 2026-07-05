@@ -7,7 +7,17 @@ use turso::{Builder, Connection, Database, Value};
 const DB_PATH: &str = "kratt-data/kratt.db";
 const ADDR: &str = "127.0.0.1:7070";
 const PAGE_SIZE: usize = 100;
-const TABLES: &[&str] = &["nodes", "edges", "sessions", "messages", "meta"];
+const TABLES: &[&str] = &[
+    "nodes",
+    "edges",
+    "events",
+    "edge_actor_views",
+    "actor_positions",
+    "actor_position_history",
+    "sessions",
+    "messages",
+    "meta",
+];
 
 #[allow(clippy::expect_used)]
 fn main() {

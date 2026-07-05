@@ -14,6 +14,7 @@ mod api;
 mod memory;
 mod prompts;
 mod session;
+mod timeutil;
 mod tui;
 mod web;
 

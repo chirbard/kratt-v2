@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
+use std::future::Future;
 use std::sync::OnceLock;
 
 use tokio::runtime::Runtime;
@@ -9,13 +10,31 @@ use super::graph::{Edge, Graph, Node, load_from_toon, normalize_id};
 
 const DATA_DIR: &str = "kratt-data";
 const DB_PATH: &str = "kratt-data/kratt.db";
-pub type SemanticEdgeRow = (String, String, String, f64, f64, f64, bool, String);
+pub type SemanticEdgeRow = (
+    String,
+    String,
+    String,
+    f64,
+    f64,
+    f64,
+    bool,
+    String,
+    Option<String>,
+    Option<String>,
+);
 
 #[allow(clippy::expect_used)]
 fn runtime() -> &'static Runtime {
     static RUNTIME: OnceLock<Runtime> = OnceLock::new();
     // OnceLock::get_or_init requires FnOnce() -> T — no way to propagate errors
     RUNTIME.get_or_init(|| Runtime::new().expect("tokio runtime"))
+}
+
+pub(crate) fn block_on<F>(future: F) -> F::Output
+where
+    F: Future,
+{
+    runtime().block_on(future)
 }
 
 #[allow(clippy::expect_used)]
@@ -44,9 +63,9 @@ pub fn open_connection() -> Result<Connection, Box<dyn Error + Send + Sync>> {
 async fn init_schema(conn: &Connection) -> Result<(), Box<dyn Error + Send + Sync>> {
     create_base_tables(conn).await?;
     create_history_tables(conn).await?;
-    add_edge_provenance_column(conn).await;
-    add_edge_embedding_column(conn).await;
-    add_node_agent_views_table(conn).await;
+    add_edge_columns(conn).await;
+    add_ledger_tables(conn).await;
+    drop_node_agent_views_table(conn).await;
     Ok(())
 }
 
@@ -56,7 +75,7 @@ async fn create_base_tables(conn: &Connection) -> Result<(), Box<dyn Error + Sen
         (),
     ).await?;
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', PRIMARY KEY (source, target))",
+        "CREATE TABLE IF NOT EXISTS edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, PRIMARY KEY (source, target))",
         (),
     ).await?;
     conn.execute(
@@ -64,12 +83,6 @@ async fn create_base_tables(conn: &Connection) -> Result<(), Box<dyn Error + Sen
         (),
     )
     .await?;
-    let _ = conn
-        .execute(
-            "ALTER TABLE nodes ADD COLUMN views INTEGER NOT NULL DEFAULT 0",
-            (),
-        )
-        .await;
     Ok(())
 }
 
@@ -115,13 +128,63 @@ async fn add_edge_embedding_column(conn: &Connection) {
         .await;
 }
 
-async fn add_node_agent_views_table(conn: &Connection) {
+async fn add_edge_columns(conn: &Connection) {
+    add_edge_provenance_column(conn).await;
+    add_edge_embedding_column(conn).await;
+    add_edge_time_columns(conn).await;
+}
+
+async fn add_ledger_tables(conn: &Connection) {
+    add_events_table(conn).await;
+    add_edge_actor_views_table(conn).await;
+    add_actor_positions_table(conn).await;
+    add_actor_position_history_table(conn).await;
+}
+
+async fn add_edge_time_columns(conn: &Connection) {
     let _ = conn
-        .execute(
-            "CREATE TABLE IF NOT EXISTS node_agent_views (node_id TEXT NOT NULL, agent_name TEXT NOT NULL, views INTEGER NOT NULL DEFAULT 0, last_visited_at TEXT NOT NULL DEFAULT '', PRIMARY KEY (node_id, agent_name))",
-            (),
-        )
+        .execute("ALTER TABLE edges ADD COLUMN occurred_at TEXT", ())
         .await;
+    let _ = conn
+        .execute("ALTER TABLE edges ADD COLUMN expired_at TEXT", ())
+        .await;
+}
+
+async fn add_events_table(conn: &Connection) {
+    let _ = conn.execute("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL, actor_id TEXT NOT NULL, event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')", ()).await;
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS events_actor_idx ON events (actor_type, actor_id, id)", ()).await;
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS events_turn_idx ON events (turn_id)", ()).await;
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS events_session_idx ON events (session_id)", ()).await;
+}
+
+async fn add_edge_actor_views_table(conn: &Connection) {
+    let _ = conn.execute("CREATE TABLE IF NOT EXISTS edge_actor_views (actor_type TEXT NOT NULL, actor_id TEXT NOT NULL, source TEXT NOT NULL, target TEXT NOT NULL, views REAL NOT NULL DEFAULT 0, last_visited_at TEXT NOT NULL, PRIMARY KEY (actor_type, actor_id, source, target))", ()).await;
+}
+
+async fn add_actor_positions_table(conn: &Connection) {
+    let _ = conn.execute("CREATE TABLE IF NOT EXISTS actor_positions (actor_type TEXT NOT NULL, actor_id TEXT NOT NULL, sum_vector BLOB, total_weight REAL NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY (actor_type, actor_id))", ()).await;
+}
+
+async fn add_actor_position_history_table(conn: &Connection) {
+    let _ = conn.execute("CREATE TABLE IF NOT EXISTS actor_position_history (actor_type TEXT NOT NULL, actor_id TEXT NOT NULL, embedding BLOB, recorded_at TEXT NOT NULL)", ()).await;
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS actor_position_history_idx ON actor_position_history (actor_type, actor_id, recorded_at)", ()).await;
+}
+
+async fn drop_node_agent_views_table(conn: &Connection) {
+    let _ = conn.execute("DROP TABLE IF EXISTS node_agent_views", ()).await;
+}
+
+pub fn vector32_json(vector: &[f64]) -> Result<String, Box<dyn Error + Send + Sync>> {
+    Ok(serde_json::to_string(vector)?)
+}
+
+pub fn parse_vector32_json(json_text: &str) -> Result<Vec<f64>, Box<dyn Error + Send + Sync>> {
+    let values = serde_json::from_str::<Vec<f64>>(json_text)?;
+    Ok(values)
+}
+
+pub fn timestamp_now() -> String {
+    crate::timeutil::timestamp_now()
 }
 
 pub fn db_init() -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -189,10 +252,13 @@ async fn load_nodes(conn: &Connection, graph: &mut Graph) {
 }
 
 async fn load_edges(conn: &Connection, graph: &mut Graph) {
-    let Ok(mut rows) = conn.query(
-        "SELECT source, target, content, stability, confidence, importance, subject, date FROM edges",
-        (),
-    ).await else {
+    let Ok(mut rows) = conn
+        .query(
+            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at FROM edges",
+            (),
+        )
+        .await
+    else {
         return;
     };
     while let Ok(Some(row)) = rows.next().await {
@@ -217,6 +283,8 @@ async fn load_edges(conn: &Connection, graph: &mut Graph) {
             importance: real(imp),
             subject: int(subj) != 0,
             date: text(date),
+            occurred_at: optional_text(row.get_value(8).ok()),
+            expired_at: optional_text(row.get_value(9).ok()),
         });
     }
 }
@@ -267,7 +335,7 @@ pub fn write_edge(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     runtime().block_on(async {
         conn.execute(
-            "INSERT OR REPLACE INTO edges (source, target, content, stability, confidence, importance, subject, date, source_message_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT OR REPLACE INTO edges (source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, source_message_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 edge.source.as_str(),
                 edge.target.as_str(),
@@ -277,6 +345,8 @@ pub fn write_edge(
                 edge.importance,
                 edge.subject as i64,
                 edge.date.as_str(),
+                edge.occurred_at.as_deref(),
+                edge.expired_at.as_deref(),
                 source_message_id,
             ],
         )
@@ -291,6 +361,11 @@ pub fn erase_node(conn: &Connection, node_id: &str) -> Result<(), Box<dyn Error 
             .await?;
         conn.execute(
             "DELETE FROM edges WHERE source = ?1 OR target = ?1",
+            params![node_id],
+        )
+        .await?;
+        conn.execute(
+            "DELETE FROM edge_actor_views WHERE source = ?1 OR target = ?1",
             params![node_id],
         )
         .await?;
@@ -309,8 +384,60 @@ pub fn erase_edge(
             params![source, target],
         )
         .await?;
+        delete_edge_actor_views_async(conn, source, target).await?;
         Ok(())
     })
+}
+
+pub fn load_edge(
+    conn: &Connection,
+    source: &str,
+    target: &str,
+) -> Result<Option<Edge>, Box<dyn Error + Send + Sync>> {
+    runtime().block_on(load_edge_async(conn, source, target))
+}
+
+pub fn load_edges_for_node(
+    conn: &Connection,
+    node_id: &str,
+) -> Result<Vec<Edge>, Box<dyn Error + Send + Sync>> {
+    runtime().block_on(load_edges_for_node_async(conn, node_id))
+}
+
+async fn load_edge_async(
+    conn: &Connection,
+    source: &str,
+    target: &str,
+) -> Result<Option<Edge>, Box<dyn Error + Send + Sync>> {
+    let mut rows = conn
+        .query(
+            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at FROM edges WHERE source = ?1 AND target = ?2 LIMIT 1",
+            params![source, target],
+        )
+        .await?;
+    if let Some(row) = rows.next().await? {
+        return Ok(parse_edge_row(&row));
+    }
+    Ok(None)
+}
+
+async fn load_edges_for_node_async(
+    conn: &Connection,
+    node_id: &str,
+) -> Result<Vec<Edge>, Box<dyn Error + Send + Sync>> {
+    let mut rows = conn
+        .query(
+            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at FROM edges WHERE source = ?1 OR target = ?1",
+            params![node_id],
+        )
+        .await?;
+    let mut edges = Vec::new();
+    while let Some(row) = rows.next().await? {
+        if let Some(edge) = parse_edge_row(&row) {
+            edges.push(edge);
+        }
+    }
+    Ok(edges)
 }
 
 pub fn load_unembedded_edges() -> Vec<(String, String, String)> {
@@ -323,7 +450,7 @@ pub fn load_unembedded_edges() -> Vec<(String, String, String)> {
 async fn load_unembedded_edges_async(conn: &Connection) -> Vec<(String, String, String)> {
     let Ok(mut rows) = conn
         .query(
-            "SELECT source, target, content FROM edges WHERE embedding IS NULL",
+            "SELECT source, target, content FROM edges WHERE expired_at IS NULL AND embedding IS NULL",
             (),
         )
         .await
@@ -352,7 +479,7 @@ pub fn save_edge_embedding(
     target: &str,
     vector: &[f64],
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let json_str = serde_json::to_string(vector)?;
+    let json_str = vector32_json(vector)?;
     let conn = open_connection()?;
     runtime().block_on(async {
         conn.execute(
@@ -368,7 +495,7 @@ pub fn query_edges_by_vector(
     vector: &[f64],
     limit: usize,
 ) -> Result<Vec<SemanticEdgeRow>, Box<dyn Error + Send + Sync>> {
-    let json_str = serde_json::to_string(vector)?;
+    let json_str = vector32_json(vector)?;
     let conn = open_connection()?;
     runtime().block_on(query_edges_by_vector_async(&conn, &json_str, limit))
 }
@@ -392,7 +519,7 @@ async fn query_edges_ann(
 ) -> Result<Vec<SemanticEdgeRow>, Box<dyn Error + Send + Sync>> {
     execute_semantic_query(
         conn,
-        "SELECT e.source, e.target, e.content, e.confidence, e.stability, e.importance, e.subject, e.date FROM vector_top_k('edges_vec', vector32(?1), ?2) AS vt JOIN edges AS e ON e.rowid = vt.id",
+        "SELECT e.source, e.target, e.content, e.stability, e.confidence, e.importance, e.subject, e.date, e.occurred_at, e.expired_at FROM vector_top_k('edges_vec', vector32(?1), ?2) AS vt JOIN edges AS e ON e.rowid = vt.id WHERE e.expired_at IS NULL",
         json_str,
         limit,
     )
@@ -406,7 +533,7 @@ async fn query_edges_scan(
 ) -> Result<Vec<SemanticEdgeRow>, Box<dyn Error + Send + Sync>> {
     execute_semantic_query(
         conn,
-        "SELECT source, target, content, confidence, stability, importance, subject, date FROM edges WHERE embedding IS NOT NULL ORDER BY vector_distance_cos(embedding, vector32(?1)) LIMIT ?2",
+        "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at FROM edges WHERE embedding IS NOT NULL AND expired_at IS NULL ORDER BY vector_distance_cos(embedding, vector32(?1)) LIMIT ?2",
         json_str,
         limit,
     )
@@ -431,16 +558,18 @@ async fn execute_semantic_query(
 }
 
 fn parse_semantic_edge_row(row: &turso::Row) -> Option<SemanticEdgeRow> {
-    let source = text(row.get_value(0).ok()?);
-    let target = text(row.get_value(1).ok()?);
-    let content = text(row.get_value(2).ok()?);
-    let confidence = real(row.get_value(3).ok()?);
-    let stability = real(row.get_value(4).ok()?);
-    let importance = real(row.get_value(5).ok()?);
-    let subject = int(row.get_value(6).ok()?) != 0;
-    let date = text(row.get_value(7).ok()?);
+    let edge = parse_edge_row(row)?;
     Some((
-        source, target, content, confidence, stability, importance, subject, date,
+        edge.source,
+        edge.target,
+        edge.content,
+        edge.confidence,
+        edge.stability,
+        edge.importance,
+        edge.subject,
+        edge.date,
+        edge.occurred_at,
+        edge.expired_at,
     ))
 }
 
@@ -454,7 +583,7 @@ pub fn load_all_edges_semantic() -> Vec<SemanticEdgeRow> {
 async fn load_all_edges_semantic_async(conn: &Connection) -> Vec<SemanticEdgeRow> {
     let Ok(mut rows) = conn
         .query(
-            "SELECT source, target, content, confidence, stability, importance, subject, date FROM edges",
+            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at FROM edges WHERE expired_at IS NULL",
             (),
         )
         .await
@@ -471,18 +600,25 @@ async fn load_all_edges_semantic_async(conn: &Connection) -> Vec<SemanticEdgeRow
     edges
 }
 
-pub fn load_all_agent_views(agent_name: &str) -> HashMap<String, i64> {
+pub fn load_edge_actor_views(
+    actor_type: &str,
+    actor_id: &str,
+) -> HashMap<(String, String), f64> {
     let Ok(conn) = open_connection() else {
         return HashMap::new();
     };
-    runtime().block_on(load_all_agent_views_async(&conn, agent_name))
+    runtime().block_on(load_edge_actor_views_async(&conn, actor_type, actor_id))
 }
 
-async fn load_all_agent_views_async(conn: &Connection, agent_name: &str) -> HashMap<String, i64> {
+async fn load_edge_actor_views_async(
+    conn: &Connection,
+    actor_type: &str,
+    actor_id: &str,
+) -> HashMap<(String, String), f64> {
     let Ok(mut rows) = conn
         .query(
-            "SELECT node_id, views FROM node_agent_views WHERE agent_name = ?1",
-            params![agent_name],
+            "SELECT source, target, views FROM edge_actor_views WHERE actor_type = ?1 AND actor_id = ?2",
+            params![actor_type, actor_id],
         )
         .await
     else {
@@ -490,51 +626,29 @@ async fn load_all_agent_views_async(conn: &Connection, agent_name: &str) -> Hash
     };
     let mut views = HashMap::new();
     while let Ok(Some(row)) = rows.next().await {
-        let Some((node_id, count)) = parse_agent_view_row(&row) else {
+        let Some((source, target, count)) = parse_edge_actor_view_row(&row) else {
             continue;
         };
-        views.insert(node_id, count);
+        views.insert((source, target), count);
     }
     views
 }
 
-fn parse_agent_view_row(row: &turso::Row) -> Option<(String, i64)> {
-    let node_id = text(row.get_value(0).ok()?);
-    let count = int(row.get_value(1).ok()?);
-    Some((node_id, count))
+fn parse_edge_actor_view_row(row: &turso::Row) -> Option<(String, String, f64)> {
+    let source = text(row.get_value(0).ok()?);
+    let target = text(row.get_value(1).ok()?);
+    let count = real(row.get_value(2).ok()?);
+    Some((source, target, count))
 }
 
-pub fn record_agent_views(agent_name: &str, node_ids: &[String], date: &str) {
-    let Ok(conn) = open_connection() else { return };
-    let _ = runtime().block_on(record_agent_views_async(&conn, agent_name, node_ids, date));
-}
-
-async fn record_agent_views_async(
+async fn delete_edge_actor_views_async(
     conn: &Connection,
-    agent_name: &str,
-    node_ids: &[String],
-    date: &str,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    for node_id in node_ids {
-        increment_agent_view(conn, agent_name, node_id, date).await?;
-    }
-    Ok(())
-}
-
-async fn increment_agent_view(
-    conn: &Connection,
-    agent_name: &str,
-    node_id: &str,
-    date: &str,
+    source: &str,
+    target: &str,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     conn.execute(
-        "INSERT INTO node_agent_views (node_id, agent_name, views, last_visited_at) VALUES (?1, ?2, 1, ?3) ON CONFLICT(node_id, agent_name) DO UPDATE SET views = views + 1, last_visited_at = ?3",
-        params![node_id, agent_name, date],
-    )
-    .await?;
-    conn.execute(
-        "UPDATE nodes SET views = views + 1 WHERE id = ?1",
-        params![node_id],
+        "DELETE FROM edge_actor_views WHERE source = ?1 AND target = ?2",
+        params![source, target],
     )
     .await?;
     Ok(())
@@ -545,7 +659,9 @@ pub fn edge_count() -> usize {
         return 0;
     };
     let result = runtime().block_on(async {
-        let mut rows = conn.query("SELECT COUNT(*) FROM edges", ()).await?;
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM edges WHERE expired_at IS NULL", ())
+            .await?;
         if let Some(row) = rows.next().await?
             && let Value::Integer(count) = row.get_value(0)?
         {
@@ -593,7 +709,7 @@ async fn insert_graph_edge(
     edge: &Edge,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     conn.execute(
-        "INSERT INTO edges (source, target, content, stability, confidence, importance, subject, date, source_message_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO edges (source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, source_message_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             edge.source.as_str(),
             edge.target.as_str(),
@@ -603,6 +719,8 @@ async fn insert_graph_edge(
             edge.importance,
             edge.subject as i64,
             edge.date.as_str(),
+            edge.occurred_at.as_deref(),
+            edge.expired_at.as_deref(),
             "",
         ],
     )
@@ -750,7 +868,7 @@ async fn lookup_source_message_id(
     String::new()
 }
 
-fn source_session_id(source_message_id: &str) -> Option<String> {
+pub fn source_session_id(source_message_id: &str) -> Option<String> {
     match source_message_id.split_once(':') {
         Some((session_id, _)) if !session_id.is_empty() => Some(session_id.to_string()),
         _ => None,
@@ -912,14 +1030,37 @@ fn edge_diff_lines(pre: &Graph, post: &Graph, lines: &mut Vec<String>) {
     }
 }
 
-fn text(val: Value) -> String {
+fn parse_edge_row(row: &turso::Row) -> Option<Edge> {
+    Some(Edge {
+        source: normalize_id(&text(row.get_value(0).ok()?)),
+        target: normalize_id(&text(row.get_value(1).ok()?)),
+        content: text(row.get_value(2).ok()?),
+        stability: real(row.get_value(3).ok()?),
+        confidence: real(row.get_value(4).ok()?),
+        importance: real(row.get_value(5).ok()?),
+        subject: int(row.get_value(6).ok()?) != 0,
+        date: text(row.get_value(7).ok()?),
+        occurred_at: optional_text(row.get_value(8).ok()),
+        expired_at: optional_text(row.get_value(9).ok()),
+    })
+}
+
+fn optional_text(value: Option<Value>) -> Option<String> {
+    match value? {
+        Value::Text(string) => Some(string),
+        Value::Null => None,
+        _ => None,
+    }
+}
+
+pub(crate) fn text(val: Value) -> String {
     match val {
         Value::Text(string) => string,
         _ => String::new(),
     }
 }
 
-fn real(val: Value) -> f64 {
+pub(crate) fn real(val: Value) -> f64 {
     match val {
         Value::Real(float) => float,
         Value::Integer(int) => int as f64,

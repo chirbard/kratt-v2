@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::error::Error;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,6 +13,7 @@ use crate::prompts::{
 use super::agent::{ToolCall, parse_tool_calls, stream_collect};
 use super::db;
 use super::embed::{self, SemanticEdge};
+use super::ledger::{self, Actor, EdgeRef, Event, EventContext};
 use super::graph::{Edge, Node, graph_to_json, normalize_id};
 
 const DREAM_CONFIDENCE_CAP: f64 = 0.6;
@@ -100,7 +100,7 @@ fn run_domain_agents(
     sender: &std::sync::mpsc::Sender<DreamEvent>,
 ) -> Result<DomainOutputs, Box<dyn Error + Send + Sync>> {
     type AgentHandle = std::thread::JoinHandle<Result<String, Box<dyn Error + Send + Sync>>>;
-    let toons = build_domain_toons(&*embed, global_toon);
+    let toons = build_domain_toons(&*embed, global_toon, session_id);
     let specs = [
         ("biologist", DREAM_BIOLOGIST, toons.biologist),
         ("historian", DREAM_HISTORIAN, toons.historian),
@@ -133,14 +133,17 @@ fn run_domain_agents(
     })
 }
 
-fn build_domain_toons(embed: &dyn EmbeddingClient, global_toon: &str) -> DomainToons {
-    let today = prompts::today_iso();
+fn build_domain_toons(
+    embed: &dyn EmbeddingClient,
+    global_toon: &str,
+    session_id: &str,
+) -> DomainToons {
     let biologist = exploration_subgraph(embed, BIOLOGIST_ANCHOR, "biologist");
-    record_domain_views("biologist", &biologist, &today);
+    record_domain_views("biologist", &biologist, session_id);
     let historian = exploration_subgraph(embed, HISTORIAN_ANCHOR, "historian");
-    record_domain_views("historian", &historian, &today);
+    record_domain_views("historian", &historian, session_id);
     let economist = exploration_subgraph(embed, ECONOMIST_ANCHOR, "economist");
-    record_domain_views("economist", &economist, &today);
+    record_domain_views("economist", &economist, session_id);
     DomainToons {
         biologist: embed::edges_to_toon(&biologist),
         historian: embed::edges_to_toon(&historian),
@@ -157,14 +160,20 @@ fn exploration_subgraph(
     embed::select_exploration_edges(embed, anchor, agent_name)
 }
 
-fn record_domain_views(agent_name: &str, edges: &[SemanticEdge], date: &str) {
-    let mut seen = HashSet::new();
+// Best-effort bookkeeping: a failed ledger write must never abort the dream.
+fn record_domain_views(agent_name: &str, edges: &[SemanticEdge], session_id: &str) {
+    let mut events = Vec::new();
     for edge in edges {
-        seen.insert(edge.source.clone());
-        seen.insert(edge.target.clone());
+        events.push(Event::injected(
+            Actor::new("agent", agent_name),
+            EdgeRef::new(&edge.source, &edge.target),
+            EventContext::new(session_id, ""),
+        ));
     }
-    let node_ids: Vec<String> = seen.into_iter().collect();
-    db::record_agent_views(agent_name, &node_ids, date);
+    if events.is_empty() {
+        return;
+    }
+    let _ = ledger::record_events(&events);
 }
 
 fn join_agent(
@@ -292,14 +301,22 @@ fn apply_dream_tool_calls(
 ) -> Result<usize, Box<dyn Error + Send + Sync>> {
     db::begin_transaction(conn)?;
     let mut edge_count = 0usize;
-    for call in tool_calls {
-        let (description, added_edge) = apply_dream_call(conn, call, source_id)?;
-        if !description.is_empty() {
-            send_log(sender, "dream", description);
+    let mut events: Vec<Event> = Vec::new();
+    let result = (|| {
+        for call in tool_calls {
+            let (description, added_edge) = apply_dream_call(conn, call, source_id, &mut events)?;
+            if !description.is_empty() {
+                send_log(sender, "dream", description);
+            }
+            if added_edge {
+                edge_count += 1;
+            }
         }
-        if added_edge {
-            edge_count += 1;
-        }
+        db::block_on(ledger::record_events_in_tx(conn, &events))
+    })();
+    if let Err(err) = result {
+        let _ = db::block_on(async { conn.execute("ROLLBACK", ()).await });
+        return Err(err);
     }
     db::commit_transaction(conn)?;
     Ok(edge_count)
@@ -309,6 +326,7 @@ fn apply_dream_call(
     conn: &Connection,
     call: ToolCall,
     source_id: &str,
+    events: &mut Vec<Event>,
 ) -> Result<(String, bool), Box<dyn Error + Send + Sync>> {
     match call {
         ToolCall::UpsertEdge {
@@ -332,6 +350,7 @@ fn apply_dream_call(
                 date,
             },
             source_id,
+            events,
         ),
         ToolCall::UpsertNode {
             name,
@@ -339,8 +358,10 @@ fn apply_dream_call(
             body,
             date,
         } => apply_dream_upsert_node(conn, name, node_type, body, date),
-        ToolCall::DeleteEdge { source, target } => apply_dream_delete_edge(conn, source, target),
-        ToolCall::DeleteNode { name } => apply_dream_delete_node(conn, name),
+        ToolCall::DeleteEdge { source, target } => {
+            apply_dream_delete_edge(conn, source, target, source_id, events)
+        }
+        ToolCall::DeleteNode { name } => apply_dream_delete_node(conn, name, source_id, events),
     }
 }
 
@@ -358,7 +379,13 @@ fn apply_dream_upsert_edge(
     conn: &Connection,
     edge_call: DreamEdgeCall,
     source_id: &str,
+    events: &mut Vec<Event>,
 ) -> Result<(String, bool), Box<dyn Error + Send + Sync>> {
+    let existing = db::load_edge(
+        conn,
+        &normalize_id(&edge_call.source),
+        &normalize_id(&edge_call.target),
+    )?;
     let edge = Edge {
         source: normalize_id(&edge_call.source),
         target: normalize_id(&edge_call.target),
@@ -368,8 +395,16 @@ fn apply_dream_upsert_edge(
         importance: edge_call.importance,
         subject: edge_call.subject,
         date: edge_call.date,
+        occurred_at: None,
+        expired_at: None,
     };
     db::write_edge(conn, &edge, source_id)?;
+    events.push(Event::upsert(
+        Actor::new("system", "consolidation"),
+        EdgeRef::new(&edge.source, &edge.target),
+        EventContext::new(source_id, ""),
+        existing.is_some(),
+    ));
     Ok((
         format!("upsert_edge: {} → {}", edge_call.source, edge_call.target),
         true,
@@ -397,16 +432,39 @@ fn apply_dream_delete_edge(
     conn: &Connection,
     source: String,
     target: String,
+    source_id: &str,
+    events: &mut Vec<Event>,
 ) -> Result<(String, bool), Box<dyn Error + Send + Sync>> {
-    db::erase_edge(conn, &normalize_id(&source), &normalize_id(&target))?;
+    let normalized_source = normalize_id(&source);
+    let normalized_target = normalize_id(&target);
+    let deleted_edge = db::load_edge(conn, &normalized_source, &normalized_target)?;
+    db::erase_edge(conn, &normalized_source, &normalized_target)?;
+    if let Some(edge) = deleted_edge {
+        let pruned = ledger::pruned_events(
+            Actor::new("system", "consolidation"),
+            EventContext::new(source_id, ""),
+            &[edge],
+        )?;
+        events.extend(pruned);
+    }
     Ok((format!("delete_edge: {source} → {target}"), false))
 }
 
 fn apply_dream_delete_node(
     conn: &Connection,
     name: String,
+    source_id: &str,
+    events: &mut Vec<Event>,
 ) -> Result<(String, bool), Box<dyn Error + Send + Sync>> {
-    db::erase_node(conn, &normalize_id(&name))?;
+    let normalized = normalize_id(&name);
+    let deleted_edges = db::load_edges_for_node(conn, &normalized)?;
+    db::erase_node(conn, &normalized)?;
+    let pruned = ledger::pruned_events(
+        Actor::new("system", "consolidation"),
+        EventContext::new(source_id, ""),
+        &deleted_edges,
+    )?;
+    events.extend(pruned);
     Ok((format!("delete_node: {name}"), false))
 }
 
@@ -436,40 +494,7 @@ fn dream_session_id() -> String {
 }
 
 fn dream_timestamp() -> String {
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let days_since_epoch = (seconds / 86_400) as i64;
-    let second_of_day = seconds % 86_400;
-    let (year, month, day) = civil_from_days(days_since_epoch);
-    let hour = second_of_day / 3_600;
-    let minute = (second_of_day % 3_600) / 60;
-    let second = second_of_day % 60;
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}")
-}
-
-fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
-    let shifted_days = days_since_epoch + 719_468;
-    let era = (if shifted_days >= 0 {
-        shifted_days
-    } else {
-        shifted_days - 146_096
-    }) / 146_097;
-    let day_of_era = shifted_days - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year_base = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = if month_prime < 10 {
-        month_prime + 3
-    } else {
-        month_prime - 9
-    };
-    let year = if month <= 2 { year_base + 1 } else { year_base };
-    (year, month, day)
+    crate::timeutil::timestamp_now()
 }
 
 fn send_log(sender: &std::sync::mpsc::Sender<DreamEvent>, phase: &'static str, text: String) {

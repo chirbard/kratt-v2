@@ -224,6 +224,10 @@ pub fn build_chat_system_prompt(memory_block: &str, recent_entries: &[RecentEntr
     prompt.push_str("\nToday's date is ");
     prompt.push_str(&today_iso());
     prompt.push('.');
+    if let Some(elapsed) = elapsed_message(recent_entries) {
+        prompt.push('\n');
+        prompt.push_str(&elapsed);
+    }
     if !memory_block.trim().is_empty() {
         prompt.push_str("\n\n<memory>\n");
         prompt.push_str(memory_block);
@@ -242,6 +246,48 @@ pub fn build_chat_system_prompt(memory_block: &str, recent_entries: &[RecentEntr
     prompt
 }
 
+fn elapsed_message(recent_entries: &[RecentEntry]) -> Option<String> {
+    let previous = recent_entries.last()?;
+    let previous_ts = previous.timestamp.trim();
+    if previous_ts.is_empty() {
+        return None;
+    }
+    let previous_secs = crate::timeutil::timestamp_to_epoch_seconds(previous_ts)?;
+    let now_secs = crate::timeutil::epoch_seconds_now() as i64;
+    let gap = now_secs - previous_secs;
+    if gap <= 3_600 {
+        return None;
+    }
+    Some(format!(
+        "The previous message in this conversation was {} ago.",
+        format_elapsed_gap(gap)
+    ))
+}
+
+fn format_elapsed_gap(gap_seconds: i64) -> String {
+    let days = gap_seconds / 86_400;
+    if days > 0 {
+        return format_unit(days, "day");
+    }
+    let hours = gap_seconds / 3_600;
+    if hours > 0 {
+        return format_unit(hours, "hour");
+    }
+    let minutes = gap_seconds / 60;
+    if minutes > 0 {
+        return format_unit(minutes, "minute");
+    }
+    format_unit(gap_seconds, "second")
+}
+
+fn format_unit(value: i64, unit: &str) -> String {
+    if value == 1 {
+        format!("1 {unit}")
+    } else {
+        format!("{value} {unit}s")
+    }
+}
+
 fn recent_role_label(recent_entry: &RecentEntry) -> &str {
     match recent_entry.role.as_str() {
         "user" => "User",
@@ -251,31 +297,5 @@ fn recent_role_label(recent_entry: &RecentEntry) -> &str {
 }
 
 pub fn today_iso() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let seconds_since_epoch = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let days_since_epoch = (seconds_since_epoch / 86_400) as i64;
-    let shifted_days = days_since_epoch + 719_468;
-    let era = (if shifted_days >= 0 {
-        shifted_days
-    } else {
-        shifted_days - 146_096
-    }) / 146_097;
-    let day_of_era = shifted_days - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year_base = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = if month_prime < 10 {
-        month_prime + 3
-    } else {
-        month_prime - 9
-    };
-    let year = if month <= 2 { year_base + 1 } else { year_base };
-    format!("{year:04}-{month:02}-{day:02}")
+    crate::timeutil::today_iso()
 }
