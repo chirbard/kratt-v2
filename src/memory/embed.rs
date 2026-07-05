@@ -84,6 +84,9 @@ pub fn run_embed_pass(
         }
         start = end;
     }
+    if embedded > 0 {
+        db::sync_push_best_effort("embed");
+    }
     send_log(sender, "embed", format!("{embedded} edges embedded"));
 }
 

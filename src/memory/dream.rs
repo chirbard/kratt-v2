@@ -51,6 +51,7 @@ pub fn run_dream_pass(
     let _write_guard = db::acquire_write_lock();
     match execute_dream_pass(Arc::clone(&llm), Arc::clone(&embed), &sender) {
         Ok(edges_added) => {
+            db::sync_push_best_effort("dream");
             let _ = sender.send(DreamEvent::Done { edges_added });
             Ok(())
         }

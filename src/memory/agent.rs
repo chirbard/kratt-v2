@@ -72,6 +72,7 @@ pub fn run_memory_agent(
         user_message_id,
     };
     let result = agent_run.run();
+    db::sync_push_best_effort("memory agent");
     let _ = sender.send(MemoryEvent::Done);
     result
 }

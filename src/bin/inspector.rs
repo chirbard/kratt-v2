@@ -5,6 +5,7 @@ use tokio::runtime::Runtime;
 use turso::{Builder, Connection, Database, Value};
 
 const DB_PATH: &str = "kratt-data/kratt.db";
+const SYNCED_DB_PATH: &str = "kratt-data/kratt-synced.db";
 const ADDR: &str = "127.0.0.1:7070";
 const PAGE_SIZE: usize = 100;
 const TABLES: &[&str] = &[
@@ -22,15 +23,22 @@ const TABLES: &[&str] = &[
 #[allow(clippy::expect_used)]
 fn main() {
     let rt = Runtime::new().expect("tokio runtime");
+    // Prefer the Turso-Cloud-synced file when it exists (read-only browsing
+    // of the file the app actually uses in synced mode).
+    let path = if std::path::Path::new(SYNCED_DB_PATH).exists() {
+        SYNCED_DB_PATH
+    } else {
+        DB_PATH
+    };
     let db = rt.block_on(async {
-        Builder::new_local(DB_PATH)
+        Builder::new_local(path)
             .experimental_index_method(true)
             .build()
             .await
             .expect("open db")
     });
     let listener = TcpListener::bind(ADDR).expect("bind");
-    println!("inspector: http://{ADDR}");
+    println!("inspector: http://{ADDR} ({path})");
     loop {
         if let Ok((stream, _)) = listener.accept() {
             handle(&rt, &db, stream);

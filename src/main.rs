@@ -48,11 +48,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Some(Arc::new(web::new_search_client(tavily_key)))
     };
+    memory::sync_pull_best_effort();
     if let Err(err) = memory::db_init() {
         eprintln!("warning: db init failed: {err}");
     }
     let (embed_tx, _embed_rx) = std::sync::mpsc::channel::<memory::MemoryEvent>();
     memory::run_embed_pass(Arc::clone(&embed), &embed_tx);
     let session_path = session::new_session_path();
-    tui::run(chat_llm, memory_llm, embed, search, session_path)
+    let result = tui::run(chat_llm, memory_llm, embed, search, session_path);
+    memory::sync_push_best_effort("app exit");
+    result
 }

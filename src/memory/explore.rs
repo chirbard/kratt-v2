@@ -48,6 +48,7 @@ pub fn run_exploration_pass(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     match execute_exploration_pass(Arc::clone(&llm), Arc::clone(&embed), &sender) {
         Ok(events_recorded) => {
+            db::sync_push_best_effort("explore");
             let _ = sender.send(ExploreEvent::Done { events_recorded });
             Ok(())
         }

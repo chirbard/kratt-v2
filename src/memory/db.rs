@@ -38,27 +38,206 @@ where
     runtime().block_on(future)
 }
 
+// Synced mode: when TURSO_DATABASE_URL and TURSO_AUTH_TOKEN are set, the app
+// runs on a Turso-Cloud-synced local file (separate from the legacy plain
+// file so the old database stays intact as a fallback). On first synced run
+// with an empty synced database, legacy data is copied over automatically.
+const SYNCED_DB_PATH: &str = "kratt-data/kratt-synced.db";
+
+enum DbHandle {
+    Local(Database),
+    Synced(turso::sync::Database),
+}
+
+fn sync_credentials() -> Option<(String, String)> {
+    let url = std::env::var("TURSO_DATABASE_URL").ok()?;
+    let token = std::env::var("TURSO_AUTH_TOKEN").ok()?;
+    if url.trim().is_empty() || token.trim().is_empty() {
+        return None;
+    }
+    Some((url, token))
+}
+
 #[allow(clippy::expect_used)]
-fn database() -> &'static Database {
-    static DATABASE: OnceLock<Database> = OnceLock::new();
+fn database() -> &'static DbHandle {
+    static DATABASE: OnceLock<DbHandle> = OnceLock::new();
     // OnceLock::get_or_init requires FnOnce() -> T — no way to propagate errors
     DATABASE.get_or_init(|| {
         runtime().block_on(async {
             std::fs::create_dir_all(DATA_DIR).expect("create data dir");
-            let database = Builder::new_local(DB_PATH)
-                .experimental_index_method(true)
-                .build()
-                .await
-                .expect("open db");
-            let conn = database.connect().expect("db connect");
-            init_schema(&conn).await.expect("init schema");
-            database
+            match sync_credentials() {
+                Some((url, token)) => DbHandle::Synced(open_synced(&url, &token).await),
+                None => DbHandle::Local(open_local().await),
+            }
         })
     })
 }
 
+#[allow(clippy::expect_used)]
+async fn open_local() -> Database {
+    let database = Builder::new_local(DB_PATH)
+        .experimental_index_method(true)
+        .build()
+        .await
+        .expect("open db");
+    let conn = database.connect().expect("db connect");
+    init_schema(&conn).await.expect("init schema");
+    database
+}
+
+#[allow(clippy::expect_used)]
+async fn open_synced(url: &str, token: &str) -> turso::sync::Database {
+    let database = turso::sync::Builder::new_remote(SYNCED_DB_PATH)
+        .with_remote_url(url)
+        .with_auth_token(token)
+        .experimental_index_method(true)
+        .build()
+        .await
+        .expect("open synced db");
+    let conn = database.connect().await.expect("synced db connect");
+    init_schema(&conn).await.expect("init schema");
+    if let Err(err) = migrate_legacy_if_empty(&conn).await {
+        crate::runlog::log("sync", &format!("legacy migration failed: {err}"));
+    }
+    database
+}
+
 pub fn open_connection() -> Result<Connection, Box<dyn Error + Send + Sync>> {
-    Ok(database().connect()?)
+    match database() {
+        DbHandle::Local(database) => Ok(database.connect()?),
+        DbHandle::Synced(database) => Ok(runtime().block_on(database.connect())?),
+    }
+}
+
+// Push local changes to Turso Cloud. No-op in local mode. Best-effort at all
+// call sites — sync must never break the app.
+pub fn sync_push() -> Result<(), Box<dyn Error + Send + Sync>> {
+    match database() {
+        DbHandle::Local(_) => Ok(()),
+        DbHandle::Synced(database) => {
+            runtime().block_on(database.push())?;
+            Ok(())
+        }
+    }
+}
+
+// Pull remote changes from Turso Cloud; returns whether anything changed.
+pub fn sync_pull() -> Result<bool, Box<dyn Error + Send + Sync>> {
+    match database() {
+        DbHandle::Local(_) => Ok(false),
+        DbHandle::Synced(database) => Ok(runtime().block_on(database.pull())?),
+    }
+}
+
+pub fn sync_enabled() -> bool {
+    matches!(database(), DbHandle::Synced(_))
+}
+
+// Best-effort push for the end of background write passes and app exit.
+pub fn sync_push_best_effort(context: &str) {
+    if !sync_enabled() {
+        return;
+    }
+    match sync_push() {
+        Ok(()) => crate::runlog::log("sync", &format!("push ok ({context})")),
+        Err(err) => crate::runlog::log("sync", &format!("push failed ({context}): {err}")),
+    }
+}
+
+// Best-effort pull for app startup.
+pub fn sync_pull_best_effort() {
+    if !sync_enabled() {
+        return;
+    }
+    match sync_pull() {
+        Ok(changed) => crate::runlog::log("sync", &format!("pull ok — changed: {changed}")),
+        Err(err) => crate::runlog::log("sync", &format!("pull failed: {err}")),
+    }
+}
+
+// Explicit column lists: the legacy file gained columns via ALTERs in a
+// different order than a fresh schema creates them, so SELECT * would
+// scramble the mapping.
+const MIGRATE_TABLES: [(&str, &str); 9] = [
+    ("nodes", "id, node_type, body, date"),
+    (
+        "edges",
+        "source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, source_message_id, embedding",
+    ),
+    ("meta", "key, value"),
+    ("sessions", "id, session_type, created_at"),
+    ("messages", "id, session_id, role, content, created_at"),
+    (
+        "events",
+        "id, ts, session_id, turn_id, actor_type, actor_id, event_type, source, target, weight, payload",
+    ),
+    (
+        "edge_actor_views",
+        "actor_type, actor_id, source, target, views, last_visited_at",
+    ),
+    (
+        "actor_positions",
+        "actor_type, actor_id, sum_vector, total_weight, updated_at",
+    ),
+    (
+        "actor_position_history",
+        "actor_type, actor_id, embedding, recorded_at",
+    ),
+];
+
+async fn migrate_legacy_if_empty(
+    conn: &Connection,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if node_count(conn).await? > 0 {
+        return Ok(());
+    }
+    if !std::path::Path::new(DB_PATH).exists() {
+        return Ok(());
+    }
+    crate::runlog::log("sync", "migrating legacy kratt.db into synced database");
+    let legacy = Builder::new_local(DB_PATH)
+        .experimental_index_method(true)
+        .build()
+        .await?;
+    let legacy_conn = legacy.connect()?;
+    let mut total = 0usize;
+    for (table, columns) in MIGRATE_TABLES {
+        total += copy_table(&legacy_conn, conn, table, columns).await?;
+    }
+    crate::runlog::log("sync", &format!("legacy migration done — {total} rows"));
+    Ok(())
+}
+
+async fn copy_table(
+    source_conn: &Connection,
+    target_conn: &Connection,
+    table: &str,
+    columns: &str,
+) -> Result<usize, Box<dyn Error + Send + Sync>> {
+    let column_count = columns.split(',').count();
+    let mut placeholders = Vec::new();
+    for index in 0..column_count {
+        placeholders.push(format!("?{}", index + 1));
+    }
+    let insert_sql = format!(
+        "INSERT OR IGNORE INTO {table} ({columns}) VALUES ({})",
+        placeholders.join(", ")
+    );
+    let mut rows = source_conn
+        .query(&format!("SELECT {columns} FROM {table}"), ())
+        .await?;
+    let mut copied = 0usize;
+    while let Some(row) = rows.next().await? {
+        let mut values: Vec<Value> = Vec::with_capacity(column_count);
+        for index in 0..column_count {
+            values.push(row.get_value(index)?);
+        }
+        target_conn
+            .execute(&insert_sql, turso::params_from_iter(values))
+            .await?;
+        copied += 1;
+    }
+    Ok(copied)
 }
 
 // Turso aborts an open transaction when another connection commits — a
