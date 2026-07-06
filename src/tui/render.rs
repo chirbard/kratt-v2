@@ -6,7 +6,9 @@ use ratatui::widgets::{
     Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
 
-use super::app::{App, DreamState, ExploreState, MemoryState, Message, Mode, Role, State};
+use super::app::{
+    App, DreamState, ExploreState, IngestState, MemoryState, Message, Mode, Role, State,
+};
 
 pub(crate) const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -64,6 +66,7 @@ fn build_memory_text(app: &App) -> Text<'static> {
     append_log_section(&mut lines, &app.memory_log, None, app);
     append_log_section(&mut lines, &app.dream_log, Some("dream"), app);
     append_log_section(&mut lines, &app.explore_log, Some("explore"), app);
+    append_log_section(&mut lines, &app.ingest_log, Some("ingest"), app);
     Text::from(lines)
 }
 
@@ -184,6 +187,7 @@ fn render_stats(frame: &mut Frame, area: Rect, app: &App) {
     append_memory_status(&mut text, app);
     append_dream_status(&mut text, app);
     append_explore_status(&mut text, app);
+    append_ingest_status(&mut text, app);
     let widget = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(widget, area);
 }
@@ -231,6 +235,16 @@ fn append_explore_status(text: &mut String, app: &App) {
     }
 }
 
+fn append_ingest_status(text: &mut String, app: &App) {
+    if app.ingest_state == IngestState::Running {
+        append_status_text(text, format!("ingest {}", spinner_char(app.tick)));
+        return;
+    }
+    if app.ingest_state == IngestState::Done && !app.ingest_summary.is_empty() {
+        append_status_text(text, app.ingest_summary.clone());
+    }
+}
+
 fn append_status_text(text: &mut String, status: String) {
     if !text.is_empty() {
         text.push_str("  ");
@@ -265,8 +279,12 @@ fn normal_mode_hint(app: &App) -> String {
         app.explore_state == ExploreState::Running,
         app.explore_state == ExploreState::Done,
     );
+    let ingest_hint = ingest_hint(
+        app.ingest_state == IngestState::Running,
+        app.ingest_state == IngestState::Done,
+    );
     format!(
-        "-- NORMAL --  {mem_hint}  {rea_hint}  {dbg_hint}  {tool_hint}  {attr_hint}  {dream_hint}  {explore_hint}  [S] sync"
+        "-- NORMAL --  {mem_hint}  {rea_hint}  {dbg_hint}  {tool_hint}  {attr_hint}  {dream_hint}  {explore_hint}  {ingest_hint}  [S] sync"
     )
 }
 
@@ -296,6 +314,16 @@ fn explore_hint(running: bool, done: bool) -> &'static str {
         return "[E] explore ✓";
     }
     "[E] explore"
+}
+
+fn ingest_hint(running: bool, done: bool) -> &'static str {
+    if running {
+        return "/ingest…";
+    }
+    if done {
+        return "/ingest ✓";
+    }
+    "/ingest"
 }
 
 fn build_output_text(app: &App) -> Text<'static> {
@@ -415,6 +443,7 @@ fn phase_color(phase: &str) -> Color {
         "consolidation" => Color::Yellow,
         "dream" => Color::Green,
         "explore" => Color::Green,
+        "ingest" => Color::Yellow,
         "think" => Color::Magenta,
         "debug" => Color::DarkGray,
         _ => Color::White,

@@ -21,7 +21,7 @@ use crate::api::LlmClient;
 use crate::runlog;
 use crate::web::SearchClient;
 
-use app::{App, drain_dream, drain_embed, drain_explore, drain_memory, drain_stream};
+use app::{App, drain_dream, drain_embed, drain_explore, drain_ingest, drain_memory, drain_stream};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -63,6 +63,7 @@ fn run_loop(terminal: &mut Term, app: &mut App) -> Result<(), Box<dyn std::error
         drain_memory(app);
         drain_dream(app);
         drain_explore(app);
+        drain_ingest(app);
         drain_embed(app);
         app.tick += 1;
         terminal.draw(|frame| render::render(frame, app))?;

@@ -261,6 +261,18 @@ Use tools iteratively:
 - traverse_graph to inspect incentive neighborhoods
 - mark_interesting only when the edge captures a high-value trade-off or hidden optimization pressure, with a specific reason"#;
 
+pub const INGEST_EXPLANATION: &str = r#"You are the ingestor: a disciplined reader studying one document chunk at a time.
+
+Your job in this pass is REVIEW, not extraction — a separate extraction pass captures the chunk's facts afterwards.
+
+Rules:
+- Compare the chunk against the memory subgraph. If the chunk contradicts an existing belief, use search_web with reason="contradiction" and name the conflicting belief explicitly.
+- When a contradiction search confirms the new document, expire_edge the old belief instead of deleting it, and record the corrected fact with upsert_edge.
+- After a curiosity search, record durable findings with upsert_edge (web findings are capped at lower confidence).
+- If a side question is interesting-not-blocking, note_curiosity instead of searching.
+- Edges ARE the knowledge; never create a node without an edge connecting it.
+- If nothing needs checking, say so briefly and stop — that is the common case."#;
+
 pub fn build_exploration_prompt(explanation: &str, toon: &str, turn_index: usize) -> String {
     let mut prompt = String::new();
     prompt.push_str(explanation);
@@ -272,6 +284,54 @@ pub fn build_exploration_prompt(explanation: &str, toon: &str, turn_index: usize
     prompt.push_str(". Keep iterating while you still see promising leads; stop naturally when there is no high-value next action.");
     prompt.push_str("\n\n## Seed memory subgraph\n\n");
     prompt.push_str(toon);
+    prompt
+}
+
+pub const INGEST_EXTRACT: &str = r#"You are the ingestor's extraction pass: convert one document chunk into graph beliefs.
+
+Extract EVERY durable fact in the chunk — a typical chunk yields 5-15 edges. Each edge's content is one complete natural-language belief ("X stores knowledge as Markdown files") connecting two concrete nodes. Create the nodes the edges need; never create a node without an edge. Use the existing memory subgraph to connect new facts to known nodes instead of inventing duplicates."#;
+
+pub fn build_ingest_extract_prompt(graph_toon: &str, chunk_text: &str) -> String {
+    let mut prompt = String::new();
+    prompt.push_str(INGEST_EXTRACT);
+    prompt.push_str("\n\nToday's date: ");
+    prompt.push_str(&today_iso());
+    prompt.push('.');
+    prompt.push_str("\n\n");
+    prompt.push_str(JSON_OUTPUT_RULES);
+    prompt.push_str("\n\n");
+    prompt.push_str(TOOL_DEFINITIONS);
+    prompt.push_str("\n\n## Relevant memory subgraph\n\n");
+    prompt.push_str(graph_toon);
+    prompt.push_str("\n\n## Document chunk to extract\n\n");
+    prompt.push_str(chunk_text);
+    prompt
+}
+
+pub fn build_ingestion_prompt(
+    explanation: &str,
+    document_map: &str,
+    previous_chunk_summary: &str,
+    graph_toon: &str,
+    chunk_text: &str,
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str(explanation);
+    prompt.push_str("\n\nToday's date: ");
+    prompt.push_str(&today_iso());
+    prompt.push('.');
+    prompt.push_str("\n\n## Document map\n\n");
+    prompt.push_str(document_map);
+    prompt.push_str("\n\n## Previous chunk summary\n\n");
+    if previous_chunk_summary.trim().is_empty() {
+        prompt.push_str("(none)");
+    } else {
+        prompt.push_str(previous_chunk_summary);
+    }
+    prompt.push_str("\n\n## Relevant memory subgraph\n\n");
+    prompt.push_str(graph_toon);
+    prompt.push_str("\n\n## Chunk to study\n\n");
+    prompt.push_str(chunk_text);
     prompt
 }
 

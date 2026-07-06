@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::sync::Arc;
 
-use crate::api::{Chunk, LlmClient};
+use crate::api::{Chunk, LlmClient, ToolCallRequest};
 use crate::prompts::{CONSOLIDATE_EXPLANATION, EXTRACT_EXPLANATION, build_agent_prompt};
 use crate::runlog;
 use turso::Connection;
@@ -26,7 +26,7 @@ struct AgentRun<'run> {
     user_message_id: &'run str,
 }
 
-pub(super) enum ToolCall {
+pub(crate) enum ToolCall {
     UpsertNode {
         name: String,
         node_type: String,
@@ -203,10 +203,18 @@ pub(super) fn stream_collect(
     Ok(reasoning_full)
 }
 
-pub(super) fn parse_tool_calls(text: &str) -> Vec<ToolCall> {
+pub(crate) fn parse_tool_calls(text: &str) -> Vec<ToolCall> {
     let stripped = strip_markdown_fences(text);
-    let Ok(json_value) = serde_json::from_str::<serde_json::Value>(stripped) else {
-        return Vec::new();
+    let json_value = match serde_json::from_str::<serde_json::Value>(stripped) {
+        Ok(json_value) => json_value,
+        // Models sometimes wrap the JSON in prose or channel markers — retry
+        // on the outermost brace span. If that also fails the response is
+        // likely truncated mid-array: salvage the complete tool objects
+        // rather than discarding the whole batch.
+        Err(_) => match parse_embedded_json(stripped) {
+            Some(json_value) => json_value,
+            None => return salvage_tool_calls(stripped),
+        },
     };
     if let Some(tools) = tool_array(&json_value) {
         let mut calls = Vec::new();
@@ -221,6 +229,95 @@ pub(super) fn parse_tool_calls(text: &str) -> Vec<ToolCall> {
         Some(call) => vec![call],
         None => Vec::new(),
     }
+}
+
+// Walks the "tools" array of a truncated response and parses each complete
+// {...} object individually; an object cut off by truncation is dropped.
+fn salvage_tool_calls(text: &str) -> Vec<ToolCall> {
+    let Some(tools_key) = text.find("\"tools\"") else {
+        return Vec::new();
+    };
+    let after_key = &text[tools_key..];
+    let Some(array_offset) = after_key.find('[') else {
+        return Vec::new();
+    };
+    let array_body = &after_key[array_offset + 1..];
+    let mut calls = Vec::new();
+    for span in complete_object_spans(array_body) {
+        let Ok(json_value) = serde_json::from_str::<serde_json::Value>(span) else {
+            continue;
+        };
+        if let Some(call) = parse_single_tool(&json_value) {
+            calls.push(call);
+        }
+    }
+    calls
+}
+
+// Returns the byte spans of balanced top-level {...} objects, string-aware.
+fn complete_object_spans(text: &str) -> Vec<&str> {
+    let mut spans = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut strings = StringScanner::default();
+    for (index, byte) in text.bytes().enumerate() {
+        if strings.consumes(byte) {
+            continue;
+        }
+        match byte {
+            b'{' => {
+                if depth == 0 {
+                    start = index;
+                }
+                depth += 1;
+            }
+            b'}' => {
+                if depth == 1 {
+                    spans.push(&text[start..=index]);
+                }
+                depth = depth.saturating_sub(1);
+            }
+            b']' if depth == 0 => break,
+            _ => {}
+        }
+    }
+    spans
+}
+
+// Tracks whether the scan is inside a JSON string literal (escape-aware).
+#[derive(Default)]
+struct StringScanner {
+    in_string: bool,
+    escaped: bool,
+}
+
+impl StringScanner {
+    fn consumes(&mut self, byte: u8) -> bool {
+        if self.in_string {
+            if self.escaped {
+                self.escaped = false;
+            } else if byte == b'\\' {
+                self.escaped = true;
+            } else if byte == b'"' {
+                self.in_string = false;
+            }
+            return true;
+        }
+        if byte == b'"' {
+            self.in_string = true;
+            return true;
+        }
+        false
+    }
+}
+
+fn parse_embedded_json(text: &str) -> Option<serde_json::Value> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(&text[start..=end]).ok()
 }
 
 fn strip_markdown_fences(text: &str) -> &str {
@@ -251,6 +348,115 @@ fn parse_single_tool(obj: &serde_json::Value) -> Option<ToolCall> {
         "expire_edge" => parse_expire_edge(args),
         _ => None,
     }
+}
+
+// gpt-oss models leak harmony channel markers into the tool name
+// ("upsert_node<|channel|>json") — strip everything from the first "<|" so
+// those calls are not silently dropped.
+pub(crate) fn sanitized_tool_name(name: &str) -> &str {
+    match name.find("<|") {
+        Some(index) => &name[..index],
+        None => name,
+    }
+}
+
+pub(crate) fn parse_tool_call_request(call: &ToolCallRequest) -> Option<ToolCall> {
+    let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.args) else {
+        return None;
+    };
+    match sanitized_tool_name(&call.name) {
+        "upsert_node" => parse_upsert_node(&args),
+        "upsert_edge" => parse_upsert_edge(&args),
+        "delete_node" => parse_delete_node(&args),
+        "delete_edge" => parse_delete_edge(&args),
+        "expire_edge" => parse_expire_edge(&args),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) fn memory_mutation_tools() -> serde_json::Value {
+    serde_json::Value::Array(vec![
+        memory_tool(
+            "upsert_node",
+            "Create or update a graph node.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "type": {"type": "string", "enum": ["entity", "fact", "note"]},
+                    "body": {"type": "string"},
+                    "date": {"type": "string"}
+                },
+                "required": ["name", "type", "body", "date"]
+            }),
+        ),
+        memory_tool(
+            "upsert_edge",
+            "Create or update a directed graph edge.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string"},
+                    "target": {"type": "string"},
+                    "content": {"type": "string"},
+                    "stability": {"type": "number"},
+                    "confidence": {"type": "number"},
+                    "importance": {"type": "number"},
+                    "subject": {"type": "boolean"},
+                    "date": {"type": "string"}
+                },
+                "required": ["source", "target", "content", "stability", "confidence", "importance", "subject", "date"]
+            }),
+        ),
+        memory_tool(
+            "delete_node",
+            "Delete a node and its incident edges.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"}
+                },
+                "required": ["name"]
+            }),
+        ),
+        memory_tool(
+            "delete_edge",
+            "Delete a directed edge.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string"},
+                    "target": {"type": "string"}
+                },
+                "required": ["source", "target"]
+            }),
+        ),
+        memory_tool(
+            "expire_edge",
+            "Mark a belief historical instead of deleting it.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string"},
+                    "target": {"type": "string"},
+                    "rewritten_content": {"type": "string"}
+                },
+                "required": ["source", "target", "rewritten_content"]
+            }),
+        ),
+    ])
+}
+
+fn memory_tool(name: &str, description: &str, parameters: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": parameters
+        }
+    })
 }
 
 fn tool_array(obj: &serde_json::Value) -> Option<&[serde_json::Value]> {
@@ -356,6 +562,14 @@ fn json_f64(obj: &serde_json::Value, key: &str) -> f64 {
     value.as_f64().unwrap_or(0.0)
 }
 
+pub(crate) struct ApplyToolOptions<'scope> {
+    pub actor: Actor,
+    pub context: EventContext,
+    pub source_message_id: &'scope str,
+    pub event_payload: &'scope str,
+    pub confidence_cap: Option<f64>,
+}
+
 fn apply_tool_calls<'agent_run>(
     agent_run: &AgentRun<'agent_run>,
     conn: &Connection,
@@ -365,9 +579,15 @@ fn apply_tool_calls<'agent_run>(
     db::begin_transaction(conn)?;
     let mut events: Vec<Event> = Vec::new();
     let result = (|| {
+        let options = ApplyToolOptions {
+            actor: Actor::new("system", phase),
+            context: mutation_context(agent_run.user_message_id),
+            source_message_id: agent_run.user_message_id,
+            event_payload: "",
+            confidence_cap: None,
+        };
         for call in tool_calls {
-            let description =
-                apply_tool(call, conn, agent_run.user_message_id, phase, &mut events)?;
+            let description = apply_tool_call(call, conn, &options, &mut events)?;
             agent_run.send_log(phase, description);
         }
         db::block_on(ledger::record_events_in_tx(conn, &events))
@@ -383,18 +603,23 @@ fn apply_tool_calls<'agent_run>(
 }
 
 #[rustfmt::skip]
-fn apply_tool(call: ToolCall, conn: &Connection, source_message_id: &str, phase: &str, events: &mut Vec<Event>) -> Result<String, Box<dyn Error + Send + Sync>> {
+pub(crate) fn apply_tool_call<'scope>(
+    call: ToolCall,
+    conn: &Connection,
+    options: &ApplyToolOptions<'scope>,
+    events: &mut Vec<Event>,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
     match call {
         ToolCall::UpsertNode { name, node_type, body, date } =>
             apply_upsert_node(conn, name, node_type, body, date),
         ToolCall::UpsertEdge { source, target, content, stability, confidence, importance, subject, date } =>
-            apply_upsert_edge_call(conn, source_message_id, phase, events, UpsertEdgeCall { source, target, content, stability, confidence, importance, subject, date }),
+            apply_upsert_edge_call(conn, options, events, UpsertEdgeCall { source, target, content, stability, confidence, importance, subject, date }),
         ToolCall::DeleteNode { name } =>
-            apply_delete_node(conn, name, source_message_id, phase, events),
+            apply_delete_node(conn, name, options, events),
         ToolCall::DeleteEdge { source, target } =>
-            apply_delete_edge(conn, EdgeRef::new(&source, &target), source_message_id, phase, events),
+            apply_delete_edge(conn, EdgeRef::new(&source, &target), options, events),
         ToolCall::ExpireEdge { source, target, rewritten_content } =>
-            apply_expire_edge(conn, ExpireEdgeCall { source, target, rewritten_content }, source_message_id, phase, events),
+            apply_expire_edge(conn, ExpireEdgeCall { source, target, rewritten_content }, options, events),
     }
 }
 
@@ -404,11 +629,10 @@ struct ExpireEdgeCall {
     rewritten_content: String,
 }
 
-fn apply_expire_edge(
+fn apply_expire_edge<'scope>(
     conn: &Connection,
     call: ExpireEdgeCall,
-    source_message_id: &str,
-    phase: &str,
+    options: &ApplyToolOptions<'scope>,
     events: &mut Vec<Event>,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
     let ExpireEdgeCall {
@@ -419,16 +643,22 @@ fn apply_expire_edge(
     let normalized_source = normalize_id(&source);
     let normalized_target = normalize_id(&target);
     let Some(mut edge) = db::load_edge(conn, &normalized_source, &normalized_target)? else {
-        return Ok(format!("expire_edge skipped: {source} → {target} (not found)"));
+        return Ok(format!(
+            "expire_edge skipped: {source} → {target} (not found)"
+        ));
     };
     edge.content = rewritten_content;
     edge.expired_at = Some(crate::timeutil::timestamp_now());
-    db::write_edge(conn, &edge, source_message_id)?;
-    let payload = serde_json::json!({"expired": true}).to_string();
+    db::write_edge(conn, &edge, options.source_message_id)?;
+    let payload = if options.event_payload.is_empty() {
+        serde_json::json!({"expired": true}).to_string()
+    } else {
+        options.event_payload.to_string()
+    };
     events.push(Event::updated(
-        Actor::new("system", phase),
+        options.actor.clone(),
         EdgeRef::new(&edge.source, &edge.target),
-        mutation_context(source_message_id),
+        options.context.clone(),
         payload,
     ));
     Ok(format!("expire_edge: {source} → {target}"))
@@ -445,13 +675,15 @@ struct UpsertEdgeCall {
     date: String,
 }
 
-fn apply_upsert_edge_call(
+fn apply_upsert_edge_call<'scope>(
     conn: &Connection,
-    source_message_id: &str,
-    phase: &str,
+    options: &ApplyToolOptions<'scope>,
     events: &mut Vec<Event>,
-    call: UpsertEdgeCall,
+    mut call: UpsertEdgeCall,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
+    if let Some(confidence_cap) = options.confidence_cap {
+        call.confidence = call.confidence.min(confidence_cap);
+    }
     let edge = Edge {
         source: normalize_id(&call.source),
         target: normalize_id(&call.target),
@@ -464,7 +696,7 @@ fn apply_upsert_edge_call(
         occurred_at: None,
         expired_at: None,
     };
-    apply_upsert_edge(conn, edge, source_message_id, phase, events)
+    apply_upsert_edge(conn, edge, options, events)
 }
 
 fn apply_upsert_node(
@@ -484,48 +716,56 @@ fn apply_upsert_node(
     Ok(format!("upsert_node: {name} ({node_type})"))
 }
 
-fn apply_upsert_edge(
+fn apply_upsert_edge<'scope>(
     conn: &Connection,
     edge: Edge,
-    source_message_id: &str,
-    phase: &str,
+    options: &ApplyToolOptions<'scope>,
     events: &mut Vec<Event>,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
     let existing = db::load_edge(conn, &edge.source, &edge.target)?;
-    db::write_edge(conn, &edge, source_message_id)?;
-    events.push(Event::upsert(
-        Actor::new("system", phase),
-        EdgeRef::new(&edge.source, &edge.target),
-        mutation_context(source_message_id),
-        existing.is_some(),
-    ));
+    db::write_edge(conn, &edge, options.source_message_id)?;
+    let event = if options.event_payload.is_empty() {
+        Event::upsert(
+            options.actor.clone(),
+            EdgeRef::new(&edge.source, &edge.target),
+            options.context.clone(),
+            existing.is_some(),
+        )
+    } else {
+        Event::upsert_with_payload(
+            options.actor.clone(),
+            EdgeRef::new(&edge.source, &edge.target),
+            options.context.clone(),
+            existing.is_some(),
+            options.event_payload.to_string(),
+        )
+    };
+    events.push(event);
     Ok(format!("upsert_edge: {} → {}", edge.source, edge.target))
 }
 
-fn apply_delete_node(
+fn apply_delete_node<'scope>(
     conn: &Connection,
     name: String,
-    source_message_id: &str,
-    phase: &str,
+    options: &ApplyToolOptions<'scope>,
     events: &mut Vec<Event>,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
     let normalized = normalize_id(&name);
     let deleted_edges = db::load_edges_for_node(conn, &normalized)?;
     db::erase_node(conn, &normalized)?;
     let pruned = ledger::pruned_events(
-        Actor::new("system", phase),
-        mutation_context(source_message_id),
+        options.actor.clone(),
+        options.context.clone(),
         &deleted_edges,
     )?;
     events.extend(pruned);
     Ok(format!("delete_node: {name}"))
 }
 
-fn apply_delete_edge(
+fn apply_delete_edge<'scope>(
     conn: &Connection,
     edge_ref: EdgeRef,
-    source_message_id: &str,
-    phase: &str,
+    options: &ApplyToolOptions<'scope>,
     events: &mut Vec<Event>,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
     let normalized_source = normalize_id(&edge_ref.source);
@@ -533,11 +773,8 @@ fn apply_delete_edge(
     let deleted_edge = db::load_edge(conn, &normalized_source, &normalized_target)?;
     db::erase_edge(conn, &normalized_source, &normalized_target)?;
     if let Some(edge) = deleted_edge {
-        let pruned = ledger::pruned_events(
-            Actor::new("system", phase),
-            mutation_context(source_message_id),
-            &[edge],
-        )?;
+        let pruned =
+            ledger::pruned_events(options.actor.clone(), options.context.clone(), &[edge])?;
         events.extend(pruned);
     }
     Ok(format!(
@@ -549,4 +786,25 @@ fn apply_delete_edge(
 fn mutation_context(source_message_id: &str) -> EventContext {
     let session_id = db::source_session_id(source_message_id).unwrap_or_default();
     EventContext::new(session_id.as_str(), source_message_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ToolCall, parse_tool_calls};
+
+    #[test]
+    fn truncated_tool_array_salvages_complete_objects() {
+        let truncated = r#"{"tools":[{"tool":"upsert_node","args":{"name":"a","type":"entity","body":"","date":""}},{"tool":"upsert_edge","args":{"source":"a","target":"b","content":"a relates to b","stability":0.5,"confidence":0.5,"importance":0.5,"subject":false,"date":"2026-07-06"}},{"tool":"upsert_node","args":{"name":"trunc"#;
+        let calls = parse_tool_calls(truncated);
+        assert_eq!(calls.len(), 2);
+        assert!(matches!(calls[0], ToolCall::UpsertNode { .. }));
+        assert!(matches!(calls[1], ToolCall::UpsertEdge { .. }));
+    }
+
+    #[test]
+    fn prose_wrapped_json_is_recovered() {
+        let wrapped = r#"Here are the extracted facts: {"tools":[{"tool":"delete_edge","args":{"source":"a","target":"b"}}]} done."#;
+        let calls = parse_tool_calls(wrapped);
+        assert_eq!(calls.len(), 1);
+    }
 }

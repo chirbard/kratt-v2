@@ -11,7 +11,9 @@ use crate::prompts::{
     EXPLORE_BIOLOGIST, EXPLORE_ECONOMIST, EXPLORE_HISTORIAN, build_exploration_prompt,
 };
 use crate::runlog;
+use crate::web::SearchClient;
 
+use super::agent::{self, ApplyToolOptions, ToolCall};
 use super::db;
 use super::dream::{self, DOMAIN_AGENT_NAMES};
 use super::embed::{self, SemanticEdge};
@@ -19,9 +21,11 @@ use super::graph::{Edge, normalize_id};
 use super::ledger::{self, Actor, EdgeRef, Event, EventContext};
 
 const EXPLORATION_TURNS: usize = 4; // replay-tunable.
+const EXPLORE_SEARCHES_PER_PASS: usize = 2; // replay-tunable.
 const RETRIEVE_LIMIT: usize = 15; // replay-tunable.
 const TRAVERSE_LIMIT: usize = 20; // replay-tunable.
 const MAX_TOOL_ROUNDS: usize = 6; // per turn; runaway guard for the autonomous loop.
+const EXPLORE_WEB_CONFIDENCE_CAP: f64 = 0.5; // replay-tunable.
 
 pub enum ExploreEvent {
     Log { phase: &'static str, text: String },
@@ -35,18 +39,28 @@ struct TurnOutcomeInfo {
 struct ToolContext<'context> {
     embed: &'context dyn EmbeddingClient,
     conn: &'context Connection,
+    search: Option<&'context dyn SearchClient>,
     agent_name: &'context str,
     session_id: &'context str,
     turn_id: &'context str,
     events: &'context mut Vec<Event>,
+    active_query: &'context mut Option<String>,
+    remaining_searches: &'context mut usize,
+}
+
+struct OpenCuriosityNote {
+    note_id: String,
+    question: String,
+    topic_id: String,
 }
 
 pub fn run_exploration_pass(
     llm: Arc<dyn LlmClient>,
     embed: Arc<dyn EmbeddingClient>,
+    search: Option<Arc<dyn SearchClient>>,
     sender: Sender<ExploreEvent>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    match execute_exploration_pass(Arc::clone(&llm), Arc::clone(&embed), &sender) {
+    match execute_exploration_pass(Arc::clone(&llm), Arc::clone(&embed), search, &sender) {
         Ok(events_recorded) => {
             db::sync_push_best_effort("explore");
             let _ = sender.send(ExploreEvent::Done { events_recorded });
@@ -64,27 +78,47 @@ pub fn run_exploration_pass(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn execute_exploration_pass(
     llm: Arc<dyn LlmClient>,
     embed: Arc<dyn EmbeddingClient>,
+    search: Option<Arc<dyn SearchClient>>,
     sender: &Sender<ExploreEvent>,
 ) -> Result<usize, Box<dyn Error + Send + Sync>> {
     let _write_guard = db::acquire_write_lock();
     let session_id = exploration_session_id();
     let created_at = crate::timeutil::timestamp_now();
     db::register_exploration_session(&session_id, &created_at);
+    let open_note;
+    if let Some((note_id, question, topic_id)) = db::load_oldest_open_curiosity_note() {
+        open_note = Some(OpenCuriosityNote {
+            note_id,
+            question,
+            topic_id,
+        });
+    } else {
+        open_note = None;
+    }
     send_log(
         sender,
         "explore",
         format!("pass start — session {session_id}"),
     );
     let mut total_events = 0usize;
+    let mut search_budget = EXPLORE_SEARCHES_PER_PASS;
     for agent_name in DOMAIN_AGENT_NAMES {
         total_events += run_agent_loop(
             Arc::clone(&llm),
             Arc::clone(&embed),
+            search.as_deref(),
             &session_id,
             agent_name,
+            if agent_name == DOMAIN_AGENT_NAMES[0] {
+                open_note.as_ref()
+            } else {
+                None
+            },
+            &mut search_budget,
             sender,
         )?;
     }
@@ -101,16 +135,20 @@ fn execute_exploration_pass(
     Ok(total_events)
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn run_agent_loop(
     llm: Arc<dyn LlmClient>,
     embed: Arc<dyn EmbeddingClient>,
+    search: Option<&dyn SearchClient>,
     session_id: &str,
     agent_name: &'static str,
+    open_note: Option<&OpenCuriosityNote>,
+    remaining_searches: &mut usize,
     sender: &Sender<ExploreEvent>,
 ) -> Result<usize, Box<dyn Error + Send + Sync>> {
     let conn = db::open_connection()?;
     let seed_edges = seed_edges_for_agent(&*embed, agent_name);
-    let mut messages = initial_messages(agent_name, &seed_edges);
+    let mut messages = initial_messages(agent_name, &seed_edges, open_note);
     let tools = exploration_tools();
     let mut total_events = 0usize;
     let mut turns_used = 0usize;
@@ -121,11 +159,14 @@ fn run_agent_loop(
             &*llm,
             &*embed,
             &conn,
+            search,
             agent_name,
             session_id,
             &turn_id,
             turn_index,
             &seed_edges,
+            open_note,
+            remaining_searches,
             &mut messages,
             &tools,
             sender,
@@ -149,15 +190,19 @@ fn run_agent_loop(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 fn run_agent_turn(
     llm: &dyn LlmClient,
     embed: &dyn EmbeddingClient,
     conn: &Connection,
+    search: Option<&dyn SearchClient>,
     agent_name: &'static str,
     session_id: &str,
     turn_id: &str,
     turn_index: usize,
     seed_edges: &[SemanticEdge],
+    open_note: Option<&OpenCuriosityNote>,
+    remaining_searches: &mut usize,
     messages: &mut Vec<Value>,
     tools: &Value,
     sender: &Sender<ExploreEvent>,
@@ -167,20 +212,38 @@ fn run_agent_turn(
         "explore",
         format!("{agent_name}: turn {} start", turn_index + 1),
     );
-    let mut events = seed_events(agent_name, session_id, turn_id, turn_index, seed_edges);
-    let outcome = run_single_turn(
+    db::begin_transaction(conn)?;
+    let mut events = seed_events(
+        agent_name, session_id, turn_id, turn_index, seed_edges, open_note,
+    );
+    let result = run_single_turn(
         llm,
         embed,
         conn,
+        search,
         agent_name,
         session_id,
         turn_id,
+        remaining_searches,
         messages,
         tools,
         &mut events,
         sender,
-    )?;
-    let recorded = record_turn_events(&events);
+    );
+    let outcome = match result {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            let _ = db::block_on(async { conn.execute("ROLLBACK", ()).await });
+            return Err(err);
+        }
+    };
+    let recorded = match record_turn_events(conn, &events) {
+        Ok(recorded) => recorded,
+        Err(err) => {
+            let _ = db::block_on(async { conn.execute("ROLLBACK", ()).await });
+            return Err(err);
+        }
+    };
     send_log(
         sender,
         "explore",
@@ -198,9 +261,11 @@ fn run_single_turn(
     llm: &dyn LlmClient,
     embed: &dyn EmbeddingClient,
     conn: &Connection,
+    search: Option<&dyn SearchClient>,
     agent_name: &str,
     session_id: &str,
     turn_id: &str,
+    remaining_searches: &mut usize,
     messages: &mut Vec<Value>,
     tools: &Value,
     events: &mut Vec<Event>,
@@ -208,6 +273,7 @@ fn run_single_turn(
 ) -> Result<TurnOutcomeInfo, Box<dyn Error + Send + Sync>> {
     let mut used_tools = false;
     let mut rounds = 0usize;
+    let mut active_query: Option<String> = None;
     loop {
         // Autonomous loop: cap tool rounds per turn so a model that never
         // stops calling tools cannot run away unattended.
@@ -225,10 +291,13 @@ fn run_single_turn(
                     let mut context = ToolContext {
                         embed,
                         conn,
+                        search,
                         agent_name,
                         session_id,
                         turn_id,
                         events,
+                        active_query: &mut active_query,
+                        remaining_searches,
                     };
                     let result = handle_tool_call(&call, &mut context, sender)?;
                     messages.push(json!({
@@ -282,10 +351,14 @@ fn execute_tool_call(
     call: &ToolCallRequest,
     context: &mut ToolContext,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
-    match call.name.as_str() {
+    if let Some(tool_call) = agent::parse_tool_call_request(call) {
+        return apply_web_mutation(tool_call, context);
+    }
+    match agent::sanitized_tool_name(&call.name) {
         "retrieve_memory" => retrieve_memory(&call.args, context),
         "traverse_graph" => traverse_graph(&call.args, context),
         "mark_interesting" => mark_interesting(&call.args, context),
+        "search_web" => search_web(&call.args, context),
         _ => Ok("unknown tool".to_string()),
     }
 }
@@ -354,6 +427,60 @@ fn mark_interesting(
     Ok("marked".to_string())
 }
 
+fn search_web(
+    args: &str,
+    context: &mut ToolContext,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let Ok(root) = serde_json::from_str::<Value>(args) else {
+        return Ok("search denied: invalid arguments".to_string());
+    };
+    let queries = parse_queries(&root);
+    if queries.is_empty() {
+        return Ok("search denied: provide queries".to_string());
+    }
+    let reason = parse_string_field(&root, "reason");
+    if reason != "curiosity" {
+        return Ok("search denied: exploration only allows reason=curiosity".to_string());
+    }
+    if *context.remaining_searches == 0 {
+        runlog::log("explore", "search denied — curiosity budget exhausted");
+        return Ok("search denied: curiosity budget exhausted".to_string());
+    }
+    let Some(search_client) = context.search else {
+        runlog::log("explore", "search unavailable");
+        return Ok("search unavailable: no search client configured".to_string());
+    };
+    *context.remaining_searches -= 1;
+    let joined = queries.join(" | ");
+    runlog::log("explore", &format!("search allowed — {joined}"));
+    *context.active_query = Some(joined);
+    Ok(match search_client.search_many(&queries) {
+        Some(result) if !result.trim().is_empty() => result,
+        _ => "no results".to_string(),
+    })
+}
+
+fn apply_web_mutation(
+    tool_call: ToolCall,
+    context: &mut ToolContext,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let source_message_id = format!("{}:{}", context.session_id, context.turn_id);
+    // Only mutations after a search are web findings; anything the agent
+    // writes before searching is its own inference.
+    let payload = match &context.active_query {
+        Some(query) => json!({"via": "web_search", "query": query}).to_string(),
+        None => json!({"via": "exploration"}).to_string(),
+    };
+    let options = ApplyToolOptions {
+        actor: Actor::new("agent", context.agent_name),
+        context: EventContext::new(context.session_id, context.turn_id),
+        source_message_id: &source_message_id,
+        event_payload: &payload,
+        confidence_cap: Some(EXPLORE_WEB_CONFIDENCE_CAP),
+    };
+    agent::apply_tool_call(tool_call, context.conn, &options, context.events)
+}
+
 fn append_retrieved_events(context: &mut ToolContext, edges: &[SemanticEdge]) {
     for edge in edges {
         context.events.push(Event::retrieved(
@@ -411,17 +538,17 @@ fn is_live_edge(edge: Option<&Edge>) -> bool {
     edge.expired_at.is_none()
 }
 
-fn record_turn_events(events: &[Event]) -> usize {
+fn record_turn_events(
+    conn: &Connection,
+    events: &[Event],
+) -> Result<usize, Box<dyn Error + Send + Sync>> {
     if events.is_empty() {
-        return 0;
+        db::commit_transaction(conn)?;
+        return Ok(0);
     }
-    match ledger::record_events(events) {
-        Ok(()) => events.len(),
-        Err(err) => {
-            runlog::log("ledger", &format!("write failed: {err}"));
-            0
-        }
-    }
+    db::block_on(ledger::record_events_in_tx(conn, events))?;
+    db::commit_transaction(conn)?;
+    Ok(events.len())
 }
 
 fn seed_edges_for_agent(embed: &dyn EmbeddingClient, agent_name: &str) -> Vec<SemanticEdge> {
@@ -429,22 +556,32 @@ fn seed_edges_for_agent(embed: &dyn EmbeddingClient, agent_name: &str) -> Vec<Se
     embed::select_exploration_edges(embed, anchor, agent_name)
 }
 
-fn initial_messages(agent_name: &str, seed_edges: &[SemanticEdge]) -> Vec<Value> {
+fn initial_messages(
+    agent_name: &str,
+    seed_edges: &[SemanticEdge],
+    open_note: Option<&OpenCuriosityNote>,
+) -> Vec<Value> {
     let explanation = exploration_explanation(agent_name);
     let seed_toon = embed::edges_to_toon(seed_edges);
     let prompt = build_exploration_prompt(explanation, &seed_toon, 0);
+    let opening = match open_note {
+        Some(note) if agent_name == DOMAIN_AGENT_NAMES[0] => note.question.clone(),
+        _ => "Start exploration. Retrieve memory, traverse nodes, and mark specific edges as significant. Use search_web only for bounded curiosity, then extract any durable web findings with memory mutation tools.".to_string(),
+    };
     vec![
         json!({"role": "system", "content": prompt}),
-        json!({"role": "user", "content": "Start exploration. Retrieve memory, traverse nodes, and mark specific edges as significant."}),
+        json!({"role": "user", "content": opening}),
     ]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn seed_events(
     agent_name: &str,
     session_id: &str,
     turn_id: &str,
     turn_index: usize,
     seed_edges: &[SemanticEdge],
+    open_note: Option<&OpenCuriosityNote>,
 ) -> Vec<Event> {
     if turn_index != 0 {
         return Vec::new();
@@ -454,6 +591,15 @@ fn seed_events(
         events.push(Event::injected(
             Actor::new("agent", agent_name),
             EdgeRef::new(&edge.source, &edge.target),
+            EventContext::new(session_id, turn_id),
+        ));
+    }
+    if agent_name == DOMAIN_AGENT_NAMES[0]
+        && let Some(note) = open_note
+    {
+        events.push(Event::retrieved(
+            Actor::new("agent", agent_name),
+            EdgeRef::new(&note.note_id, &note.topic_id),
             EventContext::new(session_id, turn_id),
         ));
     }
@@ -521,6 +667,36 @@ fn parse_usize_arg(args: &str, key: &str) -> Option<usize> {
     usize::try_from(number).ok()
 }
 
+fn parse_queries(root: &Value) -> Vec<String> {
+    let Some(queries_value) = root.get("queries") else {
+        return Vec::new();
+    };
+    let Some(items) = queries_value.as_array() else {
+        return Vec::new();
+    };
+    let mut queries = Vec::new();
+    for item in items {
+        let Some(query) = item.as_str() else {
+            continue;
+        };
+        let trimmed = query.trim();
+        if !trimmed.is_empty() {
+            queries.push(trimmed.to_string());
+        }
+    }
+    queries
+}
+
+fn parse_string_field(root: &Value, key: &str) -> String {
+    let Some(value) = root.get(key) else {
+        return String::new();
+    };
+    match value.as_str() {
+        Some(text) => text.to_string(),
+        None => String::new(),
+    }
+}
+
 fn exploration_explanation(agent_name: &str) -> &'static str {
     match agent_name {
         "biologist" => EXPLORE_BIOLOGIST,
@@ -531,11 +707,15 @@ fn exploration_explanation(agent_name: &str) -> &'static str {
 }
 
 fn exploration_tools() -> Value {
-    Value::Array(vec![
-        retrieve_memory_tool(),
-        traverse_graph_tool(),
-        mark_interesting_tool(),
-    ])
+    let mut tools = match agent::memory_mutation_tools() {
+        Value::Array(array) => array,
+        _ => Vec::new(),
+    };
+    tools.push(retrieve_memory_tool());
+    tools.push(traverse_graph_tool());
+    tools.push(mark_interesting_tool());
+    tools.push(search_web_tool());
+    Value::Array(tools)
 }
 
 fn retrieve_memory_tool() -> Value {
@@ -587,6 +767,24 @@ fn mark_interesting_tool() -> Value {
                     "reason": {"type": "string"}
                 },
                 "required": ["source", "target", "reason"]
+            }
+        }
+    })
+}
+
+fn search_web_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "search_web",
+            "description": "Search the web for bounded curiosity during exploration.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "queries": {"type": "array", "items": {"type": "string"}},
+                    "reason": {"type": "string", "enum": ["curiosity"]}
+                },
+                "required": ["queries", "reason"]
             }
         }
     })

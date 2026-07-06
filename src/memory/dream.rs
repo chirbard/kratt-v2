@@ -94,13 +94,8 @@ fn execute_dream_pass(
     let consolidation = run_consolidation_agent(llm, &session_id, &global_toon, &all_ctx, sender)?;
     let tool_calls = parse_tool_calls(&consolidation);
     let source_id = format!("dream:{session_id}");
-    let edges_added = apply_dream_tool_calls(
-        &conn,
-        tool_calls,
-        &source_id,
-        &synthesis.policy,
-        sender,
-    )?;
+    let edges_added =
+        apply_dream_tool_calls(&conn, tool_calls, &source_id, &synthesis.policy, sender)?;
     send_log(
         sender,
         "dream",
@@ -373,6 +368,7 @@ fn apply_dream_tool_calls(
     Ok(edge_count)
 }
 
+#[allow(clippy::too_many_lines)]
 fn apply_dream_call<'scope, 'policy>(
     ctx: &mut DreamCallContext<'scope, 'policy>,
     call: ToolCall,
@@ -413,7 +409,10 @@ fn apply_dream_call<'scope, 'policy>(
             source,
             target,
             rewritten_content,
-        } => apply_dream_expire_edge(ctx, DreamExpireEdgeCall::new(source, target, rewritten_content)),
+        } => apply_dream_expire_edge(
+            ctx,
+            DreamExpireEdgeCall::new(source, target, rewritten_content),
+        ),
     }
 }
 
@@ -548,7 +547,10 @@ fn apply_dream_upsert_node<'scope, 'policy>(
         date: node_call.date,
     };
     db::write_node(ctx.conn, &normalized, &node)?;
-    Ok((format!("upsert_node: {} ({node_type})", node_call.name), false))
+    Ok((
+        format!("upsert_node: {} ({node_type})", node_call.name),
+        false,
+    ))
 }
 
 fn resolved_node_type<'policy>(

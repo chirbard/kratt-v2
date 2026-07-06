@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::api::{Chunk, EmbeddingClient, LlmClient, Stats};
-use crate::memory::{self, DreamEvent, ExploreEvent, MemoryEvent};
+use crate::memory::{self, DreamEvent, ExploreEvent, IngestEvent, MemoryEvent};
 use crate::session;
 use crate::web::SearchClient;
 
@@ -35,6 +35,13 @@ pub(crate) enum DreamState {
 
 #[derive(PartialEq)]
 pub(crate) enum ExploreState {
+    Idle,
+    Running,
+    Done,
+}
+
+#[derive(PartialEq)]
+pub(crate) enum IngestState {
     Idle,
     Running,
     Done,
@@ -88,6 +95,10 @@ pub(crate) struct App {
     pub(crate) explore_rx: Option<std::sync::mpsc::Receiver<ExploreEvent>>,
     pub(crate) explore_log: Vec<(String, String)>,
     pub(crate) explore_summary: String,
+    pub(crate) ingest_state: IngestState,
+    pub(crate) ingest_rx: Option<std::sync::mpsc::Receiver<IngestEvent>>,
+    pub(crate) ingest_log: Vec<(String, String)>,
+    pub(crate) ingest_summary: String,
 }
 
 impl App {
@@ -133,6 +144,10 @@ impl App {
             explore_rx: None,
             explore_log: Vec::new(),
             explore_summary: String::new(),
+            ingest_state: IngestState::Idle,
+            ingest_rx: None,
+            ingest_log: Vec::new(),
+            ingest_summary: String::new(),
         }
     }
 }
@@ -317,6 +332,34 @@ pub(crate) fn drain_explore(app: &mut App) {
     }
 }
 
+pub(crate) fn drain_ingest(app: &mut App) {
+    let ingest_receiver = match app.ingest_rx.take() {
+        Some(ingest_receiver) => ingest_receiver,
+        None => return,
+    };
+    loop {
+        match ingest_receiver.try_recv() {
+            Ok(IngestEvent::Log { phase, text }) => {
+                app.ingest_log.push((phase.to_string(), text));
+            }
+            Ok(IngestEvent::Done { chunks_processed }) => {
+                app.ingest_summary = format!("ingest done — {chunks_processed} chunks");
+                app.ingest_state = IngestState::Done;
+                start_dream(app);
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                app.ingest_rx = Some(ingest_receiver);
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                app.ingest_state = IngestState::Idle;
+                return;
+            }
+        }
+    }
+}
+
 fn start_memory_update(app: &mut App) {
     let assistant_content = last_assistant_content(app);
     let user_content = second_to_last_content(app);
@@ -357,11 +400,33 @@ pub(crate) fn start_exploration(app: &mut App) {
     let (sender, receiver) = std::sync::mpsc::channel::<ExploreEvent>();
     let llm = Arc::clone(&app.memory_llm);
     let embed = Arc::clone(&app.embed);
+    let search = clone_search_client(app);
     std::thread::spawn(move || {
-        let _ = memory::run_exploration_pass(llm, embed, sender);
+        let _ = memory::run_exploration_pass(llm, embed, search, sender);
     });
     app.explore_rx = Some(receiver);
     app.explore_state = ExploreState::Running;
+}
+
+fn clone_search_client(app: &App) -> Option<Arc<dyn SearchClient>> {
+    match &app.search {
+        Some(search) => Some(Arc::clone(search)),
+        None => None,
+    }
+}
+
+pub(crate) fn start_ingestion(app: &mut App, path: PathBuf) {
+    app.ingest_log.clear();
+    app.ingest_summary.clear();
+    let (sender, receiver) = std::sync::mpsc::channel::<IngestEvent>();
+    let llm = Arc::clone(&app.memory_llm);
+    let embed = Arc::clone(&app.embed);
+    let search = clone_search_client(app);
+    std::thread::spawn(move || {
+        let _ = memory::run_ingestion_pass(llm, embed, search, path, sender);
+    });
+    app.ingest_rx = Some(receiver);
+    app.ingest_state = IngestState::Running;
 }
 
 pub(crate) fn start_recompute_positions(app: &mut App) {

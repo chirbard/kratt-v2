@@ -403,8 +403,7 @@ fn run_cluster_pipeline(
         cluster.hub,
         cluster.edge_indices.len()
     ));
-    let text_outputs =
-        run_brainstorm_text_stages(Arc::clone(&llm), &cluster_toon, &stage_io)?;
+    let text_outputs = run_brainstorm_text_stages(Arc::clone(&llm), &cluster_toon, &stage_io)?;
     let chairman = run_chairman_stage(llm, &cluster_toon, &text_outputs, &stage_io)?;
     let parsed = parse_tool_calls(&chairman);
     if parsed.is_empty() {
@@ -481,7 +480,8 @@ fn run_chairman_stage<'stage_io>(
         "## Drifter\n{}\n\n## Advocate\n{}\n\n## Devil\n{}",
         outputs.drifter, outputs.advocate, outputs.devil
     );
-    let prompt = prompts::build_dream_prompt(prompts::SYNTHESIS_CHAIRMAN, cluster_toon, Some(&context));
+    let prompt =
+        prompts::build_dream_prompt(prompts::SYNTHESIS_CHAIRMAN, cluster_toon, Some(&context));
     stage_collect(llm, "chairman", prompt, stage_io)
 }
 
@@ -582,9 +582,7 @@ fn normalize_calls_for_cluster(cluster: &Cluster, calls: Vec<ToolCall>) -> Vec<T
 fn normalize_call(call: &ToolCall, confidence: f64) -> ToolCall {
     match call {
         ToolCall::UpsertNode { .. } => normalize_upsert_node(call),
-        ToolCall::UpsertEdge {
-            ..
-        } => normalize_upsert_edge(call, confidence),
+        ToolCall::UpsertEdge { .. } => normalize_upsert_edge(call, confidence),
         ToolCall::DeleteEdge { .. } => normalize_delete_edge(call),
         ToolCall::DeleteNode { .. } => normalize_delete_node(call),
         ToolCall::ExpireEdge { .. } => normalize_expire_edge(call),
@@ -682,7 +680,9 @@ fn apply_policy_overrides(cluster: &Cluster, calls: &[ToolCall], policy: &mut Sy
                     },
                 );
             }
-            ToolCall::DeleteNode { .. } | ToolCall::DeleteEdge { .. } | ToolCall::ExpireEdge { .. } => {}
+            ToolCall::DeleteNode { .. }
+            | ToolCall::DeleteEdge { .. }
+            | ToolCall::ExpireEdge { .. } => {}
         }
         idx += 1;
     }
@@ -705,7 +705,9 @@ fn tool_call_json(call: &ToolCall) -> serde_json::Value {
             node_type,
             body,
             date,
-        } => json!({"tool":"upsert_node","args":{"name":name,"type":node_type,"body":body,"date":date}}),
+        } => {
+            json!({"tool":"upsert_node","args":{"name":name,"type":node_type,"body":body,"date":date}})
+        }
         ToolCall::UpsertEdge {
             source,
             target,
@@ -715,7 +717,9 @@ fn tool_call_json(call: &ToolCall) -> serde_json::Value {
             importance,
             subject,
             date,
-        } => json!({"tool":"upsert_edge","args":{"source":source,"target":target,"content":content,"stability":stability,"confidence":confidence,"importance":importance,"subject":subject,"date":date}}),
+        } => {
+            json!({"tool":"upsert_edge","args":{"source":source,"target":target,"content":content,"stability":stability,"confidence":confidence,"importance":importance,"subject":subject,"date":date}})
+        }
         ToolCall::DeleteNode { name } => json!({"tool":"delete_node","args":{"name":name}}),
         ToolCall::DeleteEdge { source, target } => {
             json!({"tool":"delete_edge","args":{"source":source,"target":target}})
@@ -724,7 +728,9 @@ fn tool_call_json(call: &ToolCall) -> serde_json::Value {
             source,
             target,
             rewritten_content,
-        } => json!({"tool":"expire_edge","args":{"source":source,"target":target,"rewritten_content":rewritten_content}}),
+        } => {
+            json!({"tool":"expire_edge","args":{"source":source,"target":target,"rewritten_content":rewritten_content}})
+        }
     }
 }
 

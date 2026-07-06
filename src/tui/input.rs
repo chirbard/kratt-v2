@@ -1,6 +1,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use super::app::{self, App, DreamState, ExploreState, MemoryState, Mode, State};
+use std::path::PathBuf;
+
+use super::app::{self, App, DreamState, ExploreState, IngestState, MemoryState, Mode, State};
 use super::stream::start_stream;
 
 pub(crate) fn handle_key(key: KeyEvent, app: &mut App) -> bool {
@@ -14,8 +16,21 @@ fn handle_insert_key(key: KeyEvent, app: &mut App) -> bool {
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
         KeyCode::Esc => app.mode = Mode::Normal,
+        // Chat and ingestion both require no running background pass: dream,
+        // explore, and ingest hold transactions open across LLM calls, and a
+        // concurrent chat turn's memory writes abort them (turso allows only
+        // one writer; a second commit kills the open transaction).
         KeyCode::Enter if app.state == State::Idle && !app.input.is_empty() => {
-            start_stream(app);
+            let path = ingest_command_path(&app.input);
+            if let Some(path) = path {
+                if maintenance_allowed(app) {
+                    let path = path.to_string();
+                    app.input.clear();
+                    app::start_ingestion(app, PathBuf::from(path));
+                }
+            } else if background_passes_idle(app) {
+                start_stream(app);
+            }
         }
         KeyCode::Backspace => {
             app.input.pop();
@@ -55,6 +70,23 @@ fn maintenance_allowed(app: &App) -> bool {
         && app.memory_state == MemoryState::Idle
         && app.dream_state != DreamState::Running
         && app.explore_state != ExploreState::Running
+        && app.ingest_state != IngestState::Running
+}
+
+fn background_passes_idle(app: &App) -> bool {
+    app.dream_state != DreamState::Running
+        && app.explore_state != ExploreState::Running
+        && app.ingest_state != IngestState::Running
+}
+
+fn ingest_command_path(input: &str) -> Option<&str> {
+    let trimmed = input.trim();
+    let path = trimmed.strip_prefix("/ingest ")?;
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    Some(path)
 }
 
 fn scroll_down(app: &mut App) {

@@ -81,8 +81,31 @@ impl Event {
         )
     }
 
+    pub fn upsert_with_payload(
+        actor: Actor,
+        edge: EdgeRef,
+        context: EventContext,
+        existed: bool,
+        payload: String,
+    ) -> Self {
+        let event_type = if existed { "updated" } else { "created" };
+        Self::new(
+            actor,
+            event_type,
+            edge,
+            context,
+            EventBody::new(1.0, payload),
+        )
+    }
+
     pub fn updated(actor: Actor, edge: EdgeRef, context: EventContext, payload: String) -> Self {
-        Self::new(actor, "updated", edge, context, EventBody::new(1.0, payload))
+        Self::new(
+            actor,
+            "updated",
+            edge,
+            context,
+            EventBody::new(1.0, payload),
+        )
     }
 
     pub fn retrieved(actor: Actor, edge: EdgeRef, context: EventContext) -> Self {

@@ -208,9 +208,7 @@ const MIGRATE_TABLES: [(&str, &str); 9] = [
     ),
 ];
 
-async fn migrate_legacy_if_empty(
-    conn: &Connection,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn migrate_legacy_if_empty(conn: &Connection) -> Result<(), Box<dyn Error + Send + Sync>> {
     if node_count(conn).await? > 0 {
         return Ok(());
     }
@@ -1016,6 +1014,51 @@ pub fn register_exploration_session(session_id: &str, created_at: &str) {
         )
         .await;
     });
+}
+
+pub fn register_ingestion_session(session_id: &str, created_at: &str) {
+    let Ok(conn) = open_connection() else {
+        return;
+    };
+    runtime().block_on(async {
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO sessions (id, session_type, created_at) VALUES (?1, 'ingestion', ?2)",
+            params![session_id, created_at],
+        )
+        .await;
+    });
+}
+
+pub fn load_oldest_open_curiosity_note() -> Option<(String, String, String)> {
+    let Ok(conn) = open_connection() else {
+        return None;
+    };
+    runtime().block_on(async {
+        let mut rows = conn
+            .query(
+                "SELECT n.id, n.body, e.target
+                 FROM nodes n
+                 JOIN edges e ON e.source = n.id
+                 LEFT JOIN (
+                     SELECT DISTINCT ev.source, ev.target
+                     FROM events ev
+                     JOIN sessions s ON s.id = ev.session_id
+                     WHERE s.session_type = 'exploration' AND ev.event_type = 'retrieved'
+                 ) consumed ON consumed.source = e.source AND consumed.target = e.target
+                 WHERE n.node_type = 'note' AND e.expired_at IS NULL AND consumed.source IS NULL
+                 ORDER BY n.date ASC, n.id ASC
+                 LIMIT 1",
+                (),
+            )
+            .await
+            .ok()?;
+        let row = rows.next().await.ok()??;
+        Some((
+            text(row.get_value(0).ok()?),
+            text(row.get_value(1).ok()?),
+            text(row.get_value(2).ok()?),
+        ))
+    })
 }
 
 pub fn insert_message(session_id: &str, role: &str, content: &str, created_at: &str) -> String {
