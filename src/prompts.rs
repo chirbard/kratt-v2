@@ -30,6 +30,65 @@ The diff below shows exactly what extract added (+) and removed (-). Focus on th
 - Fix any fact node missing a subject edge (subject=true, importance=1.0) to its primary entity
 - Do not add new nodes or edges beyond corrections and merges"#;
 
+pub const CLASSIFY_TURN: &str = r#"Classify this conversation turn. Answer with exactly one word: TASK or CHAT.
+
+TASK — the turn is one move or step within an ongoing structured task or game (a chess move, a puzzle step, a concrete action in a multi-turn exercise).
+CHAT — anything else: normal conversation, facts, questions, discussion.
+
+When unsure, answer CHAT."#;
+
+pub fn build_classify_prompt(user_msg: &str, assistant_msg: &str) -> String {
+    let mut prompt = String::new();
+    prompt.push_str(CLASSIFY_TURN);
+    prompt.push_str("\n\n## Exchange\n\nUser: ");
+    prompt.push_str(user_msg);
+    prompt.push_str("\nAssistant: ");
+    prompt.push_str(assistant_msg);
+    prompt
+}
+
+pub const SCRIBE_EXPLANATION: &str = r#"You are the episodic scribe: a fast, narrow recorder for one move or step in an ongoing task or game.
+
+- Record only the concrete move(s) or state-change made this turn — verbatim in standard notation where one exists (e.g. chess: "Nc3", "e4").
+- One clean edge per move. Prefer a running move-list: an edge from the game/task node to a move node, content describing exactly what happened.
+- Do not summarize strategy, draw lessons, or restructure existing memory — that is dreaming's job later, not yours.
+- You were not given the graph; do not reference or assume other memory.
+- Every upsert_edge call must set memory_type="episodic" — this is lived experience scoped to this session, not durable knowledge.
+- No respond call; always set date=today on every upsert_edge."#;
+
+pub const SCRIBE_TOOL_DEFINITIONS: &str = r#"TOOLS
+
+upsert_node — create or update a node.
+- type "entity": body="" date="" always
+- type "fact": body is one atomic sentence, no period; date YYYY-MM-DD when event occurred, empty if unknown
+{"tool":"upsert_node","args":{"name":"kebab-case-string","type":"entity | fact","body":"","date":""}}
+
+upsert_edge — create or update a directed edge.
+- content: "<subject> verb <target>"; describe exactly what happened this turn
+- stability: 0.3 (episodic state is temporary)
+- confidence: 1.0 when the move/step is stated clearly
+- importance: 1.0 if needed to reconstruct state, else 0.5
+- subject: false
+- date: always today's date
+- memory_type: always "episodic" for scribe writes
+{"tool":"upsert_edge","args":{"source":"string","target":"string","content":"string","stability":0.3,"confidence":1.0,"importance":0.5,"subject":false,"date":"YYYY-MM-DD","memory_type":"episodic"}}"#;
+
+pub fn build_scribe_prompt(user_msg: &str, assistant_msg: &str) -> String {
+    let mut prompt = String::new();
+    prompt.push_str(SCRIBE_EXPLANATION);
+    prompt.push_str("\n\n**Today's date: ");
+    prompt.push_str(&today_iso());
+    prompt.push_str("**\n\n");
+    prompt.push_str(JSON_OUTPUT_RULES);
+    prompt.push_str("\n\n");
+    prompt.push_str(SCRIBE_TOOL_DEFINITIONS);
+    prompt.push_str("\n\n## Exchange to record\n\nUser: ");
+    prompt.push_str(user_msg);
+    prompt.push_str("\nAssistant: ");
+    prompt.push_str(assistant_msg);
+    prompt
+}
+
 pub const TOOL_DEFINITIONS: &str = r#"TOOLS
 
 upsert_node — create or update a node.
@@ -44,8 +103,7 @@ upsert_edge — create or update a directed edge.
 - importance: 1.0 must load with source, 0.0 supplementary
 - subject: true only on fact nodes; set importance=1.0
 - date: always today's date
-- memory_type: "episodic" for the lived specifics of an ongoing task or game this session (a move played, the current position, what just happened) — ephemeral and scoped to this conversation; "semantic" (the default, may be omitted) for durable facts and general lessons that should outlive the session
-{"tool":"upsert_edge","args":{"source":"string","target":"string","content":"string","stability":0.0,"confidence":0.0,"importance":0.0,"subject":false,"date":"YYYY-MM-DD","memory_type":"semantic | episodic"}}
+{"tool":"upsert_edge","args":{"source":"string","target":"string","content":"string","stability":0.0,"confidence":0.0,"importance":0.0,"subject":false,"date":"YYYY-MM-DD"}}
 
 delete_node — remove a node.
 {"tool":"delete_node","args":{"name":"string"}}
@@ -70,8 +128,6 @@ Implies links: when one fact causally leads to another, edge from first to secon
 Predicates: reuse existing content templates from current memory. Only introduce a new template when none fits. Use <subject> for source, <target> for target, <fact> when target is a fact node.
 
 One-way only. Never add reverse links.
-
-Episodic vs semantic: the concrete state of an ongoing task or game (moves made, the current position, this-session events) is episodic — it is lived experience that decays and stays scoped to this conversation. Durable facts and the general lessons drawn from a task ("attacking the f7 square early is strong") are semantic. Default to semantic; use episodic for the per-move, per-turn specifics.
 
 Never hallucinate. Only store what was explicitly stated.
 

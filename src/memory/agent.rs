@@ -2,7 +2,10 @@ use std::error::Error;
 use std::sync::Arc;
 
 use crate::api::{Chunk, LlmClient, ToolCallRequest};
-use crate::prompts::{CONSOLIDATE_EXPLANATION, EXTRACT_EXPLANATION, build_agent_prompt};
+use crate::prompts::{
+    CONSOLIDATE_EXPLANATION, EXTRACT_EXPLANATION, build_agent_prompt, build_classify_prompt,
+    build_scribe_prompt,
+};
 use crate::runlog;
 use turso::Connection;
 
@@ -64,6 +67,41 @@ pub(crate) enum ToolCall {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnMode {
+    TaskMove,
+    Conversation,
+}
+
+impl TurnMode {
+    fn label(self) -> &'static str {
+        match self {
+            TurnMode::TaskMove => "task",
+            TurnMode::Conversation => "chat",
+        }
+    }
+}
+
+fn classify_turn(llm: &Arc<dyn LlmClient>, user_msg: &str, assistant_msg: &str) -> TurnMode {
+    let prompt = build_classify_prompt(user_msg, assistant_msg);
+    match llm.collect(&prompt) {
+        Ok(reply) => parse_turn_mode(&reply),
+        Err(_) => TurnMode::Conversation,
+    }
+}
+
+fn parse_turn_mode(reply: &str) -> TurnMode {
+    // Bias toward CHAT (the heavy semantic path): a conversation misclassified
+    // as a task would record durable facts as fast-decaying episodic edges —
+    // worse than the reverse — so any mention of CHAT wins the tie.
+    let upper = reply.to_uppercase();
+    if upper.contains("TASK") && !upper.contains("CHAT") {
+        TurnMode::TaskMove
+    } else {
+        TurnMode::Conversation
+    }
+}
+
 pub fn run_memory_agent(
     llm: Arc<dyn LlmClient>,
     user_msg: &str,
@@ -86,6 +124,23 @@ pub fn run_memory_agent(
 
 impl<'run> AgentRun<'run> {
     fn run(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let mode = classify_turn(&self.llm, self.user_msg, self.assistant_msg);
+        self.send_log("mem", format!("turn classified: {}", mode.label()));
+        match mode {
+            TurnMode::TaskMove => self.run_scribe(),
+            TurnMode::Conversation => self.run_heavy(),
+        }
+    }
+
+    fn run_scribe(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let _write_guard = db::acquire_write_lock();
+        let conn = db::open_connection()?;
+        let prompt = build_scribe_prompt(self.user_msg, self.assistant_msg);
+        self.run_pass(&conn, "scribe", prompt, "episodic")?;
+        Ok(())
+    }
+
+    fn run_heavy(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         let _write_guard = db::acquire_write_lock();
         let conn = db::open_connection()?;
         let mut graph = db::load_graph();
@@ -104,7 +159,7 @@ impl<'run> AgentRun<'run> {
             self.assistant_msg,
             None,
         );
-        self.run_pass(&conn, "extract", extract_prompt)?;
+        self.run_pass(&conn, "extract", extract_prompt, "semantic")?;
 
         let post_extract_graph = db::load_graph();
         let diff = db::graph_diff_toon(&pre_extract_graph, &post_extract_graph);
@@ -115,7 +170,7 @@ impl<'run> AgentRun<'run> {
             self.assistant_msg,
             if diff.is_empty() { None } else { Some(&diff) },
         );
-        self.run_pass(&conn, "consolidate", consolidate_prompt)?;
+        self.run_pass(&conn, "consolidate", consolidate_prompt, "semantic")?;
 
         let final_graph = db::load_graph();
         self.send_log(
@@ -134,6 +189,7 @@ impl<'run> AgentRun<'run> {
         conn: &Connection,
         phase: &'static str,
         prompt: String,
+        default_memory_type: &'static str,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.send_log(phase, "calling LLM…".to_string());
         let call_text = match stream_collect(
@@ -154,7 +210,7 @@ impl<'run> AgentRun<'run> {
         } else {
             self.send_log(phase, format!("{} tool calls", tool_calls.len()));
         }
-        if let Err(err) = apply_tool_calls(self, conn, phase, tool_calls) {
+        if let Err(err) = apply_tool_calls(self, conn, phase, tool_calls, default_memory_type) {
             self.send_log(phase, format!("error: {err}"));
             return Err(err);
         }
@@ -605,6 +661,7 @@ fn apply_tool_calls<'agent_run>(
     conn: &Connection,
     phase: &'static str,
     tool_calls: Vec<ToolCall>,
+    default_memory_type: &'static str,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     db::begin_transaction(conn)?;
     let mut events: Vec<Event> = Vec::new();
@@ -615,7 +672,7 @@ fn apply_tool_calls<'agent_run>(
             source_message_id: agent_run.user_message_id,
             event_payload: "",
             confidence_cap: None,
-            default_memory_type: "semantic",
+            default_memory_type,
         };
         for call in tool_calls {
             let description = apply_tool_call(call, conn, &options, &mut events)?;
@@ -881,7 +938,18 @@ fn mutation_context(source_message_id: &str) -> EventContext {
 
 #[cfg(test)]
 mod tests {
-    use super::{ToolCall, parse_tool_calls};
+    use super::{ToolCall, TurnMode, parse_tool_calls, parse_turn_mode};
+
+    #[test]
+    fn turn_mode_parses_task_and_chat_and_defaults_to_conversation() {
+        assert_eq!(parse_turn_mode("TASK"), TurnMode::TaskMove);
+        assert_eq!(parse_turn_mode("task"), TurnMode::TaskMove);
+        assert_eq!(parse_turn_mode("CHAT"), TurnMode::Conversation);
+        assert_eq!(parse_turn_mode("garbage nonsense"), TurnMode::Conversation);
+        assert_eq!(parse_turn_mode(""), TurnMode::Conversation);
+        // Ambiguous replies mentioning both bias to the safe heavy path.
+        assert_eq!(parse_turn_mode("this is chat, not a task"), TurnMode::Conversation);
+    }
 
     #[test]
     fn truncated_tool_array_salvages_complete_objects() {
