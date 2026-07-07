@@ -7,6 +7,9 @@ use crate::session;
 use crate::web::SearchClient;
 
 pub(crate) const RECENT_TURNS: usize = 2;
+// replay-tunable.
+pub(crate) const SCHEDULER_IDLE_TICKS: u64 = 1875; // replay-tunable. ~30 seconds at 62.5fps (1000ms/16ms polling)
+pub(crate) const SCHEDULER_MAX_CONSECUTIVE: u32 = 6;
 
 #[derive(PartialEq)]
 pub(crate) enum Mode {
@@ -99,9 +102,15 @@ pub(crate) struct App {
     pub(crate) ingest_rx: Option<std::sync::mpsc::Receiver<IngestEvent>>,
     pub(crate) ingest_log: Vec<(String, String)>,
     pub(crate) ingest_summary: String,
+    pub(crate) autonomous_mode: bool,
+    pub(crate) scheduler_idle_ticks: u64,
+    pub(crate) scheduler_consecutive_actions: u32,
+    pub(crate) last_activity_tick: u64,
+    pub(crate) scheduler_paused: bool,
 }
 
 impl App {
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn new(
         chat_llm: Arc<dyn LlmClient>,
         memory_llm: Arc<dyn LlmClient>,
@@ -148,6 +157,11 @@ impl App {
             ingest_rx: None,
             ingest_log: Vec::new(),
             ingest_summary: String::new(),
+            autonomous_mode: false,
+            scheduler_idle_ticks: 0,
+            scheduler_consecutive_actions: 0,
+            last_activity_tick: 0,
+            scheduler_paused: false,
         }
     }
 }
@@ -490,4 +504,120 @@ pub(crate) fn second_to_last_content(app: &App) -> String {
         Some(message) => message.content.clone(),
         None => String::new(),
     }
+}
+
+/// Check if everything is idle for scheduler purposes (same as maintenance_allowed but includes memory state)
+pub(crate) fn scheduler_allowed(app: &App) -> bool {
+    app.state == State::Idle
+        && app.memory_state == MemoryState::Idle
+        && app.dream_state != DreamState::Running
+        && app.explore_state != ExploreState::Running
+        && app.ingest_state != IngestState::Running
+}
+
+/// Toggle autonomous mode
+pub(crate) fn toggle_autonomous_mode(app: &mut App) {
+    app.autonomous_mode = !app.autonomous_mode;
+    if app.autonomous_mode {
+        crate::runlog::log("sched", "autonomous mode enabled");
+    } else {
+        crate::runlog::log("sched", "autonomous mode disabled");
+    }
+}
+
+/// Check if scheduler should run on this tick
+/// Returns true if autonomous mode is on, everything is idle, and enough idle ticks have elapsed
+pub(crate) fn should_run_scheduler(app: &App) -> bool {
+    if !app.autonomous_mode {
+        return false;
+    }
+    if app.scheduler_paused {
+        return false;
+    }
+    if !scheduler_allowed(app) {
+        return false;
+    }
+    app.scheduler_idle_ticks >= SCHEDULER_IDLE_TICKS
+}
+
+/// Reset scheduler idle counter (called on any user activity)
+pub(crate) fn reset_scheduler_idle(app: &mut App) {
+    app.scheduler_idle_ticks = 0;
+    app.last_activity_tick = app.tick;
+}
+
+/// Update scheduler state on each tick
+pub(crate) fn update_scheduler_state(app: &mut App) {
+    // If anything is running (not idle), pause the scheduler and reset idle ticks
+    if !scheduler_allowed(app) {
+        app.scheduler_paused = true;
+        app.scheduler_idle_ticks = 0;
+    } else {
+        // Everything is idle again: unpause (a finished pass must not block
+        // the next evaluation) and accumulate idle time.
+        app.scheduler_paused = false;
+        app.scheduler_idle_ticks += 1;
+    }
+
+    // Check if we should run the scheduler
+    if should_run_scheduler(app) {
+        run_scheduler(app);
+    }
+}
+
+/// Run the scheduler decision and dispatch
+fn run_scheduler(app: &mut App) {
+    // Import the scheduler module directly
+    use crate::memory::scheduler;
+
+    // Mark scheduler as paused while deciding/dispatching
+    app.scheduler_paused = true;
+    app.scheduler_idle_ticks = 0;
+
+    // Gather once, decide from the same snapshot.
+    let inputs = scheduler::gather_inputs();
+    let action = scheduler::decide(&inputs);
+
+    // Log the decision
+    scheduler::log_scheduler_decision(&action);
+
+    // Log drift info when actions dispatch
+    if !matches!(action, scheduler::SchedulerAction::Rest { .. }) {
+        scheduler::log_drift_info(&inputs.actor_positions);
+    }
+
+    // Dispatch the action
+    match action {
+        scheduler::SchedulerAction::Dream { reason } => {
+            crate::runlog::log("sched", &format!("dispatching dream: {}", reason));
+            start_dream(app);
+            app.scheduler_consecutive_actions += 1;
+        }
+        scheduler::SchedulerAction::Explore { reason } => {
+            crate::runlog::log("sched", &format!("dispatching explore: {}", reason));
+            start_exploration(app);
+            app.scheduler_consecutive_actions += 1;
+        }
+        scheduler::SchedulerAction::Ingest { path, reason } => {
+            crate::runlog::log("sched", &format!("dispatching ingest: {} ({:?})", reason, path.display()));
+            start_ingestion(app, path);
+            app.scheduler_consecutive_actions += 1;
+        }
+        scheduler::SchedulerAction::Rest { reason } => {
+            crate::runlog::log("sched", &format!("resting: {}", reason));
+            // Rest does not count toward the runaway guard: the guard bounds
+            // API spend, and resting spends nothing — an idle evening of
+            // Rest evaluations must not switch autonomous mode off.
+        }
+    }
+
+    // Check if we've exceeded the maximum consecutive actions
+    if app.scheduler_consecutive_actions >= SCHEDULER_MAX_CONSECUTIVE {
+        app.autonomous_mode = false;
+        crate::runlog::log("sched", &format!("autonomous mode disabled after {} consecutive actions with no user interaction", SCHEDULER_MAX_CONSECUTIVE));
+        app.scheduler_consecutive_actions = 0;
+    }
+
+    // Unpause scheduler - it will be paused again if another action starts
+    app.scheduler_paused = false;
 }

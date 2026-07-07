@@ -81,7 +81,7 @@ async fn open_local() -> Database {
         .await
         .expect("open db");
     let conn = database.connect().expect("db connect");
-    init_schema(&conn).await.expect("init schema");
+    init_schema(&conn, true).await.expect("init schema");
     database
 }
 
@@ -95,7 +95,7 @@ async fn open_synced(url: &str, token: &str) -> turso::sync::Database {
         .await
         .expect("open synced db");
     let conn = database.connect().await.expect("synced db connect");
-    init_schema(&conn).await.expect("init schema");
+    init_schema(&conn, false).await.expect("init schema");
     if let Err(err) = migrate_legacy_if_empty(&conn).await {
         crate::runlog::log("sync", &format!("legacy migration failed: {err}"));
     }
@@ -137,14 +137,41 @@ pub fn sync_enabled() -> bool {
     matches!(database(), DbHandle::Synced(_))
 }
 
+// Last sync failure, for the TUI status line. Background passes push from
+// their own threads, so this cell is the handoff point to the renderer.
+// Set on failure, cleared by the next success.
+fn sync_error_cell() -> &'static std::sync::Mutex<Option<String>> {
+    static SYNC_ERROR: OnceLock<std::sync::Mutex<Option<String>>> = OnceLock::new();
+    SYNC_ERROR.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn record_sync_outcome(error: Option<String>) {
+    if let Ok(mut cell) = sync_error_cell().lock() {
+        *cell = error;
+    }
+}
+
+pub fn last_sync_error() -> Option<String> {
+    match sync_error_cell().lock() {
+        Ok(cell) => cell.clone(),
+        Err(_) => None,
+    }
+}
+
 // Best-effort push for the end of background write passes and app exit.
 pub fn sync_push_best_effort(context: &str) {
     if !sync_enabled() {
         return;
     }
     match sync_push() {
-        Ok(()) => crate::runlog::log("sync", &format!("push ok ({context})")),
-        Err(err) => crate::runlog::log("sync", &format!("push failed ({context}): {err}")),
+        Ok(()) => {
+            crate::runlog::log("sync", &format!("push ok ({context})"));
+            record_sync_outcome(None);
+        }
+        Err(err) => {
+            crate::runlog::log("sync", &format!("push failed ({context}): {err}"));
+            record_sync_outcome(Some(format!("push failed ({context})")));
+        }
     }
 }
 
@@ -154,8 +181,14 @@ pub fn sync_pull_best_effort() {
         return;
     }
     match sync_pull() {
-        Ok(changed) => crate::runlog::log("sync", &format!("pull ok — changed: {changed}")),
-        Err(err) => crate::runlog::log("sync", &format!("pull failed: {err}")),
+        Ok(changed) => {
+            crate::runlog::log("sync", &format!("pull ok — changed: {changed}"));
+            record_sync_outcome(None);
+        }
+        Err(err) => {
+            crate::runlog::log("sync", &format!("pull failed: {err}"));
+            record_sync_outcome(Some("pull failed".to_string()));
+        }
     }
 }
 
@@ -165,14 +198,22 @@ pub fn sync_now() -> String {
     if !sync_enabled() {
         return "sync disabled (no Turso Cloud credentials)".to_string();
     }
+    let mut failure = None;
     let pull_summary = match sync_pull() {
         Ok(changed) => format!("pull ok (changed: {changed})"),
-        Err(err) => format!("pull failed: {err}"),
+        Err(err) => {
+            failure = Some("pull failed (manual sync)".to_string());
+            format!("pull failed: {err}")
+        }
     };
     let push_summary = match sync_push() {
         Ok(()) => "push ok".to_string(),
-        Err(err) => format!("push failed: {err}"),
+        Err(err) => {
+            failure = Some("push failed (manual sync)".to_string());
+            format!("push failed: {err}")
+        }
     };
+    record_sync_outcome(failure);
     let summary = format!("{pull_summary} · {push_summary}");
     crate::runlog::log("sync", &summary);
     summary
@@ -274,9 +315,12 @@ pub fn acquire_write_lock() -> std::sync::MutexGuard<'static, ()> {
     }
 }
 
-async fn init_schema(conn: &Connection) -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn init_schema(
+    conn: &Connection,
+    create_fts_index: bool,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     create_base_tables(conn).await?;
-    create_history_tables(conn).await?;
+    create_history_tables(conn, create_fts_index).await?;
     add_edge_columns(conn).await;
     add_ledger_tables(conn).await;
     drop_node_agent_views_table(conn).await;
@@ -300,7 +344,10 @@ async fn create_base_tables(conn: &Connection) -> Result<(), Box<dyn Error + Sen
     Ok(())
 }
 
-async fn create_history_tables(conn: &Connection) -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn create_history_tables(
+    conn: &Connection,
+    create_fts_index: bool,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, session_type TEXT NOT NULL DEFAULT 'conversation', created_at TEXT NOT NULL DEFAULT '')",
         (),
@@ -311,9 +358,13 @@ async fn create_history_tables(conn: &Connection) -> Result<(), Box<dyn Error + 
         (),
     )
     .await?;
-    // fts index has no IF NOT EXISTS in turso — and re-running the CREATE
-    // pollutes the sync change log with DDL the cloud server cannot parse
-    // (every first push after app start failed on it). Check first.
+    // The FTS index is local-mode only. The cloud server cannot parse
+    // `CREATE INDEX … USING fts` DDL: a push carrying it fails, and a pull
+    // can clobber the local index record, restarting the cycle on every
+    // machine. In synced mode message search falls back to LIKE.
+    if !create_fts_index {
+        return Ok(());
+    }
     if !fts_index_exists(conn).await {
         let _ = conn
             .execute(
@@ -1084,18 +1135,49 @@ pub fn search_messages_fts(queries: &[String]) -> String {
     let Ok(conn) = open_connection() else {
         return String::new();
     };
-    runtime().block_on(search_messages_fts_async(&conn, &fts_query))
+    runtime().block_on(search_messages_async(&conn, &fts_query, queries))
 }
 
-async fn search_messages_fts_async(conn: &Connection, fts_query: &str) -> String {
-    let mut lines = Vec::new();
-    let Ok(mut rows) = conn.query(
+// MATCH needs the FTS index, which exists only in local mode (the cloud
+// server cannot store its DDL) — synced mode falls back to LIKE.
+async fn search_messages_async(conn: &Connection, fts_query: &str, queries: &[String]) -> String {
+    let rows = conn.query(
         "SELECT id, role, content, created_at FROM messages WHERE content MATCH ?1 ORDER BY created_at DESC LIMIT 10",
         params![fts_query],
     )
-    .await else {
+    .await;
+    match rows {
+        Ok(rows) => collect_message_rows(rows).await,
+        Err(_) => search_messages_like(conn, queries).await,
+    }
+}
+
+async fn search_messages_like(conn: &Connection, queries: &[String]) -> String {
+    let mut clauses = Vec::new();
+    let mut values: Vec<Value> = Vec::new();
+    for query in queries {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        clauses.push(format!("content LIKE ?{}", values.len() + 1));
+        values.push(Value::Text(format!("%{trimmed}%")));
+    }
+    if clauses.is_empty() {
+        return String::new();
+    }
+    let sql = format!(
+        "SELECT id, role, content, created_at FROM messages WHERE {} ORDER BY created_at DESC LIMIT 10",
+        clauses.join(" OR ")
+    );
+    let Ok(rows) = conn.query(&sql, turso::params_from_iter(values)).await else {
         return String::new();
     };
+    collect_message_rows(rows).await
+}
+
+async fn collect_message_rows(mut rows: turso::Rows) -> String {
+    let mut lines = Vec::new();
     while let Ok(Some(row)) = rows.next().await {
         let Some(line) = format_message_search_row(&row) else {
             continue;
@@ -1382,7 +1464,7 @@ pub(crate) fn real(val: Value) -> f64 {
     }
 }
 
-fn int(val: Value) -> i64 {
+pub(crate) fn int(val: Value) -> i64 {
     match val {
         Value::Integer(int) => int,
         _ => 0,

@@ -22,6 +22,8 @@ const TABLES: &[&str] = &[
 
 #[allow(clippy::expect_used)]
 fn main() {
+    // Same cwd pinning as the main binary: data paths are relative.
+    let _ = std::env::set_current_dir(env!("CARGO_MANIFEST_DIR"));
     let rt = Runtime::new().expect("tokio runtime");
     // Prefer the Turso-Cloud-synced file when it exists (read-only browsing
     // of the file the app actually uses in synced mode).

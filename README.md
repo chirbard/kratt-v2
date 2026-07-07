@@ -46,6 +46,12 @@ Notes:
   SQL shell and data browser; the local inspector
   (`cargo run --bin inspector`, http://127.0.0.1:7070) still works and reads
   whichever file the app uses.
+- Message full-text search degrades in synced mode: the cloud server cannot
+  parse the `CREATE INDEX … USING fts` DDL (pushes carrying it fail, and pulls
+  can drop the local index record), so the FTS index is created in local mode
+  only and synced-mode history search falls back to LIKE.
+- Sync failures show as a red `⚠ sync` warning in the status line; press S to
+  retry. The warning clears on the next successful sync.
 
 ## using cargo-modules to see boundary violations
 

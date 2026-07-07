@@ -58,9 +58,15 @@ fn handle_normal_key(key: KeyEvent, app: &mut App) -> bool {
         KeyCode::Char('D') if maintenance_allowed(app) => app::start_dream(app),
         KeyCode::Char('E') if maintenance_allowed(app) => app::start_exploration(app),
         KeyCode::Char('S') if maintenance_allowed(app) => app::start_sync(app),
+        KeyCode::Char('A') => toggle_autonomous_mode(app),
         _ => {}
     }
     false
+}
+
+fn toggle_autonomous_mode(app: &mut App) {
+    app::toggle_autonomous_mode(app);
+    app::reset_scheduler_idle(app);
 }
 
 // Background maintenance actions (recompute, dream, explore, sync) are

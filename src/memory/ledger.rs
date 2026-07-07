@@ -681,7 +681,7 @@ async fn load_actor_direction_async(
     Ok(normalized_vector(&delta))
 }
 
-fn parse_vector_blob(value: Value) -> Option<Vec<f64>> {
+pub(crate) fn parse_vector_blob(value: Value) -> Option<Vec<f64>> {
     let json_text = db::text(value);
     if json_text.is_empty() {
         return None;
@@ -818,7 +818,7 @@ async fn snapshot_position(
     Ok(())
 }
 
-fn cosine_distance(left: &[f64], right: &[f64]) -> Result<f64, Box<dyn Error + Send + Sync>> {
+pub(crate) fn cosine_distance(left: &[f64], right: &[f64]) -> Result<f64, Box<dyn Error + Send + Sync>> {
     if left.len() != right.len() {
         return Err("position vector dimension mismatch".into());
     }

@@ -57,6 +57,9 @@ fn run_loop(terminal: &mut Term, app: &mut App) -> Result<(), Box<dyn std::error
             && key.kind == KeyEventKind::Press
             && input::handle_key(key, app)
         {
+            // Any keypress resets scheduler idle counter and consecutive actions
+            app::reset_scheduler_idle(app);
+            app.scheduler_consecutive_actions = 0;
             break;
         }
         drain_stream(app);
@@ -65,6 +68,10 @@ fn run_loop(terminal: &mut Term, app: &mut App) -> Result<(), Box<dyn std::error
         drain_explore(app);
         drain_ingest(app);
         drain_embed(app);
+        
+        // Update scheduler state on each tick
+        app::update_scheduler_state(app);
+        
         app.tick += 1;
         terminal.draw(|frame| render::render(frame, app))?;
     }

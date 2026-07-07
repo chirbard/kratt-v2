@@ -26,6 +26,10 @@ const DEFAULT_MEMORY_MODEL: &str = "openai/gpt-oss-20b:nitro";
 const DEFAULT_EMBED_MODEL: &str = "perplexity/pplx-embed-v1-0.6b";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // All data paths (kratt-data/, logs, .env) are relative — pin the working
+    // directory to the crate root so `cargo run` from a subdirectory doesn't
+    // scatter kratt-data/ copies around the repo.
+    std::env::set_current_dir(env!("CARGO_MANIFEST_DIR"))?;
     dotenvy::dotenv()?;
     let api_key = std::env::var("OPENROUTER_API_KEY")?;
     let tavily_key = std::env::var("TAVILY_API_KEY").unwrap_or_default();

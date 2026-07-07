@@ -188,6 +188,17 @@ fn render_stats(frame: &mut Frame, area: Rect, app: &App) {
     append_dream_status(&mut text, app);
     append_explore_status(&mut text, app);
     append_ingest_status(&mut text, app);
+    if let Some(sync_error) = crate::memory::last_sync_error() {
+        let line = Line::from(vec![
+            Span::styled(text, Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("  ⚠ sync: {sync_error} — press S to retry"),
+                Style::default().fg(Color::Red),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
     let widget = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(widget, area);
 }
@@ -283,8 +294,9 @@ fn normal_mode_hint(app: &App) -> String {
         app.ingest_state == IngestState::Running,
         app.ingest_state == IngestState::Done,
     );
+    let auto_hint = autonomous_mode_hint(app.autonomous_mode, app.scheduler_paused);
     format!(
-        "-- NORMAL --  {mem_hint}  {rea_hint}  {dbg_hint}  {tool_hint}  {attr_hint}  {dream_hint}  {explore_hint}  {ingest_hint}  [S] sync"
+        "-- NORMAL --  {mem_hint}  {rea_hint}  {dbg_hint}  {tool_hint}  {attr_hint}  {dream_hint}  {explore_hint}  {ingest_hint}  [S] sync  {auto_hint}"
     )
 }
 
@@ -324,6 +336,17 @@ fn ingest_hint(running: bool, done: bool) -> &'static str {
         return "/ingest ✓";
     }
     "/ingest"
+}
+
+fn autonomous_mode_hint(enabled: bool, paused: bool) -> String {
+    if !enabled {
+        return "[A] auto".to_string();
+    }
+    if paused {
+        "[A] auto (paused)".to_string()
+    } else {
+        "[A] auto ✓".to_string()
+    }
 }
 
 fn build_output_text(app: &App) -> Text<'static> {
