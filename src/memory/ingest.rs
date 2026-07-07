@@ -376,6 +376,7 @@ fn apply_ingest_mutation<'scope>(
         source_message_id: study.source_message_id,
         event_payload: &payload,
         confidence_cap,
+        default_memory_type: "semantic",
     };
     agent::apply_tool_call(tool_call, study.conn, &options, study.events)
 }
@@ -511,6 +512,8 @@ fn execute_note_curiosity<'scope>(
         date: timeutil::today_iso(),
         occurred_at: None,
         expired_at: None,
+        memory_type: "semantic".to_string(),
+        origin_session: String::new(),
     };
     let existed = db::load_edge(study.conn, &edge.source, &edge.target)?.is_some();
     db::write_edge(study.conn, &edge, study.source_message_id)?;
@@ -562,6 +565,8 @@ fn record_skipped_chunk(
             date: timeutil::today_iso(),
             occurred_at: None,
             expired_at: None,
+            memory_type: "semantic".to_string(),
+            origin_session: String::new(),
         };
         let existed = db::load_edge(conn, &edge.source, &edge.target)?.is_some();
         db::write_edge(conn, &edge, source_message_id)?;

@@ -21,6 +21,8 @@ pub type SemanticEdgeRow = (
     String,
     Option<String>,
     Option<String>,
+    String,
+    String,
     Option<Vec<f64>>,
 );
 
@@ -226,7 +228,7 @@ const MIGRATE_TABLES: [(&str, &str); 9] = [
     ("nodes", "id, node_type, body, date"),
     (
         "edges",
-        "source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, source_message_id, embedding",
+        "source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, source_message_id, embedding, memory_type, origin_session",
     ),
     ("meta", "key, value"),
     ("sessions", "id, session_type, created_at"),
@@ -333,7 +335,7 @@ async fn create_base_tables(conn: &Connection) -> Result<(), Box<dyn Error + Sen
         (),
     ).await?;
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, PRIMARY KEY (source, target))",
+        "CREATE TABLE IF NOT EXISTS edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', PRIMARY KEY (source, target))",
         (),
     ).await?;
     conn.execute(
@@ -414,6 +416,22 @@ async fn add_edge_columns(conn: &Connection) {
     add_edge_provenance_column(conn).await;
     add_edge_embedding_column(conn).await;
     add_edge_time_columns(conn).await;
+    add_edge_memory_type_columns(conn).await;
+}
+
+async fn add_edge_memory_type_columns(conn: &Connection) {
+    let _ = conn
+        .execute(
+            "ALTER TABLE edges ADD COLUMN memory_type TEXT NOT NULL DEFAULT 'semantic'",
+            (),
+        )
+        .await;
+    let _ = conn
+        .execute(
+            "ALTER TABLE edges ADD COLUMN origin_session TEXT NOT NULL DEFAULT ''",
+            (),
+        )
+        .await;
 }
 
 async fn add_ledger_tables(conn: &Connection) {
@@ -554,7 +572,7 @@ async fn load_nodes(conn: &Connection, graph: &mut Graph) {
 async fn load_edges(conn: &Connection, graph: &mut Graph) {
     let Ok(mut rows) = conn
         .query(
-            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at FROM edges",
+            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session FROM edges",
             (),
         )
         .await
@@ -585,6 +603,8 @@ async fn load_edges(conn: &Connection, graph: &mut Graph) {
             date: text(date),
             occurred_at: optional_text(row.get_value(8).ok()),
             expired_at: optional_text(row.get_value(9).ok()),
+            memory_type: text_or(row.get_value(10), "semantic"),
+            origin_session: text_or(row.get_value(11), ""),
         });
     }
 }
@@ -635,7 +655,7 @@ pub fn write_edge(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     runtime().block_on(async {
         conn.execute(
-            "INSERT OR REPLACE INTO edges (source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, source_message_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT OR REPLACE INTO edges (source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, source_message_id, memory_type, origin_session) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 edge.source.as_str(),
                 edge.target.as_str(),
@@ -648,6 +668,8 @@ pub fn write_edge(
                 edge.occurred_at.as_deref(),
                 edge.expired_at.as_deref(),
                 source_message_id,
+                edge.memory_type.as_str(),
+                edge.origin_session.as_str(),
             ],
         )
         .await?;
@@ -735,7 +757,7 @@ async fn load_edge_async(
 ) -> Result<Option<Edge>, Box<dyn Error + Send + Sync>> {
     let mut rows = conn
         .query(
-            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at FROM edges WHERE source = ?1 AND target = ?2 LIMIT 1",
+            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session FROM edges WHERE source = ?1 AND target = ?2 LIMIT 1",
             params![source, target],
         )
         .await?;
@@ -751,7 +773,7 @@ async fn load_edges_for_node_async(
 ) -> Result<Vec<Edge>, Box<dyn Error + Send + Sync>> {
     let mut rows = conn
         .query(
-            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at FROM edges WHERE source = ?1 OR target = ?1",
+            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session FROM edges WHERE source = ?1 OR target = ?1",
             params![node_id],
         )
         .await?;
@@ -843,7 +865,7 @@ async fn query_edges_ann(
 ) -> Result<Vec<SemanticEdgeRow>, Box<dyn Error + Send + Sync>> {
     execute_semantic_query(
         conn,
-        "SELECT e.source, e.target, e.content, e.stability, e.confidence, e.importance, e.subject, e.date, e.occurred_at, e.expired_at, vector_extract(e.embedding) FROM vector_top_k('edges_vec', vector32(?1), ?2) AS vt JOIN edges AS e ON e.rowid = vt.id WHERE e.expired_at IS NULL",
+        "SELECT e.source, e.target, e.content, e.stability, e.confidence, e.importance, e.subject, e.date, e.occurred_at, e.expired_at, e.memory_type, e.origin_session, vector_extract(e.embedding) FROM vector_top_k('edges_vec', vector32(?1), ?2) AS vt JOIN edges AS e ON e.rowid = vt.id WHERE e.expired_at IS NULL",
         json_str,
         limit,
     )
@@ -857,7 +879,7 @@ async fn query_edges_scan(
 ) -> Result<Vec<SemanticEdgeRow>, Box<dyn Error + Send + Sync>> {
     execute_semantic_query(
         conn,
-        "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, vector_extract(embedding) FROM edges WHERE embedding IS NOT NULL AND expired_at IS NULL ORDER BY vector_distance_cos(embedding, vector32(?1)) LIMIT ?2",
+        "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session, vector_extract(embedding) FROM edges WHERE embedding IS NOT NULL AND expired_at IS NULL ORDER BY vector_distance_cos(embedding, vector32(?1)) LIMIT ?2",
         json_str,
         limit,
     )
@@ -883,7 +905,7 @@ async fn execute_semantic_query(
 
 fn parse_semantic_edge_row(row: &turso::Row) -> Option<SemanticEdgeRow> {
     let edge = parse_edge_row(row)?;
-    let embedding = parse_optional_vector32(row.get_value(10).ok());
+    let embedding = parse_optional_vector32(row.get_value(12).ok());
     Some((
         edge.source,
         edge.target,
@@ -895,6 +917,8 @@ fn parse_semantic_edge_row(row: &turso::Row) -> Option<SemanticEdgeRow> {
         edge.date,
         edge.occurred_at,
         edge.expired_at,
+        edge.memory_type,
+        edge.origin_session,
         embedding,
     ))
 }
@@ -909,7 +933,7 @@ pub fn load_all_edges_semantic() -> Vec<SemanticEdgeRow> {
 async fn load_all_edges_semantic_async(conn: &Connection) -> Vec<SemanticEdgeRow> {
     let Ok(mut rows) = conn
         .query(
-            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, CASE WHEN embedding IS NULL THEN NULL ELSE vector_extract(embedding) END FROM edges WHERE expired_at IS NULL",
+            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session, CASE WHEN embedding IS NULL THEN NULL ELSE vector_extract(embedding) END FROM edges WHERE expired_at IS NULL",
             (),
         )
         .await
@@ -1032,7 +1056,7 @@ async fn insert_graph_edge(
     edge: &Edge,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     conn.execute(
-        "INSERT INTO edges (source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, source_message_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        "INSERT INTO edges (source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, source_message_id, memory_type, origin_session) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             edge.source.as_str(),
             edge.target.as_str(),
@@ -1045,6 +1069,8 @@ async fn insert_graph_edge(
             edge.occurred_at.as_deref(),
             edge.expired_at.as_deref(),
             "",
+            edge.memory_type.as_str(),
+            edge.origin_session.as_str(),
         ],
     )
     .await?;
@@ -1477,7 +1503,16 @@ fn parse_edge_row(row: &turso::Row) -> Option<Edge> {
         date: text(row.get_value(7).ok()?),
         occurred_at: optional_text(row.get_value(8).ok()),
         expired_at: optional_text(row.get_value(9).ok()),
+        memory_type: text_or(row.get_value(10), "semantic"),
+        origin_session: text_or(row.get_value(11), ""),
     })
+}
+
+fn text_or(value: Result<Value, turso::Error>, default: &str) -> String {
+    match value {
+        Ok(Value::Text(text)) => text,
+        _ => default.to_string(),
+    }
 }
 
 fn optional_text(value: Option<Value>) -> Option<String> {

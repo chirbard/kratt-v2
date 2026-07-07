@@ -164,11 +164,11 @@ fn build_domain_toons(
     global_toon: &str,
     session_id: &str,
 ) -> DomainToons {
-    let biologist = exploration_subgraph(embed, BIOLOGIST_ANCHOR, DOMAIN_AGENT_NAMES[0]);
+    let biologist = exploration_subgraph(embed, BIOLOGIST_ANCHOR, DOMAIN_AGENT_NAMES[0], session_id);
     record_domain_views(DOMAIN_AGENT_NAMES[0], &biologist, session_id);
-    let historian = exploration_subgraph(embed, HISTORIAN_ANCHOR, DOMAIN_AGENT_NAMES[1]);
+    let historian = exploration_subgraph(embed, HISTORIAN_ANCHOR, DOMAIN_AGENT_NAMES[1], session_id);
     record_domain_views(DOMAIN_AGENT_NAMES[1], &historian, session_id);
-    let economist = exploration_subgraph(embed, ECONOMIST_ANCHOR, DOMAIN_AGENT_NAMES[2]);
+    let economist = exploration_subgraph(embed, ECONOMIST_ANCHOR, DOMAIN_AGENT_NAMES[2], session_id);
     record_domain_views(DOMAIN_AGENT_NAMES[2], &economist, session_id);
     DomainToons {
         biologist: embed::edges_to_toon(&biologist),
@@ -182,8 +182,9 @@ fn exploration_subgraph(
     embed: &dyn EmbeddingClient,
     anchor: &str,
     agent_name: &str,
+    session_id: &str,
 ) -> Vec<SemanticEdge> {
-    embed::select_exploration_edges(embed, anchor, agent_name)
+    embed::select_exploration_edges(embed, anchor, agent_name, session_id)
 }
 
 // Best-effort bookkeeping: a failed ledger write must never abort the dream.
@@ -383,6 +384,7 @@ fn apply_dream_call<'scope, 'policy>(
             importance,
             subject,
             date,
+            memory_type: _,
         } => apply_dream_upsert_edge(
             ctx,
             DreamEdgeCall {
@@ -413,7 +415,23 @@ fn apply_dream_call<'scope, 'policy>(
             ctx,
             DreamExpireEdgeCall::new(source, target, rewritten_content),
         ),
+        ToolCall::PromoteEdge { source, target } => apply_dream_promote_edge(ctx, source, target),
     }
+}
+
+fn apply_dream_promote_edge<'scope, 'policy>(
+    ctx: &mut DreamCallContext<'scope, 'policy>,
+    source: String,
+    target: String,
+) -> Result<(String, bool), Box<dyn Error + Send + Sync>> {
+    let description = super::agent::apply_promote_edge(
+        ctx.conn,
+        EdgeRef::new(&source, &target),
+        Actor::new("system", "consolidation"),
+        EventContext::new(ctx.source_id, ""),
+        ctx.events,
+    )?;
+    Ok((description, false))
 }
 
 struct DreamApplyState<'policy> {
@@ -521,6 +539,8 @@ fn apply_dream_upsert_edge<'scope, 'policy>(
         date: edge_call.date,
         occurred_at: None,
         expired_at: None,
+        memory_type: "semantic".to_string(),
+        origin_session: String::new(),
     };
     db::write_edge(ctx.conn, &edge, ctx.source_id)?;
     ctx.events.push(Event::upsert(

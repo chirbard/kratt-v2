@@ -23,6 +23,19 @@ pub struct Edge {
     pub subject: bool,
     pub occurred_at: Option<String>,
     pub expired_at: Option<String>,
+    // "episodic" | "semantic" — episodic edges are lived experience scoped to
+    // origin_session; semantic edges are durable beliefs. Anti-contamination
+    // across sessions comes from retrieval scoping (embed.rs), not decay.
+    pub memory_type: String,
+    pub origin_session: String,
+}
+
+pub fn normalize_memory_type(raw: &str) -> String {
+    if raw == "episodic" {
+        "episodic".to_string()
+    } else {
+        "semantic".to_string()
+    }
 }
 
 #[derive(Clone)]
@@ -111,6 +124,8 @@ fn parse_toon_edge(fields: &[String]) -> Option<Edge> {
         target: normalize_id(&fields[col + 3]),
         occurred_at: None,
         expired_at: None,
+        memory_type: "semantic".to_string(),
+        origin_session: String::new(),
     })
 }
 
@@ -211,4 +226,26 @@ pub fn graph_to_json(graph: &Graph) -> serde_json::Value {
         "nodes": nodes_json,
         "edges": edges_json,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_memory_type;
+
+    #[test]
+    fn normalize_memory_type_accepts_episodic() {
+        assert_eq!(normalize_memory_type("episodic"), "episodic");
+    }
+
+    #[test]
+    fn normalize_memory_type_accepts_semantic() {
+        assert_eq!(normalize_memory_type("semantic"), "semantic");
+    }
+
+    #[test]
+    fn normalize_memory_type_rejects_garbage_to_semantic() {
+        assert_eq!(normalize_memory_type("durable"), "semantic");
+        assert_eq!(normalize_memory_type(""), "semantic");
+        assert_eq!(normalize_memory_type("Episodic"), "semantic");
+    }
 }

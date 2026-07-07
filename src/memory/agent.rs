@@ -42,6 +42,9 @@ pub(crate) enum ToolCall {
         importance: f64,
         subject: bool,
         date: String,
+        // None means the caller did not specify memory_type — the writer's
+        // default (ApplyToolOptions::default_memory_type) applies.
+        memory_type: Option<String>,
     },
     DeleteNode {
         name: String,
@@ -54,6 +57,10 @@ pub(crate) enum ToolCall {
         source: String,
         target: String,
         rewritten_content: String,
+    },
+    PromoteEdge {
+        source: String,
+        target: String,
     },
 }
 
@@ -346,6 +353,7 @@ fn parse_single_tool(obj: &serde_json::Value) -> Option<ToolCall> {
         "delete_node" => parse_delete_node(args),
         "delete_edge" => parse_delete_edge(args),
         "expire_edge" => parse_expire_edge(args),
+        "promote_edge" => parse_promote_edge(args),
         _ => None,
     }
 }
@@ -370,6 +378,7 @@ pub(crate) fn parse_tool_call_request(call: &ToolCallRequest) -> Option<ToolCall
         "delete_node" => parse_delete_node(&args),
         "delete_edge" => parse_delete_edge(&args),
         "expire_edge" => parse_expire_edge(&args),
+        "promote_edge" => parse_promote_edge(&args),
         _ => None,
     }
 }
@@ -404,7 +413,8 @@ pub(crate) fn memory_mutation_tools() -> serde_json::Value {
                     "confidence": {"type": "number"},
                     "importance": {"type": "number"},
                     "subject": {"type": "boolean"},
-                    "date": {"type": "string"}
+                    "date": {"type": "string"},
+                    "memory_type": {"type": "string", "enum": ["episodic", "semantic"]}
                 },
                 "required": ["source", "target", "content", "stability", "confidence", "importance", "subject", "date"]
             }),
@@ -504,7 +514,17 @@ fn parse_upsert_edge(args: &serde_json::Value) -> Option<ToolCall> {
         importance: json_f64(args, "importance"),
         subject: json_bool(args, "subject"),
         date,
+        memory_type: json_opt_str(args, "memory_type"),
     })
+}
+
+fn parse_promote_edge(args: &serde_json::Value) -> Option<ToolCall> {
+    let source = json_str(args, "source");
+    let target = json_str(args, "target");
+    if source.is_empty() || target.is_empty() {
+        return None;
+    }
+    Some(ToolCall::PromoteEdge { source, target })
 }
 
 fn parse_delete_node(args: &serde_json::Value) -> Option<ToolCall> {
@@ -548,6 +568,11 @@ fn json_str(obj: &serde_json::Value, key: &str) -> String {
     }
 }
 
+fn json_opt_str(obj: &serde_json::Value, key: &str) -> Option<String> {
+    let text = obj.get(key)?.as_str()?;
+    Some(text.to_string())
+}
+
 fn json_bool(obj: &serde_json::Value, key: &str) -> bool {
     let Some(value) = obj.get(key) else {
         return false;
@@ -568,6 +593,11 @@ pub(crate) struct ApplyToolOptions<'scope> {
     pub source_message_id: &'scope str,
     pub event_payload: &'scope str,
     pub confidence_cap: Option<f64>,
+    // memory_type an upsert_edge call gets when it doesn't specify one
+    // itself. Chat and ingestion write durable belief ("semantic"— lived
+    // experience is not yet knowledge); exploration/task sessions write
+    // lived experience by default ("episodic").
+    pub default_memory_type: &'static str,
 }
 
 fn apply_tool_calls<'agent_run>(
@@ -585,6 +615,7 @@ fn apply_tool_calls<'agent_run>(
             source_message_id: agent_run.user_message_id,
             event_payload: "",
             confidence_cap: None,
+            default_memory_type: "semantic",
         };
         for call in tool_calls {
             let description = apply_tool_call(call, conn, &options, &mut events)?;
@@ -612,14 +643,16 @@ pub(crate) fn apply_tool_call<'scope>(
     match call {
         ToolCall::UpsertNode { name, node_type, body, date } =>
             apply_upsert_node(conn, name, node_type, body, date),
-        ToolCall::UpsertEdge { source, target, content, stability, confidence, importance, subject, date } =>
-            apply_upsert_edge_call(conn, options, events, UpsertEdgeCall { source, target, content, stability, confidence, importance, subject, date }),
+        ToolCall::UpsertEdge { source, target, content, stability, confidence, importance, subject, date, memory_type } =>
+            apply_upsert_edge_call(conn, options, events, UpsertEdgeCall { source, target, content, stability, confidence, importance, subject, date, memory_type }),
         ToolCall::DeleteNode { name } =>
             apply_delete_node(conn, name, options, events),
         ToolCall::DeleteEdge { source, target } =>
             apply_delete_edge(conn, EdgeRef::new(&source, &target), options, events),
         ToolCall::ExpireEdge { source, target, rewritten_content } =>
             apply_expire_edge(conn, ExpireEdgeCall { source, target, rewritten_content }, options, events),
+        ToolCall::PromoteEdge { source, target } =>
+            apply_promote_edge(conn, EdgeRef::new(&source, &target), options.actor.clone(), options.context.clone(), events),
     }
 }
 
@@ -673,6 +706,7 @@ struct UpsertEdgeCall {
     importance: f64,
     subject: bool,
     date: String,
+    memory_type: Option<String>,
 }
 
 fn apply_upsert_edge_call<'scope>(
@@ -684,6 +718,15 @@ fn apply_upsert_edge_call<'scope>(
     if let Some(confidence_cap) = options.confidence_cap {
         call.confidence = call.confidence.min(confidence_cap);
     }
+    let memory_type = match call.memory_type {
+        Some(requested) => super::graph::normalize_memory_type(&requested),
+        None => options.default_memory_type.to_string(),
+    };
+    let origin_session = if memory_type == "episodic" {
+        options.context.session_id.clone()
+    } else {
+        String::new()
+    };
     let edge = Edge {
         source: normalize_id(&call.source),
         target: normalize_id(&call.target),
@@ -695,7 +738,18 @@ fn apply_upsert_edge_call<'scope>(
         date: call.date,
         occurred_at: None,
         expired_at: None,
+        memory_type,
+        origin_session,
     };
+    if edge.memory_type == "episodic" {
+        runlog::log(
+            "mem",
+            &format!(
+                "episodic edge {} → {} (session {})",
+                edge.source, edge.target, edge.origin_session
+            ),
+        );
+    }
     apply_upsert_edge(conn, edge, options, events)
 }
 
@@ -742,6 +796,43 @@ fn apply_upsert_edge<'scope>(
     };
     events.push(event);
     Ok(format!("upsert_edge: {} → {}", edge.source, edge.target))
+}
+
+// Dreaming's promotion path: an episodic edge that kept being reinforced or
+// that synthesis built on becomes a durable belief. Flips memory_type,
+// clears origin_session (it is no longer session-scoped), and refreshes
+// date so semantic decay restarts from the promotion point. Reused by both
+// the chat/explore/ingest tool-call path and dream's consolidation agent.
+pub(crate) fn apply_promote_edge(
+    conn: &Connection,
+    edge_ref: EdgeRef,
+    actor: Actor,
+    context: EventContext,
+    events: &mut Vec<Event>,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let EdgeRef { source, target } = edge_ref;
+    let normalized_source = normalize_id(&source);
+    let normalized_target = normalize_id(&target);
+    let Some(mut edge) = db::load_edge(conn, &normalized_source, &normalized_target)? else {
+        return Ok(format!(
+            "promote_edge skipped: {source} → {target} (not found)"
+        ));
+    };
+    edge.memory_type = "semantic".to_string();
+    edge.origin_session = String::new();
+    edge.date = crate::prompts::today_iso();
+    db::write_edge(conn, &edge, "")?;
+    events.push(Event::updated(
+        actor,
+        EdgeRef::new(&edge.source, &edge.target),
+        context,
+        serde_json::json!({"promoted_from": "episodic"}).to_string(),
+    ));
+    runlog::log(
+        "mem",
+        &format!("promoted {} → {} to semantic", edge.source, edge.target),
+    );
+    Ok(format!("promote_edge: {} → {}", edge.source, edge.target))
 }
 
 fn apply_delete_node<'scope>(

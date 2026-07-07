@@ -115,6 +115,8 @@ fn load_live_edges() -> Vec<ClusterEdge> {
         date,
         occurred_at,
         expired_at,
+        _memory_type,
+        _origin_session,
         _embedding,
     ) in rows
     {
@@ -586,6 +588,17 @@ fn normalize_call(call: &ToolCall, confidence: f64) -> ToolCall {
         ToolCall::DeleteEdge { .. } => normalize_delete_edge(call),
         ToolCall::DeleteNode { .. } => normalize_delete_node(call),
         ToolCall::ExpireEdge { .. } => normalize_expire_edge(call),
+        ToolCall::PromoteEdge { .. } => normalize_promote_edge(call),
+    }
+}
+
+fn normalize_promote_edge(call: &ToolCall) -> ToolCall {
+    let ToolCall::PromoteEdge { source, target } = call else {
+        unreachable!("normalize_promote_edge called with non-promote_edge");
+    };
+    ToolCall::PromoteEdge {
+        source: source.clone(),
+        target: target.clone(),
     }
 }
 
@@ -612,6 +625,7 @@ fn normalize_upsert_edge(call: &ToolCall, confidence: f64) -> ToolCall {
         importance,
         subject,
         date,
+        memory_type,
         ..
     } = call
     else {
@@ -626,6 +640,7 @@ fn normalize_upsert_edge(call: &ToolCall, confidence: f64) -> ToolCall {
         importance: *importance,
         subject: *subject,
         date: date.clone(),
+        memory_type: memory_type.clone(),
     }
 }
 
@@ -682,7 +697,8 @@ fn apply_policy_overrides(cluster: &Cluster, calls: &[ToolCall], policy: &mut Sy
             }
             ToolCall::DeleteNode { .. }
             | ToolCall::DeleteEdge { .. }
-            | ToolCall::ExpireEdge { .. } => {}
+            | ToolCall::ExpireEdge { .. }
+            | ToolCall::PromoteEdge { .. } => {}
         }
         idx += 1;
     }
@@ -717,8 +733,9 @@ fn tool_call_json(call: &ToolCall) -> serde_json::Value {
             importance,
             subject,
             date,
+            memory_type,
         } => {
-            json!({"tool":"upsert_edge","args":{"source":source,"target":target,"content":content,"stability":stability,"confidence":confidence,"importance":importance,"subject":subject,"date":date}})
+            json!({"tool":"upsert_edge","args":{"source":source,"target":target,"content":content,"stability":stability,"confidence":confidence,"importance":importance,"subject":subject,"date":date,"memory_type":memory_type}})
         }
         ToolCall::DeleteNode { name } => json!({"tool":"delete_node","args":{"name":name}}),
         ToolCall::DeleteEdge { source, target } => {
@@ -730,6 +747,9 @@ fn tool_call_json(call: &ToolCall) -> serde_json::Value {
             rewritten_content,
         } => {
             json!({"tool":"expire_edge","args":{"source":source,"target":target,"rewritten_content":rewritten_content}})
+        }
+        ToolCall::PromoteEdge { source, target } => {
+            json!({"tool":"promote_edge","args":{"source":source,"target":target}})
         }
     }
 }

@@ -183,7 +183,7 @@ fn build_memory_block(
     turn_id: &str,
 ) -> MemoryBuild {
     let started = Instant::now();
-    let selection = memory::select_semantic_edges_routed(embed, query);
+    let selection = memory::select_semantic_edges_routed(embed, query, session_id);
     let edges = selection.edges;
     let mut events = Vec::new();
     events.push(memory::Event::routed(

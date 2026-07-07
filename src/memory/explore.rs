@@ -150,7 +150,7 @@ fn run_agent_loop(
     sender: &Sender<ExploreEvent>,
 ) -> Result<usize, Box<dyn Error + Send + Sync>> {
     let conn = db::open_connection()?;
-    let seed_edges = seed_edges_for_agent(&*embed, agent_name);
+    let seed_edges = seed_edges_for_agent(&*embed, agent_name, session_id);
     let mut messages = initial_messages(agent_name, &seed_edges, open_note);
     let tools = exploration_tools();
     let mut total_events = 0usize;
@@ -480,6 +480,9 @@ fn apply_web_mutation(
         source_message_id: &source_message_id,
         event_payload: &payload,
         confidence_cap: Some(EXPLORE_WEB_CONFIDENCE_CAP),
+        // Exploration is lived experience, not durable belief by default —
+        // it becomes knowledge only if dreaming promotes it later.
+        default_memory_type: "episodic",
     };
     agent::apply_tool_call(tool_call, context.conn, &options, context.events)
 }
@@ -518,6 +521,8 @@ fn semantic_edges_from_graph(edges: &[Edge]) -> Vec<SemanticEdge> {
             date: edge.date.clone(),
             occurred_at: edge.occurred_at.clone(),
             expired_at: edge.expired_at.clone(),
+            memory_type: edge.memory_type.clone(),
+            origin_session: edge.origin_session.clone(),
             embedding: None,
         });
     }
@@ -554,9 +559,13 @@ fn record_turn_events(
     Ok(events.len())
 }
 
-fn seed_edges_for_agent(embed: &dyn EmbeddingClient, agent_name: &str) -> Vec<SemanticEdge> {
+fn seed_edges_for_agent(
+    embed: &dyn EmbeddingClient,
+    agent_name: &str,
+    session_id: &str,
+) -> Vec<SemanticEdge> {
     let anchor = dream::domain_anchor(agent_name).unwrap_or_default();
-    embed::select_exploration_edges(embed, anchor, agent_name)
+    embed::select_exploration_edges(embed, anchor, agent_name, session_id)
 }
 
 fn initial_messages(

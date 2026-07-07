@@ -26,6 +26,10 @@ const W_RECENCY: f64 = 0.15; // replay-tunable.
 // often-seen edges suppresses exactly the beliefs a follow-up question
 // needs. Keep at 0 for chat; exploration ranking has its own novelty.
 const W_NOVELTY: f64 = 0.0; // replay-tunable.
+// Any episodic edge reaching rank_score has already survived session
+// scoping (scope_episodic), so it is guaranteed same-session — rank it as
+// maximally relevant recent experience.
+const EPISODIC_RANK_BONUS: f64 = 1.0; // replay-tunable.
 
 #[derive(Clone)]
 pub struct RoutedSemanticSelection {
@@ -45,6 +49,8 @@ pub struct SemanticEdge {
     pub date: String,
     pub occurred_at: Option<String>,
     pub expired_at: Option<String>,
+    pub memory_type: String,
+    pub origin_session: String,
     pub embedding: Option<Vec<f64>>,
 }
 
@@ -92,27 +98,32 @@ pub fn run_embed_pass(
 
 pub fn select_semantic_edges(embed: &dyn EmbeddingClient, query: &str) -> Vec<SemanticEdge> {
     if db::edge_count() < SMALL_GRAPH_THRESHOLD {
-        return fallback_edges();
+        return fallback_edges(None);
     }
     let Some(vector) = query_embedding(embed, query) else {
-        return fallback_edges();
+        return fallback_edges(None);
     };
-    let Some(anchors) = anchor_edges_for_vector(&vector) else {
-        return fallback_edges();
+    let Some(anchors) = anchor_edges_for_vector(&vector, None) else {
+        return fallback_edges(None);
     };
-    let all_edges = all_semantic_edges();
+    let all_edges = all_semantic_edges(None);
     expand_hops(anchors, all_edges)
 }
 
+// Episodic edges are visible only within their originating session; across
+// sessions they exist for decay and dream-promotion but never enter
+// retrieval. session_id is the only anti-contamination guard here — decay
+// alone is too slow to separate same-day sessions (see decay.rs).
 pub fn select_semantic_edges_routed(
     embed: &dyn EmbeddingClient,
     query: &str,
+    session_id: &str,
 ) -> RoutedSemanticSelection {
     let query_embedding = match query_embedding(embed, query) {
         Some(vector) => vector,
         None => {
             return RoutedSemanticSelection {
-                edges: fallback_edges(),
+                edges: fallback_edges(Some(session_id)),
                 routing: routing::Routing {
                     routing_vector: Vec::new(),
                     expert: None,
@@ -125,17 +136,17 @@ pub fn select_semantic_edges_routed(
     let routing = routing::route(&query_embedding);
     if db::edge_count() < SMALL_GRAPH_THRESHOLD {
         return RoutedSemanticSelection {
-            edges: fallback_edges(),
+            edges: fallback_edges(Some(session_id)),
             routing,
         };
     }
-    let Some(anchors) = anchor_edges_for_vector(&routing.routing_vector) else {
+    let Some(anchors) = anchor_edges_for_vector(&routing.routing_vector, Some(session_id)) else {
         return RoutedSemanticSelection {
-            edges: fallback_edges(),
+            edges: fallback_edges(Some(session_id)),
             routing,
         };
     };
-    let all_edges = all_semantic_edges();
+    let all_edges = all_semantic_edges(Some(session_id));
     let pool = expand_hops_pool(anchors, all_edges);
     let user_views = db::load_edge_actor_views("user", "local");
     let edges = rank_pool_for_chat(pool, &routing.routing_vector, &user_views);
@@ -146,13 +157,14 @@ pub fn select_exploration_edges(
     embed: &dyn EmbeddingClient,
     anchor: &str,
     agent_name: &str,
+    session_id: &str,
 ) -> Vec<SemanticEdge> {
     if db::edge_count() < SMALL_GRAPH_THRESHOLD {
-        return fallback_edges();
+        return fallback_edges(Some(session_id));
     }
     let vector = match embed_text(embed, anchor) {
         Ok(vector) => vector,
-        Err(_) => return fallback_edges(),
+        Err(_) => return fallback_edges(Some(session_id)),
     };
     let rows = match db::query_edges_by_vector(&vector, EXPLORATION_CANDIDATES) {
         Ok(rows) => rows,
@@ -161,8 +173,9 @@ pub fn select_exploration_edges(
     if rows.is_empty() {
         return select_semantic_edges(embed, anchor);
     }
-    let anchors = choose_exploration_anchors(rows_to_semantic_edges(rows), agent_name);
-    let all_edges = all_semantic_edges();
+    let candidates = scope_episodic(rows_to_semantic_edges(rows), Some(session_id));
+    let anchors = choose_exploration_anchors(candidates, agent_name);
+    let all_edges = all_semantic_edges(Some(session_id));
     expand_hops(anchors, all_edges)
 }
 
@@ -218,12 +231,32 @@ fn save_batch_embeddings(
     Ok(rows.len())
 }
 
-fn all_semantic_edges() -> Vec<SemanticEdge> {
-    rows_to_semantic_edges(db::load_all_edges_semantic())
+// session_id = None means "no session context" — the safe default, which
+// excludes episodic edges entirely rather than leaking them across an
+// unrelated retrieval path (crystal export and any future untagged caller
+// inherit this behavior for free).
+fn all_semantic_edges(session_id: Option<&str>) -> Vec<SemanticEdge> {
+    scope_episodic(rows_to_semantic_edges(db::load_all_edges_semantic()), session_id)
 }
 
-fn fallback_edges() -> Vec<SemanticEdge> {
-    rank_and_cap(all_semantic_edges())
+// See select_semantic_edges_routed: episodic edges from another session (or
+// with no session context at all) are dropped before ranking ever sees them.
+fn scope_episodic(edges: Vec<SemanticEdge>, session_id: Option<&str>) -> Vec<SemanticEdge> {
+    let mut scoped = Vec::new();
+    for edge in edges {
+        if edge.memory_type != "episodic" {
+            scoped.push(edge);
+            continue;
+        }
+        if session_id == Some(edge.origin_session.as_str()) {
+            scoped.push(edge);
+        }
+    }
+    scoped
+}
+
+fn fallback_edges(session_id: Option<&str>) -> Vec<SemanticEdge> {
+    rank_and_cap(all_semantic_edges(session_id))
 }
 
 fn choose_exploration_anchors(
@@ -241,7 +274,10 @@ fn query_embedding(embed: &dyn EmbeddingClient, query: &str) -> Option<Vec<f64>>
     embed_text(embed, query).ok()
 }
 
-fn anchor_edges_for_vector(vector: &[f64]) -> Option<Vec<SemanticEdge>> {
+fn anchor_edges_for_vector(
+    vector: &[f64],
+    session_id: Option<&str>,
+) -> Option<Vec<SemanticEdge>> {
     let rows = match db::query_edges_by_vector(vector, TOP_K) {
         Ok(rows) => rows,
         Err(_) => return None,
@@ -249,7 +285,7 @@ fn anchor_edges_for_vector(vector: &[f64]) -> Option<Vec<SemanticEdge>> {
     if rows.is_empty() {
         return None;
     }
-    Some(rows_to_semantic_edges(rows))
+    Some(scope_episodic(rows_to_semantic_edges(rows), session_id))
 }
 
 // Blend per-edge novelty with endpoint exposure so an unseen edge on an
@@ -442,7 +478,12 @@ fn rank_score(
     let sim = similarity_term(routing_vector, edge.embedding.as_deref());
     let recency = recency_term(&edge.date);
     let novelty = novelty_term(edge, user_views);
-    W_SIM * sim + W_CONF * edge.confidence + W_RECENCY * recency + W_NOVELTY * novelty
+    let base = W_SIM * sim + W_CONF * edge.confidence + W_RECENCY * recency + W_NOVELTY * novelty;
+    if edge.memory_type == "episodic" {
+        base + EPISODIC_RANK_BONUS
+    } else {
+        base
+    }
 }
 
 fn similarity_term(routing_vector: &[f64], edge_embedding: Option<&[f64]>) -> f64 {
@@ -525,6 +566,8 @@ fn rows_to_semantic_edges(rows: Vec<db::SemanticEdgeRow>) -> Vec<SemanticEdge> {
         date,
         occurred_at,
         expired_at,
+        memory_type,
+        origin_session,
         embedding,
     ) in rows
     {
@@ -539,6 +582,8 @@ fn rows_to_semantic_edges(rows: Vec<db::SemanticEdgeRow>) -> Vec<SemanticEdge> {
             date,
             occurred_at,
             expired_at,
+            memory_type,
+            origin_session,
             embedding,
         });
     }
@@ -548,4 +593,55 @@ fn rows_to_semantic_edges(rows: Vec<db::SemanticEdgeRow>) -> Vec<SemanticEdge> {
 fn send_log(sender: &std::sync::mpsc::Sender<MemoryEvent>, phase: &'static str, text: String) {
     runlog::log(phase, &text);
     let _ = sender.send(MemoryEvent::Log { phase, text });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SemanticEdge, scope_episodic};
+
+    fn test_edge(memory_type: &str, origin_session: &str) -> SemanticEdge {
+        SemanticEdge {
+            source: "a".to_string(),
+            target: "b".to_string(),
+            content: String::new(),
+            confidence: 1.0,
+            stability: 0.5,
+            importance: 0.5,
+            subject: false,
+            date: String::new(),
+            occurred_at: None,
+            expired_at: None,
+            memory_type: memory_type.to_string(),
+            origin_session: origin_session.to_string(),
+            embedding: None,
+        }
+    }
+
+    #[test]
+    fn same_session_episodic_edge_survives_scoping() {
+        let edges = vec![test_edge("episodic", "game-1")];
+        let scoped = scope_episodic(edges, Some("game-1"));
+        assert_eq!(scoped.len(), 1);
+    }
+
+    #[test]
+    fn cross_session_episodic_edge_is_filtered_out() {
+        let edges = vec![test_edge("episodic", "game-1")];
+        let scoped = scope_episodic(edges, Some("game-2"));
+        assert!(scoped.is_empty());
+    }
+
+    #[test]
+    fn no_session_context_excludes_all_episodic_edges() {
+        let edges = vec![test_edge("episodic", "game-1")];
+        let scoped = scope_episodic(edges, None);
+        assert!(scoped.is_empty());
+    }
+
+    #[test]
+    fn semantic_edges_are_never_filtered() {
+        let edges = vec![test_edge("semantic", "")];
+        let scoped = scope_episodic(edges, Some("game-2"));
+        assert_eq!(scoped.len(), 1);
+    }
 }

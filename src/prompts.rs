@@ -44,7 +44,8 @@ upsert_edge — create or update a directed edge.
 - importance: 1.0 must load with source, 0.0 supplementary
 - subject: true only on fact nodes; set importance=1.0
 - date: always today's date
-{"tool":"upsert_edge","args":{"source":"string","target":"string","content":"string","stability":0.0,"confidence":0.0,"importance":0.0,"subject":false,"date":"YYYY-MM-DD"}}
+- memory_type: "episodic" for the lived specifics of an ongoing task or game this session (a move played, the current position, what just happened) — ephemeral and scoped to this conversation; "semantic" (the default, may be omitted) for durable facts and general lessons that should outlive the session
+{"tool":"upsert_edge","args":{"source":"string","target":"string","content":"string","stability":0.0,"confidence":0.0,"importance":0.0,"subject":false,"date":"YYYY-MM-DD","memory_type":"semantic | episodic"}}
 
 delete_node — remove a node.
 {"tool":"delete_node","args":{"name":"string"}}
@@ -69,6 +70,8 @@ Implies links: when one fact causally leads to another, edge from first to secon
 Predicates: reuse existing content templates from current memory. Only introduce a new template when none fits. Use <subject> for source, <target> for target, <fact> when target is a fact node.
 
 One-way only. Never add reverse links.
+
+Episodic vs semantic: the concrete state of an ongoing task or game (moves made, the current position, this-session events) is episodic — it is lived experience that decays and stays scoped to this conversation. Durable facts and the general lessons drawn from a task ("attacking the f7 square early is strong") are semantic. Default to semantic; use episodic for the per-move, per-turn specifics.
 
 Never hallucinate. Only store what was explicitly stated.
 
@@ -202,6 +205,7 @@ Rules:
 - Apply today's date to all edges.
 - Synthesis proposals identify higher-order facts. When you accept a synthesis proposal, forward its upsert_node AND its upsert_edge calls together — a synthesis edge without its node is invalid. Never create edges pointing at nodes that do not exist and are not being created in this same response. Keep synthesis nodes as type="synthesis" and preserve their support-based confidence.
 - Prefer expire_edge when a belief was once true but is now superseded. Use delete_edge only for absorbed scaffolding; keep deletions conservative.
+- promote_edge — the graph may contain episodic edges (lived experience from an exploration or task session). Promote one to durable knowledge only when it has been reinforced (a "reinforced" event exists for it) or when a synthesis proposal built on it — i.e. a lesson that survived experience, not a raw episodic detail. Promote the generalization ("castling late repeatedly loses"), never the specific instance ("opponent played e4 in game 3"). {"tool":"promote_edge","args":{"source":"string","target":"string"}}
 
 Respond with raw JSON tool calls only. Use the standard format. These will be applied immediately."#;
 
