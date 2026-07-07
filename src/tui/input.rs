@@ -22,11 +22,17 @@ fn handle_insert_key(key: KeyEvent, app: &mut App) -> bool {
         // one writer; a second commit kills the open transaction).
         KeyCode::Enter if app.state == State::Idle && !app.input.is_empty() => {
             let path = ingest_command_path(&app.input);
+            let outcome_score = outcome_command_score(&app.input);
             if let Some(path) = path {
                 if maintenance_allowed(app) {
                     let path = path.to_string();
                     app.input.clear();
                     app::start_ingestion(app, PathBuf::from(path));
+                }
+            } else if let Some(score) = outcome_score {
+                if background_passes_idle(app) {
+                    app.input.clear();
+                    app::run_outcome_command(app, score);
                 }
             } else if background_passes_idle(app) {
                 start_stream(app);
@@ -93,6 +99,13 @@ fn ingest_command_path(input: &str) -> Option<&str> {
         return None;
     }
     Some(path)
+}
+
+fn outcome_command_score(input: &str) -> Option<f64> {
+    let trimmed = input.trim();
+    let arg = trimmed.strip_prefix("/outcome ")?;
+    let score = arg.trim().parse::<f64>().ok()?;
+    Some(score.clamp(-1.0, 1.0))
 }
 
 fn scroll_down(app: &mut App) {

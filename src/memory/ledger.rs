@@ -143,6 +143,34 @@ impl Event {
         )
     }
 
+    // turn_id is empty for a session-level outcome and set for per-move credit
+    // (record_move_outcome in reinforce.rs); both scopes share this constructor.
+    pub fn outcome(session_id: &str, turn_id: &str, score: f64, payload: String) -> Self {
+        Self::new(
+            Actor::new("system", "reinforcement"),
+            "outcome",
+            EdgeRef::new("", ""),
+            EventContext::new(session_id, turn_id),
+            EventBody::new(score, payload),
+        )
+    }
+
+    pub fn reinforced(
+        edge: EdgeRef,
+        session_id: &str,
+        turn_id: &str,
+        delta: f64,
+        payload: String,
+    ) -> Self {
+        Self::new(
+            Actor::new("system", "reinforcement"),
+            "reinforced",
+            edge,
+            EventContext::new(session_id, turn_id),
+            EventBody::new(delta, payload),
+        )
+    }
+
     fn new(
         actor: Actor,
         event_type: &str,

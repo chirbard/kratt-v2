@@ -704,6 +704,30 @@ pub fn load_edges_for_node(
     runtime().block_on(load_edges_for_node_async(conn, node_id))
 }
 
+pub fn update_edge_confidence(
+    conn: &Connection,
+    source: &str,
+    target: &str,
+    confidence: f64,
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    runtime().block_on(update_edge_confidence_async(conn, source, target, confidence))
+}
+
+async fn update_edge_confidence_async(
+    conn: &Connection,
+    source: &str,
+    target: &str,
+    confidence: f64,
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    let changed = conn
+        .execute(
+            "UPDATE edges SET confidence = ?1 WHERE source = ?2 AND target = ?3 AND expired_at IS NULL",
+            params![confidence, source, target],
+        )
+        .await?;
+    Ok(changed > 0)
+}
+
 async fn load_edge_async(
     conn: &Connection,
     source: &str,
@@ -1078,6 +1102,29 @@ pub fn register_ingestion_session(session_id: &str, created_at: &str) {
         )
         .await;
     });
+}
+
+pub fn latest_session_id(session_type: &str) -> Option<String> {
+    let conn = open_connection().ok()?;
+    runtime().block_on(latest_session_id_async(&conn, session_type))
+}
+
+async fn latest_session_id_async(conn: &Connection, session_type: &str) -> Option<String> {
+    let mut rows = conn
+        .query(
+            "SELECT id FROM sessions WHERE session_type = ?1 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            params![session_type],
+        )
+        .await
+        .ok()?;
+    let row = match rows.next().await {
+        Ok(Some(row)) => row,
+        _ => return None,
+    };
+    match row.get_value(0) {
+        Ok(value) => Some(text(value)),
+        Err(_) => None,
+    }
 }
 
 pub fn load_oldest_open_curiosity_note() -> Option<(String, String, String)> {

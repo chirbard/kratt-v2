@@ -443,6 +443,22 @@ pub(crate) fn start_ingestion(app: &mut App, path: PathBuf) {
     app.ingest_state = IngestState::Running;
 }
 
+pub(crate) fn run_outcome_command(app: &mut App, score: f64) {
+    app.memory_log.clear();
+    let Some(session_id) = memory::latest_session_id("exploration") else {
+        app.memory_log.push((
+            "reinforce".to_string(),
+            "no exploration session found".to_string(),
+        ));
+        return;
+    };
+    let text = match memory::record_outcome(&session_id, score, "{}") {
+        Ok(summary) => summary,
+        Err(err) => format!("error: {err}"),
+    };
+    app.memory_log.push(("reinforce".to_string(), text));
+}
+
 pub(crate) fn start_recompute_positions(app: &mut App) {
     app.memory_log.clear();
     let (sender, receiver) = std::sync::mpsc::channel::<MemoryEvent>();
