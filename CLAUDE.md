@@ -14,3 +14,5 @@ Design for the endgame: **millions of edges**, semantic subgraph selection at re
 
 - `cargo clippy` must pass clean — no warnings, no exceptions
 - Feature-based directory layout: each feature owns its module, no cross-contamination between features; dependencies flow inward (hexagonal-lite: core has no knowledge of TUI, TUI has no knowledge of memory internals)
+- New phases add unit tests for the logic they touch; DB-touching logic should get an in-memory test harness rather than staying untested
+- No agent step may require an LLM output longer than ~2k tokens — decompose into a loop of small tool calls (see kratt-roadmap concepts/cognitive-core.md)
