@@ -15,4 +15,4 @@ Design for the endgame: **millions of edges**, semantic subgraph selection at re
 - `cargo clippy` must pass clean — no warnings, no exceptions
 - Feature-based directory layout: each feature owns its module, no cross-contamination between features; dependencies flow inward (hexagonal-lite: core has no knowledge of TUI, TUI has no knowledge of memory internals)
 - New phases add unit tests for the logic they touch; DB-touching logic should get an in-memory test harness rather than staying untested
-- No agent step may require an LLM output longer than ~2k tokens — decompose into a loop of small tool calls (see kratt-roadmap concepts/cognitive-core.md)
+- Kratt's internal LLM calls (scribe, memory passes, dream/synthesis agents, prompts in src/prompts.rs): never design a prompt that needs more than ~2k output tokens in one response — decompose into a loop of small tool calls instead (see kratt-roadmap concepts/cognitive-core.md). This constrains the prompts/passes we build into the app, not the coding agents working on this repo.
