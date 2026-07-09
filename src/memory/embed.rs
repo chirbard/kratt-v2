@@ -236,7 +236,10 @@ fn save_batch_embeddings(
 // unrelated retrieval path (crystal export and any future untagged caller
 // inherit this behavior for free).
 fn all_semantic_edges(session_id: Option<&str>) -> Vec<SemanticEdge> {
-    scope_episodic(rows_to_semantic_edges(db::load_all_edges_semantic()), session_id)
+    scope_episodic(
+        rows_to_semantic_edges(db::load_all_edges_semantic()),
+        session_id,
+    )
 }
 
 // See select_semantic_edges_routed: episodic edges from another session (or
@@ -274,10 +277,7 @@ fn query_embedding(embed: &dyn EmbeddingClient, query: &str) -> Option<Vec<f64>>
     embed_text(embed, query).ok()
 }
 
-fn anchor_edges_for_vector(
-    vector: &[f64],
-    session_id: Option<&str>,
-) -> Option<Vec<SemanticEdge>> {
+fn anchor_edges_for_vector(vector: &[f64], session_id: Option<&str>) -> Option<Vec<SemanticEdge>> {
     let rows = match db::query_edges_by_vector(vector, TOP_K) {
         Ok(rows) => rows,
         Err(_) => return None,

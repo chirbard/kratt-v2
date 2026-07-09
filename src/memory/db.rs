@@ -732,7 +732,9 @@ pub fn update_edge_confidence(
     target: &str,
     confidence: f64,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
-    runtime().block_on(update_edge_confidence_async(conn, source, target, confidence))
+    runtime().block_on(update_edge_confidence_async(
+        conn, source, target, confidence,
+    ))
 }
 
 async fn update_edge_confidence_async(

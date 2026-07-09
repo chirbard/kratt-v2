@@ -139,9 +139,7 @@ fn rest_action(inputs: &SchedulerInputs) -> SchedulerAction {
     SchedulerAction::Rest {
         reason: format!(
             "nothing to do (debt: {}, open notes: {}, coldest edge: {} days)",
-            inputs.acquisition_debt,
-            inputs.open_curiosity_notes_count,
-            coldest_days
+            inputs.acquisition_debt, inputs.open_curiosity_notes_count, coldest_days
         ),
     }
 }
@@ -159,7 +157,10 @@ pub fn log_drift_info(actor_positions: &[(String, String, Option<Vec<f64>>)]) {
     if let Some((distance, actor_a, actor_b)) = min_distance {
         crate::runlog::log(
             "sched",
-            &format!("drift: min pair {}-{} distance {:.4}", actor_a, actor_b, distance),
+            &format!(
+                "drift: min pair {}-{} distance {:.4}",
+                actor_a, actor_b, distance
+            ),
         );
         log_drift_warning(distance, actor_a.as_str(), actor_b.as_str());
     }
@@ -237,7 +238,10 @@ pub fn log_scheduler_decision(action: &SchedulerAction) {
             crate::runlog::log("sched", &format!("explore: {}", reason));
         }
         SchedulerAction::Ingest { path, reason } => {
-            crate::runlog::log("sched", &format!("ingest: {} ({:?})", reason, path.display()));
+            crate::runlog::log(
+                "sched",
+                &format!("ingest: {} ({:?})", reason, path.display()),
+            );
         }
         SchedulerAction::Rest { reason } => {
             crate::runlog::log("sched", &format!("rest: {}", reason));
@@ -299,7 +303,8 @@ async fn get_newest_dream_event_ts(conn: &Connection) -> Option<String> {
              LIMIT 1",
             (),
         )
-        .await {
+        .await
+    {
         Ok(rows) => rows,
         Err(_) => return None,
     };
@@ -396,7 +401,8 @@ async fn count_open_curiosity_notes(conn: &Connection) -> usize {
              WHERE n.node_type = 'note' AND e.expired_at IS NULL AND consumed.source IS NULL",
             (),
         )
-        .await {
+        .await
+    {
         Ok(rows) => rows,
         Err(_) => return 0,
     };
@@ -495,21 +501,23 @@ mod tests {
         // Create a temporary file that exists for the test
         let temp_path = std::env::temp_dir().join("test_file.md");
         let _ = std::fs::File::create(&temp_path);
-        
+
         let inputs = SchedulerInputs {
             acquisition_debt: 10,
-            re_read_candidates: vec![
-                (temp_path.to_string_lossy().into_owned(), 3, "node1".to_string()),
-            ],
+            re_read_candidates: vec![(
+                temp_path.to_string_lossy().into_owned(),
+                3,
+                "node1".to_string(),
+            )],
             open_curiosity_notes_count: 0,
             coldest_edge_age_days: Some(5),
             actor_positions: vec![],
         };
         let action = decide(&inputs);
-        
+
         // Clean up
         let _ = std::fs::remove_file(&temp_path);
-        
+
         match action {
             SchedulerAction::Ingest { path, reason } => {
                 assert_eq!(path, temp_path);
@@ -596,16 +604,14 @@ mod tests {
         // Dream should win over ingest when debt is high
         let inputs = SchedulerInputs {
             acquisition_debt: 60, // >= 50
-            re_read_candidates: vec![
-                ("path/to/file.md".to_string(), 5, "node1".to_string()),
-            ],
+            re_read_candidates: vec![("path/to/file.md".to_string(), 5, "node1".to_string())],
             open_curiosity_notes_count: 0,
             coldest_edge_age_days: Some(5),
             actor_positions: vec![],
         };
         let action = decide(&inputs);
         match action {
-            SchedulerAction::Dream { .. } => {},
+            SchedulerAction::Dream { .. } => {}
             _ => panic!("Expected Dream action to win over Ingest, got {:?}", action),
         }
     }
@@ -615,9 +621,7 @@ mod tests {
         // Ingest should win over explore when notes are above threshold
         let inputs = SchedulerInputs {
             acquisition_debt: 10,
-            re_read_candidates: vec![
-                ("path/to/file.md".to_string(), 3, "node1".to_string()),
-            ],
+            re_read_candidates: vec![("path/to/file.md".to_string(), 3, "node1".to_string())],
             open_curiosity_notes_count: 5,
             coldest_edge_age_days: Some(5),
             actor_positions: vec![],

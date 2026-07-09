@@ -68,8 +68,8 @@ fn date_to_days(date: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::decay_edge;
     use super::super::graph::Edge;
+    use super::decay_edge;
 
     fn test_edge(memory_type: &str, date: &str) -> Edge {
         Edge {

@@ -868,7 +868,10 @@ async fn snapshot_position(
     Ok(())
 }
 
-pub(crate) fn cosine_distance(left: &[f64], right: &[f64]) -> Result<f64, Box<dyn Error + Send + Sync>> {
+pub(crate) fn cosine_distance(
+    left: &[f64],
+    right: &[f64],
+) -> Result<f64, Box<dyn Error + Send + Sync>> {
     if left.len() != right.len() {
         return Err("position vector dimension mismatch".into());
     }
@@ -1118,6 +1121,9 @@ mod tests {
             unreachable!("refresh succeeds")
         };
         assert_eq!(refreshed, 0);
-        assert_eq!(db::block_on(edge_date(&conn, "carol", "delhi")), "2020-01-01");
+        assert_eq!(
+            db::block_on(edge_date(&conn, "carol", "delhi")),
+            "2020-01-01"
+        );
     }
 }

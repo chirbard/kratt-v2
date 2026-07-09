@@ -615,7 +615,10 @@ fn run_scheduler(app: &mut App) {
             app.scheduler_consecutive_actions += 1;
         }
         scheduler::SchedulerAction::Ingest { path, reason } => {
-            crate::runlog::log("sched", &format!("dispatching ingest: {} ({:?})", reason, path.display()));
+            crate::runlog::log(
+                "sched",
+                &format!("dispatching ingest: {} ({:?})", reason, path.display()),
+            );
             start_ingestion(app, path);
             app.scheduler_consecutive_actions += 1;
         }
@@ -630,7 +633,13 @@ fn run_scheduler(app: &mut App) {
     // Check if we've exceeded the maximum consecutive actions
     if app.scheduler_consecutive_actions >= SCHEDULER_MAX_CONSECUTIVE {
         app.autonomous_mode = false;
-        crate::runlog::log("sched", &format!("autonomous mode disabled after {} consecutive actions with no user interaction", SCHEDULER_MAX_CONSECUTIVE));
+        crate::runlog::log(
+            "sched",
+            &format!(
+                "autonomous mode disabled after {} consecutive actions with no user interaction",
+                SCHEDULER_MAX_CONSECUTIVE
+            ),
+        );
         app.scheduler_consecutive_actions = 0;
     }
 

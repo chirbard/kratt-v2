@@ -275,8 +275,12 @@ impl<'run> AgentRun<'run> {
             // Continuations must list everything applied so far, not just the
             // latest iteration, or the model re-emits earlier calls.
             applied.extend(outcome.descriptions);
-            prompt =
-                build_continue_prompt(pass.explanation, self.user_msg, self.assistant_msg, &applied);
+            prompt = build_continue_prompt(
+                pass.explanation,
+                self.user_msg,
+                self.assistant_msg,
+                &applied,
+            );
         }
         self.send_log(pass.phase, "done".to_string());
         Ok(())
@@ -1239,7 +1243,10 @@ mod tests {
         assert_eq!(parse_turn_mode("garbage nonsense"), TurnMode::Conversation);
         assert_eq!(parse_turn_mode(""), TurnMode::Conversation);
         // Ambiguous replies mentioning both bias to the safe heavy path.
-        assert_eq!(parse_turn_mode("this is chat, not a task"), TurnMode::Conversation);
+        assert_eq!(
+            parse_turn_mode("this is chat, not a task"),
+            TurnMode::Conversation
+        );
     }
 
     #[test]

@@ -68,10 +68,10 @@ fn run_loop(terminal: &mut Term, app: &mut App) -> Result<(), Box<dyn std::error
         drain_explore(app);
         drain_ingest(app);
         drain_embed(app);
-        
+
         // Update scheduler state on each tick
         app::update_scheduler_state(app);
-        
+
         app.tick += 1;
         terminal.draw(|frame| render::render(frame, app))?;
     }

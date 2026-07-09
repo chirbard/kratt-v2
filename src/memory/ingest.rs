@@ -258,7 +258,13 @@ fn record_chunk_turn<'scope>(
         // The interactive loop handles fact-checking (search, notes, expiry)
         // but the small model extracts poorly one call at a time — a batch
         // text-protocol pass guarantees the chunk's facts land as edges.
-        run_batch_extraction(llm, input.semantic_edges, input.chunk_text, &mut study, sender)?;
+        run_batch_extraction(
+            llm,
+            input.semantic_edges,
+            input.chunk_text,
+            &mut study,
+            sender,
+        )?;
         db::block_on(ledger::record_events_in_tx(input.conn, &events))
     })();
     if let Err(err) = result {
@@ -279,13 +285,18 @@ fn run_batch_extraction<'scope>(
     study: &mut ChunkStudyContext<'scope>,
     sender: &Sender<IngestEvent>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let prompt =
-        crate::prompts::build_ingest_extract_prompt(&embed::edges_to_toon(semantic_edges), chunk_text);
+    let prompt = crate::prompts::build_ingest_extract_prompt(
+        &embed::edges_to_toon(semantic_edges),
+        chunk_text,
+    );
     let response = llm.collect(&prompt)?;
     let calls = agent::parse_tool_calls(&response);
     if calls.is_empty() {
         let head: String = response.chars().take(200).collect();
-        runlog::log("ingest", &format!("extraction parsed 0 calls; response head: {head}"));
+        runlog::log(
+            "ingest",
+            &format!("extraction parsed 0 calls; response head: {head}"),
+        );
     }
     study.provenance = MutationProvenance::Document;
     let mut applied = 0usize;

@@ -15,6 +15,7 @@ use super::agent::{ToolCall, parse_tool_calls, stream_collect};
 use super::db;
 use super::embed::{self, SemanticEdge};
 use super::graph::{Edge, Node, graph_to_json, normalize_id};
+use super::hygiene;
 use super::ledger::{self, Actor, EdgeRef, Event, EventContext};
 use super::synthesis::{self, SynthesisPolicy};
 
@@ -70,6 +71,19 @@ pub fn run_dream_pass(
     }
 }
 
+// A clean graph logs nothing — hygiene should be invisible until it finds rot.
+fn run_hygiene_pass(
+    conn: &Connection,
+    sender: &std::sync::mpsc::Sender<DreamEvent>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let report = hygiene::run_hygiene(conn)?;
+    if report.is_clean() {
+        return Ok(());
+    }
+    send_log(sender, "hygiene", report.summary());
+    Ok(())
+}
+
 fn execute_dream_pass(
     llm: Arc<dyn LlmClient>,
     embed: Arc<dyn EmbeddingClient>,
@@ -78,12 +92,14 @@ fn execute_dream_pass(
     let session_id = dream_session_id();
     let created_at = dream_timestamp();
     db::register_dream_session(&session_id, &created_at);
+    let conn = db::open_connection()?;
+    // Repair before the agents read the graph, so they reason over clean state.
+    run_hygiene_pass(&conn, sender)?;
     let graph = db::load_graph();
     let global_toon = toon::encode(&graph_to_json(&graph), None);
     let domain = run_domain_agents(Arc::clone(&llm), embed, &session_id, &global_toon, sender)?;
     let abstract_outputs =
         run_abstract_agents(Arc::clone(&llm), &session_id, &global_toon, &domain, sender)?;
-    let conn = db::open_connection()?;
     let synthesis = synthesis::run_synthesis_stage(
         Arc::clone(&llm),
         &conn,
@@ -164,11 +180,14 @@ fn build_domain_toons(
     global_toon: &str,
     session_id: &str,
 ) -> DomainToons {
-    let biologist = exploration_subgraph(embed, BIOLOGIST_ANCHOR, DOMAIN_AGENT_NAMES[0], session_id);
+    let biologist =
+        exploration_subgraph(embed, BIOLOGIST_ANCHOR, DOMAIN_AGENT_NAMES[0], session_id);
     record_domain_views(DOMAIN_AGENT_NAMES[0], &biologist, session_id);
-    let historian = exploration_subgraph(embed, HISTORIAN_ANCHOR, DOMAIN_AGENT_NAMES[1], session_id);
+    let historian =
+        exploration_subgraph(embed, HISTORIAN_ANCHOR, DOMAIN_AGENT_NAMES[1], session_id);
     record_domain_views(DOMAIN_AGENT_NAMES[1], &historian, session_id);
-    let economist = exploration_subgraph(embed, ECONOMIST_ANCHOR, DOMAIN_AGENT_NAMES[2], session_id);
+    let economist =
+        exploration_subgraph(embed, ECONOMIST_ANCHOR, DOMAIN_AGENT_NAMES[2], session_id);
     record_domain_views(DOMAIN_AGENT_NAMES[2], &economist, session_id);
     DomainToons {
         biologist: embed::edges_to_toon(&biologist),
