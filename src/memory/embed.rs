@@ -460,8 +460,10 @@ fn rank_pool_for_chat(
         index += 1;
     }
     scored.sort_by(chat_rank_cmp);
-    if scored.len() > MAX_POOL {
-        scored.truncate(MAX_POOL);
+    // TOP_K, not MAX_POOL: MAX_POOL caps the candidate pool, but what gets
+    // injected (and clock-refreshed) must stay workspace-sized.
+    if scored.len() > TOP_K {
+        scored.truncate(TOP_K);
     }
     let mut edges = Vec::new();
     for row in scored {
