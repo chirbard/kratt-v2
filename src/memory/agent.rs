@@ -3,14 +3,15 @@ use std::sync::Arc;
 
 use crate::api::{Chunk, LlmClient, ToolCallRequest};
 use crate::prompts::{
-    CONSOLIDATE_EXPLANATION, EXTRACT_EXPLANATION, build_agent_prompt, build_classify_prompt,
-    build_continue_prompt, build_scribe_prompt,
+    AgentPrompt, CONSOLIDATE_EXPLANATION, EXTRACT_EXPLANATION, build_agent_prompt,
+    build_classify_prompt, build_continue_prompt, build_scribe_prompt,
 };
 use crate::runlog;
 use turso::Connection;
 
 use super::db;
 use super::decay;
+use super::embed::SemanticEdge;
 use super::graph::{Edge, Node, graph_to_json, normalize_id};
 use super::ledger::{self, Actor, EdgeRef, Event, EventContext};
 
@@ -152,6 +153,7 @@ impl<'run> AgentRun<'run> {
     fn run_scribe(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         let _write_guard = db::acquire_write_lock();
         let conn = db::open_connection()?;
+        self.refresh_injected_clock(&conn)?;
         let prompt = build_scribe_prompt(self.user_msg, self.assistant_msg);
         // Single-shot on purpose: the scribe records a handful of moves in a
         // few seconds, and loop latency would sit in the chat critical path.
@@ -162,33 +164,33 @@ impl<'run> AgentRun<'run> {
     fn run_heavy(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
         let _write_guard = db::acquire_write_lock();
         let conn = db::open_connection()?;
-        let mut graph = db::load_graph();
-        let decay_ran = decay::apply_decay_if_needed(&mut graph);
-        if decay_ran && let Err(err) = db::save_graph(&graph) {
-            self.send_log("memory", format!("error: {err}"));
-            return Err(err);
-        }
+        // Before decay, so beliefs used this turn are not aged in the same pass.
+        let injected = self.refresh_injected_clock(&conn)?;
+        let graph = self.decayed_graph()?;
 
         let pre_extract_graph = graph.clone();
         let pre_extract_toon = toon::encode(&graph_to_json(&pre_extract_graph), None);
-        let extract_prompt = build_agent_prompt(
-            EXTRACT_EXPLANATION,
-            &pre_extract_toon,
-            self.user_msg,
-            self.assistant_msg,
-            None,
-        );
+        let injected_toon = injected_toon(&injected);
+        let extract_prompt = build_agent_prompt(&AgentPrompt {
+            explanation: EXTRACT_EXPLANATION,
+            toon: &pre_extract_toon,
+            user_msg: self.user_msg,
+            assistant_msg: self.assistant_msg,
+            diff_text: None,
+            injected_toon: injected_toon.as_deref(),
+        });
         self.run_pass(&conn, &heavy_pass("extract"), extract_prompt)?;
 
         let post_extract_graph = db::load_graph();
         let diff = db::graph_diff_toon(&pre_extract_graph, &post_extract_graph);
-        let consolidate_prompt = build_agent_prompt(
-            CONSOLIDATE_EXPLANATION,
-            &pre_extract_toon,
-            self.user_msg,
-            self.assistant_msg,
-            if diff.is_empty() { None } else { Some(&diff) },
-        );
+        let consolidate_prompt = build_agent_prompt(&AgentPrompt {
+            explanation: CONSOLIDATE_EXPLANATION,
+            toon: &pre_extract_toon,
+            user_msg: self.user_msg,
+            assistant_msg: self.assistant_msg,
+            diff_text: if diff.is_empty() { None } else { Some(&diff) },
+            injected_toon: None,
+        });
         self.run_pass(&conn, &heavy_pass("consolidate"), consolidate_prompt)?;
 
         let final_graph = db::load_graph();
@@ -201,6 +203,33 @@ impl<'run> AgentRun<'run> {
             ),
         );
         Ok(())
+    }
+
+    fn decayed_graph(&self) -> Result<super::graph::Graph, Box<dyn Error + Send + Sync>> {
+        let mut graph = db::load_graph();
+        let decay_ran = decay::apply_decay_if_needed(&mut graph);
+        if decay_ran && let Err(err) = db::save_graph(&graph) {
+            self.send_log("memory", format!("error: {err}"));
+            return Err(err);
+        }
+        Ok(graph)
+    }
+
+    // Spacing effect: the beliefs retrieval used this turn get their decay
+    // clock reset to today. The `injected` ledger event already records the
+    // use, so no new event type is written here — this is only the clock touch.
+    fn refresh_injected_clock(
+        &self,
+        conn: &Connection,
+    ) -> Result<Vec<Edge>, Box<dyn Error + Send + Sync>> {
+        let injected = db::block_on(ledger::load_injected_edges(conn, self.user_message_id))?;
+        let today = crate::prompts::today_iso();
+        let refreshed = db::block_on(db::touch_edge_dates(conn, &injected, &today))?;
+        self.send_log(
+            "mem",
+            format!("refreshed decay clock on {refreshed} injected edges"),
+        );
+        Ok(injected)
     }
 
     fn run_pass(
@@ -296,6 +325,37 @@ impl<'run> AgentRun<'run> {
 
     fn send_append(&self, phase: &'static str, text: String) {
         let _ = self.sender.send(MemoryEvent::Append { phase, text });
+    }
+}
+
+// None when nothing was injected — the prompt then omits the section entirely
+// rather than showing the model an empty prediction.
+fn injected_toon(edges: &[Edge]) -> Option<String> {
+    if edges.is_empty() {
+        return None;
+    }
+    let mut semantic = Vec::new();
+    for edge in edges {
+        semantic.push(to_semantic_edge(edge));
+    }
+    Some(super::embed::edges_to_toon(&semantic))
+}
+
+fn to_semantic_edge(edge: &Edge) -> SemanticEdge {
+    SemanticEdge {
+        source: edge.source.clone(),
+        target: edge.target.clone(),
+        content: edge.content.clone(),
+        confidence: edge.confidence,
+        stability: edge.stability,
+        importance: edge.importance,
+        subject: edge.subject,
+        date: edge.date.clone(),
+        occurred_at: edge.occurred_at.clone(),
+        expired_at: edge.expired_at.clone(),
+        memory_type: edge.memory_type.clone(),
+        origin_session: edge.origin_session.clone(),
+        embedding: None,
     }
 }
 

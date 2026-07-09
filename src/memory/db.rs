@@ -767,6 +767,32 @@ async fn load_edge_async(
     Ok(None)
 }
 
+// Retrieval resets the forgetting clock: an edge injected into a turn was
+// just used, so its date moves to today and decay restarts from there.
+// Expired edges are left alone — they are history, not live belief.
+pub(super) async fn touch_edge_dates(
+    conn: &Connection,
+    edges: &[Edge],
+    today: &str,
+) -> Result<usize, Box<dyn Error + Send + Sync>> {
+    let mut refreshed = 0usize;
+    for edge in edges {
+        if edge.expired_at.is_some() {
+            continue;
+        }
+        let changed = conn
+            .execute(
+                "UPDATE edges SET date = ?1 WHERE source = ?2 AND target = ?3 AND expired_at IS NULL",
+                params![today, edge.source.as_str(), edge.target.as_str()],
+            )
+            .await?;
+        if changed > 0 {
+            refreshed += 1;
+        }
+    }
+    Ok(refreshed)
+}
+
 async fn load_edges_for_node_async(
     conn: &Connection,
     node_id: &str,
@@ -1491,7 +1517,7 @@ fn edge_diff_lines(pre: &Graph, post: &Graph, lines: &mut Vec<String>) {
     }
 }
 
-fn parse_edge_row(row: &turso::Row) -> Option<Edge> {
+pub(super) fn parse_edge_row(row: &turso::Row) -> Option<Edge> {
     Some(Edge {
         source: normalize_id(&text(row.get_value(0).ok()?)),
         target: normalize_id(&text(row.get_value(1).ok()?)),

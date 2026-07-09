@@ -9,17 +9,33 @@ pub const CHAT_SYSTEM_PROMPT: &str = r#"You are a direct, honest assistant with 
 - Use <recent_context> for short-term continuity
 - Never output graph data, JSON, edge lists, or memory update descriptions"#;
 
-pub const EXTRACT_EXPLANATION: &str = r#"You are an aggressive extraction agent for a memory graph. Extract every entity and relationship from the conversation that is not yet in the graph.
+pub const EXTRACT_EXPLANATION: &str = r#"You are the extraction agent for a memory graph. Extract the surprise: what this conversation adds to, contradicts, or refines in what memory already knows.
 
-- Every named person, place, object, technology, or concept gets an entity node
-- Structural relationships (is-a, speaks, works-at, is a type of): direct edges between entity nodes
-- Events, actions, observations (moved, left, sold, likes, hates): create a fact node (one-sentence body, date if known), subject edge from fact to primary entity (subject=true, importance=1.0), and edge from source entity to the fact node
-- When uncertain, add it anyway — over-extraction is corrected in consolidation
-- No respond call; always set date=today on every upsert_edge
-- Post-training facts (software versions, release dates, world events) are highest priority — prefer user's stated version over training data; extract even if stated casually
-- If a fact is already in the graph and the conversation touches it, upsert with date=today and confidence raised toward 0.9
-- If the assistant cites or corrects a fact from a web result, extract with confidence 0.9
-- Emit at most 8 tool calls in this response. If more work remains you will be asked to continue, so never rush the rest in"#;
+## What memory already predicted
+
+The "Beliefs injected into this turn" section, when present, is what memory retrieved and showed the assistant before it answered — memory's prediction for this turn.
+
+- If the conversation only restates or confirms a belief in that section, write nothing for it. Those beliefs were already strengthened by being used; a redundant upsert adds no information.
+- Extract what the prediction missed: claims that contradict it, extend it, or are absent from it and from the graph entirely.
+- Reconsolidation: those beliefs were just used, which makes them editable. If the conversation contradicts or refines one, rewrite it (upsert with corrected content and confidence) or expire_edge it when it was true then but is superseded now. This applies to the injected beliefs, not to the graph at large.
+
+## Salience — how hard to write
+
+- The user corrected the assistant or a stored belief, or the assistant was verifiably wrong: encode the correction with confidence 0.9 and stability 0.9. Corrections are the highest-value writes you make.
+- Emphatic or decision-bearing statements ("we decided", "always do X", "never Y"): normal-to-high confidence.
+- Casual mentions in passing: confidence 0.5 or lower, and skip entirely when the claim is not durable knowledge.
+
+## What counts as knowledge
+
+- Record knowledge, not conversation behavior. "The user asked about X", "the user wants more examples", "the assistant explained Y" are not facts and get no edge.
+- Reuse existing node names exactly as they appear in the graph, casing included. Never mint a variant of a node that already exists.
+- Named people, places, technologies, and concepts that carry durable knowledge get an entity node.
+- Structural relationships (is-a, speaks, works-at): direct edges between entity nodes.
+- Events and observations (moved, left, sold, likes, hates): a fact node (one-sentence body, date if known), a subject edge from the fact to its primary entity (subject=true, importance=1.0), and an edge from the source entity to the fact node.
+- Post-training facts (software versions, release dates, world events) are highest priority — prefer the user's stated version over your training data, and extract even when stated casually.
+- If the assistant cites or corrects a fact from a web result, extract with confidence 0.9.
+- No respond call; always set date=today on every upsert_edge.
+- Emit at most 8 tool calls in this response. If more work remains you will be asked to continue, so never rush the rest in."#;
 
 pub const CONSOLIDATE_EXPLANATION: &str = r#"You are a quality-gate agent for a memory graph. The extract agent just ran — your job is to audit its changes and push back where needed.
 
@@ -27,6 +43,8 @@ The diff below shows exactly what extract added (+) and removed (-). Focus on th
 
 - Delete nodes or edges that are wrong, too vague, or cannot be verified from the conversation
 - Merge nodes that duplicate existing ones: re-add their edges under the canonical name, delete_node the duplicate
+- Node ids are normalized on write (lowercased, spaces become hyphens): "MiniCPM5-1B" and "minicpm5-1b" are already the SAME node — never delete_node a "casing duplicate", that deletes the real node and its edges
+- True duplicates differ in separators or wording ("claude-pro" vs "claude_pro"): first re-add the variant's edges under the canonical id, then delete_node the variant spelled exactly as it appears in the graph state
 - Reword edge content to match the closest existing predicate template when one clearly fits
 - Fix any fact node missing a subject edge (subject=true, importance=1.0) to its primary entity
 - Do not add new nodes or edges beyond corrections and merges
@@ -142,15 +160,21 @@ pub const JSON_OUTPUT_RULES: &str = r#"Respond with raw JSON only. No markdown. 
 Single call: {"tool":"upsert_node","args":{"name":"example","type":"entity","body":"","date":""}}
 Multiple calls: {"tools":[{"tool":"upsert_node","args":{"name":"example","type":"entity","body":"","date":""}},{"tool":"upsert_edge","args":{"source":"a","target":"b","content":"<subject> verb <target>","stability":1.0,"confidence":1.0,"importance":0.0,"subject":false,"date":"YYYY-MM-DD"}}]}"#;
 
-pub fn build_agent_prompt(
-    explanation: &str,
-    toon: &str,
-    user_msg: &str,
-    assistant_msg: &str,
-    diff_text: Option<&str>,
-) -> String {
+pub struct AgentPrompt<'scope> {
+    pub explanation: &'scope str,
+    pub toon: &'scope str,
+    pub user_msg: &'scope str,
+    pub assistant_msg: &'scope str,
+    pub diff_text: Option<&'scope str>,
+    // Beliefs retrieval showed the assistant this turn, rendered as TOON.
+    // First iteration of a pass only — continuations re-send neither the graph
+    // nor this block.
+    pub injected_toon: Option<&'scope str>,
+}
+
+pub fn build_agent_prompt(input: &AgentPrompt) -> String {
     let mut prompt = String::new();
-    prompt.push_str(explanation);
+    prompt.push_str(input.explanation);
     prompt.push_str("\n\n**Today's date: ");
     prompt.push_str(&today_iso());
     prompt.push_str("**");
@@ -161,16 +185,28 @@ pub fn build_agent_prompt(
     prompt.push_str("\n\n");
     prompt.push_str(MEMORY_RULES);
     prompt.push_str("\n\n## Current memory state\n\n");
-    prompt.push_str(toon);
-    if let Some(diff) = diff_text {
+    prompt.push_str(input.toon);
+    push_injected_section(&mut prompt, input.injected_toon);
+    if let Some(diff) = input.diff_text {
         prompt.push_str("\n\n## What extract added\n\n");
         prompt.push_str(diff);
     }
     prompt.push_str("\n\n## Exchange to process\n\nUser: ");
-    prompt.push_str(user_msg);
+    prompt.push_str(input.user_msg);
     prompt.push_str("\nAssistant: ");
-    prompt.push_str(assistant_msg);
+    prompt.push_str(input.assistant_msg);
     prompt
+}
+
+fn push_injected_section(prompt: &mut String, injected_toon: Option<&str>) {
+    let Some(injected) = injected_toon else {
+        return;
+    };
+    if injected.trim().is_empty() {
+        return;
+    }
+    prompt.push_str("\n\n## Beliefs injected into this turn\n\n");
+    prompt.push_str(injected);
 }
 
 pub const CONTINUE_PASS: &str = r#"You are continuing the pass described above. The tool calls listed under "Already applied" were made by you earlier in this pass and are committed — never repeat them. Your role and its restrictions still apply in full.
@@ -535,4 +571,46 @@ fn recent_role_label(recent_entry: &RecentEntry) -> &str {
 
 pub fn today_iso() -> String {
     crate::timeutil::today_iso()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AgentPrompt, EXTRACT_EXPLANATION, build_agent_prompt, build_continue_prompt};
+
+    const INJECTED_HEADING: &str = "## Beliefs injected into this turn";
+
+    fn prompt_with(injected_toon: Option<&str>) -> String {
+        build_agent_prompt(&AgentPrompt {
+            explanation: EXTRACT_EXPLANATION,
+            toon: "nodes: []",
+            user_msg: "user",
+            assistant_msg: "assistant",
+            diff_text: None,
+            injected_toon,
+        })
+    }
+
+    #[test]
+    fn injected_section_is_present_when_edges_were_injected() {
+        let prompt = prompt_with(Some("edges: alice -> berlin"));
+        assert!(prompt.contains(INJECTED_HEADING));
+        assert!(prompt.contains("alice -> berlin"));
+    }
+
+    #[test]
+    fn injected_section_is_omitted_when_nothing_was_injected() {
+        assert!(!prompt_with(None).contains(INJECTED_HEADING));
+        // An all-whitespace render is an empty prediction, not a heading.
+        assert!(!prompt_with(Some("  \n ")).contains(INJECTED_HEADING));
+    }
+
+    #[test]
+    fn continuations_never_carry_the_injected_section() {
+        let applied = vec!["upsert_edge: alice → berlin".to_string()];
+        let continuation =
+            build_continue_prompt(EXTRACT_EXPLANATION, "user", "assistant", &applied);
+        assert!(!continuation.contains(INJECTED_HEADING));
+        assert!(!continuation.contains("## Current memory state"));
+        assert!(continuation.contains("upsert_edge: alice → berlin"));
+    }
 }

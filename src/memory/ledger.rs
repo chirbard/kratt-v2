@@ -415,6 +415,28 @@ fn parse_routed_payload(payload: &str, attribution: &mut Attribution) {
     };
 }
 
+// The full set of live beliefs retrieval put in front of the model this turn —
+// memory's prediction for the turn. The memory pass uses it to refresh decay
+// clocks and to extract only what the prediction missed.
+pub(super) async fn load_injected_edges(
+    conn: &Connection,
+    turn_id: &str,
+) -> Result<Vec<Edge>, Box<dyn Error + Send + Sync>> {
+    let mut rows = conn
+        .query(
+            "SELECT ed.source, ed.target, ed.content, ed.stability, ed.confidence, ed.importance, ed.subject, ed.date, ed.occurred_at, ed.expired_at, ed.memory_type, ed.origin_session FROM events ev JOIN edges ed ON ed.source = ev.source AND ed.target = ev.target WHERE ev.turn_id = ?1 AND ev.event_type = 'injected' AND ed.expired_at IS NULL GROUP BY ed.source, ed.target",
+            params![turn_id],
+        )
+        .await?;
+    let mut edges = Vec::new();
+    while let Some(row) = rows.next().await? {
+        if let Some(edge) = db::parse_edge_row(&row) {
+            edges.push(edge);
+        }
+    }
+    Ok(edges)
+}
+
 async fn load_top_injected_edges(
     conn: &Connection,
     turn_id: &str,
@@ -961,4 +983,141 @@ async fn load_current_positions(
         positions.insert((actor_type, actor_id), state);
     }
     Ok(positions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Connection, Edge, load_injected_edges};
+    use crate::memory::db;
+    use turso::{Builder, params};
+
+    const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', PRIMARY KEY (source, target))";
+    const EVENTS_DDL: &str = "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')";
+
+    // Fresh in-memory graph: three edges, one of them already expired.
+    async fn harness() -> Connection {
+        let Ok(database) = Builder::new_local(":memory:").build().await else {
+            unreachable!("in-memory database builds")
+        };
+        let Ok(conn) = database.connect() else {
+            unreachable!("in-memory database connects")
+        };
+        let _ = conn.execute(EDGES_DDL, ()).await;
+        let _ = conn.execute(EVENTS_DDL, ()).await;
+        insert_edge(&conn, "alice", "berlin", "2020-01-01", None).await;
+        insert_edge(&conn, "carol", "delhi", "2020-01-01", Some("2024-05-05")).await;
+        insert_edge(&conn, "erin", "faro", "2020-01-01", None).await;
+        conn
+    }
+
+    async fn insert_edge(
+        conn: &Connection,
+        source: &str,
+        target: &str,
+        date: &str,
+        expired_at: Option<&str>,
+    ) {
+        let _ = conn
+            .execute(
+                "INSERT INTO edges (source, target, content, date, expired_at) VALUES (?1, ?2, 'x', ?3, ?4)",
+                params![source, target, date, expired_at],
+            )
+            .await;
+    }
+
+    async fn insert_injected(conn: &Connection, turn_id: &str, source: &str, target: &str) {
+        let _ = conn
+            .execute(
+                "INSERT INTO events (turn_id, event_type, source, target) VALUES (?1, 'injected', ?2, ?3)",
+                params![turn_id, source, target],
+            )
+            .await;
+    }
+
+    async fn edge_date(conn: &Connection, source: &str, target: &str) -> String {
+        let Ok(mut rows) = conn
+            .query(
+                "SELECT date FROM edges WHERE source = ?1 AND target = ?2",
+                params![source, target],
+            )
+            .await
+        else {
+            unreachable!("date query runs")
+        };
+        let Ok(Some(row)) = rows.next().await else {
+            unreachable!("edge exists")
+        };
+        let Ok(value) = row.get_value(0) else {
+            unreachable!("date column reads")
+        };
+        db::text(value)
+    }
+
+    fn injected_for(conn: &Connection, turn_id: &str) -> Vec<Edge> {
+        let Ok(edges) = db::block_on(load_injected_edges(conn, turn_id)) else {
+            unreachable!("loader succeeds")
+        };
+        edges
+    }
+
+    #[test]
+    fn loader_returns_deduplicated_live_edges_for_the_turn_only() {
+        let conn = db::block_on(harness());
+        db::block_on(insert_injected(&conn, "turn-1", "alice", "berlin"));
+        // Same edge injected twice in one turn — retrieval hit it more than once.
+        db::block_on(insert_injected(&conn, "turn-1", "alice", "berlin"));
+        db::block_on(insert_injected(&conn, "turn-1", "carol", "delhi"));
+        db::block_on(insert_injected(&conn, "turn-2", "erin", "faro"));
+
+        let injected = injected_for(&conn, "turn-1");
+        assert_eq!(injected.len(), 1, "expired edge and duplicate are excluded");
+        assert_eq!(injected[0].source, "alice");
+        assert_eq!(injected[0].target, "berlin");
+
+        assert_eq!(injected_for(&conn, "turn-2").len(), 1);
+        assert!(injected_for(&conn, "turn-unknown").is_empty());
+    }
+
+    #[test]
+    fn refresh_sets_today_on_injected_edges_and_spares_the_rest() {
+        let conn = db::block_on(harness());
+        db::block_on(insert_injected(&conn, "turn-1", "alice", "berlin"));
+        db::block_on(insert_injected(&conn, "turn-2", "erin", "faro"));
+
+        let today = crate::prompts::today_iso();
+        let injected = injected_for(&conn, "turn-1");
+        let Ok(refreshed) = db::block_on(db::touch_edge_dates(&conn, &injected, &today)) else {
+            unreachable!("refresh succeeds")
+        };
+        assert_eq!(refreshed, 1);
+
+        assert_eq!(db::block_on(edge_date(&conn, "alice", "berlin")), today);
+        // Injected in a different turn — its clock keeps running.
+        assert_eq!(db::block_on(edge_date(&conn, "erin", "faro")), "2020-01-01");
+    }
+
+    #[test]
+    fn refresh_never_touches_an_expired_edge() {
+        let conn = db::block_on(harness());
+        let expired = Edge {
+            source: "carol".to_string(),
+            target: "delhi".to_string(),
+            content: "x".to_string(),
+            stability: 0.0,
+            confidence: 0.0,
+            importance: 0.0,
+            date: "2020-01-01".to_string(),
+            subject: false,
+            occurred_at: None,
+            expired_at: Some("2024-05-05".to_string()),
+            memory_type: "semantic".to_string(),
+            origin_session: String::new(),
+        };
+        let today = crate::prompts::today_iso();
+        let Ok(refreshed) = db::block_on(db::touch_edge_dates(&conn, &[expired], &today)) else {
+            unreachable!("refresh succeeds")
+        };
+        assert_eq!(refreshed, 0);
+        assert_eq!(db::block_on(edge_date(&conn, "carol", "delhi")), "2020-01-01");
+    }
 }
