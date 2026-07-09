@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::api::{Chunk, LlmClient, ToolCallRequest};
 use crate::prompts::{
     CONSOLIDATE_EXPLANATION, EXTRACT_EXPLANATION, build_agent_prompt, build_classify_prompt,
-    build_scribe_prompt,
+    build_continue_prompt, build_scribe_prompt,
 };
 use crate::runlog;
 use turso::Connection;
@@ -27,6 +27,23 @@ struct AgentRun<'run> {
     assistant_msg: &'run str,
     sender: &'run std::sync::mpsc::Sender<MemoryEvent>,
     user_message_id: &'run str,
+}
+
+// A heavy pass emits a few tool calls per response and is re-prompted until it
+// says DONE, so no single response has to carry the whole pass.
+const MAX_PASS_ITERATIONS: usize = 4; // replay-tunable
+
+struct PassSpec {
+    phase: &'static str,
+    default_memory_type: &'static str,
+    // Re-sent on every continuation so the pass keeps its role; a generic
+    // continuation prompt turned consolidate into a second extractor.
+    explanation: &'static str,
+}
+
+struct IterationOutcome {
+    descriptions: Vec<String>,
+    done: bool,
 }
 
 pub(crate) enum ToolCall {
@@ -136,7 +153,9 @@ impl<'run> AgentRun<'run> {
         let _write_guard = db::acquire_write_lock();
         let conn = db::open_connection()?;
         let prompt = build_scribe_prompt(self.user_msg, self.assistant_msg);
-        self.run_pass(&conn, "scribe", prompt, "episodic")?;
+        // Single-shot on purpose: the scribe records a handful of moves in a
+        // few seconds, and loop latency would sit in the chat critical path.
+        self.run_single_pass(&conn, &scribe_pass(), prompt)?;
         Ok(())
     }
 
@@ -159,7 +178,7 @@ impl<'run> AgentRun<'run> {
             self.assistant_msg,
             None,
         );
-        self.run_pass(&conn, "extract", extract_prompt, "semantic")?;
+        self.run_pass(&conn, &heavy_pass("extract"), extract_prompt)?;
 
         let post_extract_graph = db::load_graph();
         let diff = db::graph_diff_toon(&pre_extract_graph, &post_extract_graph);
@@ -170,7 +189,7 @@ impl<'run> AgentRun<'run> {
             self.assistant_msg,
             if diff.is_empty() { None } else { Some(&diff) },
         );
-        self.run_pass(&conn, "consolidate", consolidate_prompt, "semantic")?;
+        self.run_pass(&conn, &heavy_pass("consolidate"), consolidate_prompt)?;
 
         let final_graph = db::load_graph();
         self.send_log(
@@ -187,11 +206,61 @@ impl<'run> AgentRun<'run> {
     fn run_pass(
         &self,
         conn: &Connection,
-        phase: &'static str,
+        pass: &PassSpec,
         prompt: String,
-        default_memory_type: &'static str,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        self.send_log(phase, "calling LLM…".to_string());
+        self.drive_pass(pass, prompt, |iteration, iteration_prompt| {
+            self.run_iteration(conn, pass, iteration, iteration_prompt)
+        })
+    }
+
+    fn run_single_pass(
+        &self,
+        conn: &Connection,
+        pass: &PassSpec,
+        prompt: String,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.run_iteration(conn, pass, 1, prompt)?;
+        self.send_log(pass.phase, "done".to_string());
+        Ok(())
+    }
+
+    // Emit → apply → re-prompt. Continuations carry only the exchange and a
+    // one-line summary of what was applied, never the full graph again.
+    fn drive_pass<Iterate>(
+        &self,
+        pass: &PassSpec,
+        first_prompt: String,
+        mut iterate: Iterate,
+    ) -> Result<(), Box<dyn Error + Send + Sync>>
+    where
+        Iterate: FnMut(usize, String) -> Result<IterationOutcome, Box<dyn Error + Send + Sync>>,
+    {
+        let mut prompt = first_prompt;
+        let mut applied: Vec<String> = Vec::new();
+        for iteration in 1..=MAX_PASS_ITERATIONS {
+            let outcome = iterate(iteration, prompt)?;
+            if outcome.done || iteration == MAX_PASS_ITERATIONS {
+                break;
+            }
+            // Continuations must list everything applied so far, not just the
+            // latest iteration, or the model re-emits earlier calls.
+            applied.extend(outcome.descriptions);
+            prompt =
+                build_continue_prompt(pass.explanation, self.user_msg, self.assistant_msg, &applied);
+        }
+        self.send_log(pass.phase, "done".to_string());
+        Ok(())
+    }
+
+    fn run_iteration(
+        &self,
+        conn: &Connection,
+        pass: &PassSpec,
+        iteration: usize,
+        prompt: String,
+    ) -> Result<IterationOutcome, Box<dyn Error + Send + Sync>> {
+        self.send_log(pass.phase, format!("iteration {iteration}: calling LLM…"));
         let call_text = match stream_collect(
             Arc::clone(&self.llm),
             prompt,
@@ -200,22 +269,24 @@ impl<'run> AgentRun<'run> {
         ) {
             Ok(call_text) => call_text,
             Err(err) => {
-                self.send_log(phase, format!("error: {err}"));
+                self.send_log(pass.phase, format!("error: {err}"));
                 return Err(err);
             }
         };
         let tool_calls = parse_tool_calls(&call_text);
-        if tool_calls.is_empty() {
-            self.send_log(phase, "no tool calls".to_string());
-        } else {
-            self.send_log(phase, format!("{} tool calls", tool_calls.len()));
+        self.send_log(
+            pass.phase,
+            format!("iteration {iteration}: {} tool calls", tool_calls.len()),
+        );
+        // A response may both apply calls and declare the pass finished.
+        let done = tool_calls.is_empty() || says_done(&call_text);
+        match apply_tool_calls(self, conn, pass.phase, tool_calls, pass.default_memory_type) {
+            Ok(descriptions) => Ok(IterationOutcome { descriptions, done }),
+            Err(err) => {
+                self.send_log(pass.phase, format!("error: {err}"));
+                Err(err)
+            }
         }
-        if let Err(err) = apply_tool_calls(self, conn, phase, tool_calls, default_memory_type) {
-            self.send_log(phase, format!("error: {err}"));
-            return Err(err);
-        }
-        self.send_log(phase, "done".to_string());
-        Ok(())
     }
 
     fn send_log(&self, phase: &'static str, text: String) {
@@ -226,6 +297,39 @@ impl<'run> AgentRun<'run> {
     fn send_append(&self, phase: &'static str, text: String) {
         let _ = self.sender.send(MemoryEvent::Append { phase, text });
     }
+}
+
+fn heavy_pass(phase: &'static str) -> PassSpec {
+    let explanation = if phase == "extract" {
+        EXTRACT_EXPLANATION
+    } else {
+        CONSOLIDATE_EXPLANATION
+    };
+    PassSpec {
+        phase,
+        default_memory_type: "semantic",
+        explanation,
+    }
+}
+
+fn scribe_pass() -> PassSpec {
+    PassSpec {
+        phase: "scribe",
+        default_memory_type: "episodic",
+        // Never used: the scribe is single-shot and does not continue.
+        explanation: "",
+    }
+}
+
+// Whole-word match: substring matching would fire on "abandoned"/"undone"
+// inside prose or edge content and kill the pass early.
+fn says_done(text: &str) -> bool {
+    for token in text.split(|letter: char| !letter.is_ascii_alphanumeric()) {
+        if token.eq_ignore_ascii_case("done") {
+            return true;
+        }
+    }
+    false
 }
 
 pub(super) fn stream_collect(
@@ -662,9 +766,10 @@ fn apply_tool_calls<'agent_run>(
     phase: &'static str,
     tool_calls: Vec<ToolCall>,
     default_memory_type: &'static str,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
     db::begin_transaction(conn)?;
     let mut events: Vec<Event> = Vec::new();
+    let mut descriptions: Vec<String> = Vec::new();
     let result = (|| {
         let options = ApplyToolOptions {
             actor: Actor::new("system", phase),
@@ -676,7 +781,8 @@ fn apply_tool_calls<'agent_run>(
         };
         for call in tool_calls {
             let description = apply_tool_call(call, conn, &options, &mut events)?;
-            agent_run.send_log(phase, description);
+            agent_run.send_log(phase, description.clone());
+            descriptions.push(description);
         }
         db::block_on(ledger::record_events_in_tx(conn, &events))
     })();
@@ -687,7 +793,7 @@ fn apply_tool_calls<'agent_run>(
         return Err(err);
     }
     db::commit_transaction(conn)?;
-    Ok(())
+    Ok(descriptions)
 }
 
 #[rustfmt::skip]
@@ -938,7 +1044,132 @@ fn mutation_context(source_message_id: &str) -> EventContext {
 
 #[cfg(test)]
 mod tests {
-    use super::{ToolCall, TurnMode, parse_tool_calls, parse_turn_mode};
+    use super::{
+        AgentRun, IterationOutcome, MAX_PASS_ITERATIONS, MemoryEvent, ToolCall, TurnMode,
+        parse_tool_calls, parse_turn_mode, says_done, stream_collect,
+    };
+    use crate::api::{Chunk, LlmClient, Stats, TurnOutcome};
+    use std::error::Error;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::mpsc::{Receiver, Sender};
+
+    // Replays one canned response per stream() call; the loop under test never
+    // reaches the DB, so only the LLM half of an iteration is exercised.
+    struct ScriptedClient {
+        responses: Mutex<Vec<String>>,
+    }
+
+    impl ScriptedClient {
+        fn scripted(responses: &[&str]) -> Arc<dyn LlmClient> {
+            let mut queued: Vec<String> = Vec::new();
+            for text in responses.iter().rev() {
+                queued.push((*text).to_string());
+            }
+            Arc::new(ScriptedClient {
+                responses: Mutex::new(queued),
+            })
+        }
+    }
+
+    impl LlmClient for ScriptedClient {
+        fn collect(&self, _prompt: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+            unimplemented!("scripted client streams only")
+        }
+
+        fn stream(&self, _prompt: String, _system: Option<String>, sender: Sender<Chunk>) {
+            let Ok(mut queued) = self.responses.lock() else {
+                return;
+            };
+            // Running dry means the loop asked for more turns than scripted;
+            // an empty reply reads as "no tool calls" and ends the pass.
+            let text = queued.pop().unwrap_or_default();
+            let _ = sender.send(Chunk::Content(text));
+            let _ = sender.send(Chunk::Done(Stats {
+                tokens_in: 0,
+                tokens_out: 0,
+                cost_usd: None,
+                ttft_ms: 0,
+            }));
+        }
+
+        fn stream_turn(
+            &self,
+            _messages: &[serde_json::Value],
+            _tools: Option<&serde_json::Value>,
+            _sender: &Sender<Chunk>,
+        ) -> Result<TurnOutcome, Box<dyn Error + Send + Sync>> {
+            unimplemented!("scripted client streams only")
+        }
+    }
+
+    const ONE_CALL: &str =
+        r#"{"tools":[{"tool":"delete_edge","args":{"source":"a","target":"b"}}]}"#;
+
+    // Counts iterations by driving drive_pass with an iterate closure that does
+    // the real LLM + parse work but stubs out the DB write.
+    fn count_iterations(responses: &[&str]) -> usize {
+        let (sender, receiver): (Sender<MemoryEvent>, Receiver<MemoryEvent>) =
+            std::sync::mpsc::channel();
+        let llm = ScriptedClient::scripted(responses);
+        let agent_run = AgentRun {
+            llm,
+            user_msg: "user",
+            assistant_msg: "assistant",
+            sender: &sender,
+            user_message_id: "msg-1",
+        };
+        let mut iterations = 0usize;
+        let pass = super::heavy_pass("extract");
+        let result = agent_run.drive_pass(&pass, "first prompt".to_string(), |_index, prompt| {
+            iterations += 1;
+            let call_text = stream_collect(Arc::clone(&agent_run.llm), prompt, drop, drop)?;
+            let tool_calls = parse_tool_calls(&call_text);
+            let done = tool_calls.is_empty() || says_done(&call_text);
+            let mut descriptions = Vec::new();
+            for _call in &tool_calls {
+                descriptions.push("applied".to_string());
+            }
+            Ok(IterationOutcome { descriptions, done })
+        });
+        assert!(result.is_ok());
+        drop(receiver);
+        iterations
+    }
+
+    #[test]
+    fn pass_stops_when_the_model_reports_done() {
+        assert_eq!(count_iterations(&[ONE_CALL, "DONE"]), 2);
+    }
+
+    #[test]
+    fn pass_stops_immediately_when_no_tool_calls_are_emitted() {
+        assert_eq!(count_iterations(&["nothing to record here"]), 1);
+    }
+
+    #[test]
+    fn pass_stops_at_the_iteration_cap_when_the_model_never_finishes() {
+        let responses = vec![ONE_CALL; MAX_PASS_ITERATIONS + 2];
+        assert_eq!(count_iterations(&responses), MAX_PASS_ITERATIONS);
+    }
+
+    #[test]
+    fn done_detection_tolerates_prose_and_casing() {
+        assert!(says_done("done"));
+        assert!(says_done("  Done.\n"));
+        assert!(says_done("Nothing else remains — DONE"));
+        assert!(!says_done(ONE_CALL));
+        assert!(!says_done("the plan was abandoned, work undone"));
+    }
+
+    #[test]
+    fn a_response_with_both_tool_calls_and_done_applies_then_stops() {
+        let mixed = format!("{ONE_CALL}\nDONE");
+        let calls = parse_tool_calls(&mixed);
+        assert_eq!(calls.len(), 1);
+        assert!(says_done(&mixed));
+        assert_eq!(count_iterations(&[&mixed]), 1);
+    }
 
     #[test]
     fn turn_mode_parses_task_and_chat_and_defaults_to_conversation() {

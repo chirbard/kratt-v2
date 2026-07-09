@@ -18,7 +18,8 @@ pub const EXTRACT_EXPLANATION: &str = r#"You are an aggressive extraction agent 
 - No respond call; always set date=today on every upsert_edge
 - Post-training facts (software versions, release dates, world events) are highest priority — prefer user's stated version over training data; extract even if stated casually
 - If a fact is already in the graph and the conversation touches it, upsert with date=today and confidence raised toward 0.9
-- If the assistant cites or corrects a fact from a web result, extract with confidence 0.9"#;
+- If the assistant cites or corrects a fact from a web result, extract with confidence 0.9
+- Emit at most 8 tool calls in this response. If more work remains you will be asked to continue, so never rush the rest in"#;
 
 pub const CONSOLIDATE_EXPLANATION: &str = r#"You are a quality-gate agent for a memory graph. The extract agent just ran — your job is to audit its changes and push back where needed.
 
@@ -28,7 +29,8 @@ The diff below shows exactly what extract added (+) and removed (-). Focus on th
 - Merge nodes that duplicate existing ones: re-add their edges under the canonical name, delete_node the duplicate
 - Reword edge content to match the closest existing predicate template when one clearly fits
 - Fix any fact node missing a subject edge (subject=true, importance=1.0) to its primary entity
-- Do not add new nodes or edges beyond corrections and merges"#;
+- Do not add new nodes or edges beyond corrections and merges
+- Emit at most 8 tool calls in this response. If more work remains you will be asked to continue, so never rush the rest in"#;
 
 pub const CLASSIFY_TURN: &str = r#"Classify this conversation turn. Answer with exactly one word: TASK or CHAT.
 
@@ -165,6 +167,45 @@ pub fn build_agent_prompt(
         prompt.push_str(diff);
     }
     prompt.push_str("\n\n## Exchange to process\n\nUser: ");
+    prompt.push_str(user_msg);
+    prompt.push_str("\nAssistant: ");
+    prompt.push_str(assistant_msg);
+    prompt
+}
+
+pub const CONTINUE_PASS: &str = r#"You are continuing the pass described above. The tool calls listed under "Already applied" were made by you earlier in this pass and are committed — never repeat them. Your role and its restrictions still apply in full.
+
+Emit at most 8 further tool calls. If nothing remains to do, reply with the single word DONE and no JSON."#;
+
+pub fn build_continue_prompt(
+    explanation: &str,
+    user_msg: &str,
+    assistant_msg: &str,
+    applied: &[String],
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str(explanation);
+    prompt.push_str("\n\n");
+    prompt.push_str(CONTINUE_PASS);
+    prompt.push_str("\n\n**Today's date: ");
+    prompt.push_str(&today_iso());
+    prompt.push_str("**");
+    prompt.push_str("\n\n");
+    prompt.push_str(JSON_OUTPUT_RULES);
+    prompt.push_str("\n\n");
+    prompt.push_str(TOOL_DEFINITIONS);
+    prompt.push_str("\n\n");
+    prompt.push_str(MEMORY_RULES);
+    prompt.push_str("\n\n## Already applied\n\n");
+    if applied.is_empty() {
+        prompt.push_str("(nothing)");
+    }
+    for description in applied {
+        prompt.push_str("- ");
+        prompt.push_str(description);
+        prompt.push('\n');
+    }
+    prompt.push_str("\n## Exchange being processed\n\nUser: ");
     prompt.push_str(user_msg);
     prompt.push_str("\nAssistant: ");
     prompt.push_str(assistant_msg);
