@@ -19,12 +19,14 @@ pub struct RecentEntry {
     pub timestamp: String,
 }
 
+pub fn sessions_dir() -> PathBuf {
+    PathBuf::from(crate::paths::data_dir()).join("sessions")
+}
+
 pub fn new_session_path() -> PathBuf {
     let created_at = timestamp_now();
     let filename = created_at.replace(':', "-");
-    let path = PathBuf::from("kratt-data")
-        .join("sessions")
-        .join(format!("{filename}.jsonl"));
+    let path = sessions_dir().join(format!("{filename}.jsonl"));
     let session_id = session_id_from_path(&path);
     memory::register_session(&session_id, &created_at);
     path

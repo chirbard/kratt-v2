@@ -2,8 +2,6 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-const TOON_PATH: &str = "kratt-data/kratt-graph.toon";
-
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Node {
     pub node_type: String,
@@ -172,7 +170,7 @@ pub fn normalize_id(input: &str) -> String {
 }
 
 pub fn load_from_toon() -> Graph {
-    let toon_text = match std::fs::read_to_string(TOON_PATH) {
+    let toon_text = match std::fs::read_to_string(crate::paths::data_file("kratt-graph.toon")) {
         Ok(contents) => contents,
         Err(_) => return Graph::new(),
     };

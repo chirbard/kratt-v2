@@ -8,8 +8,8 @@ use turso::{Builder, Connection, Database, Value, params};
 
 use super::graph::{Edge, Graph, Node, load_from_toon, normalize_id};
 
-const DATA_DIR: &str = "kratt-data";
-const DB_PATH: &str = "kratt-data/kratt.db";
+use crate::paths;
+
 pub type SemanticEdgeRow = (
     String,
     String,
@@ -44,8 +44,6 @@ where
 // runs on a Turso-Cloud-synced local file (separate from the legacy plain
 // file so the old database stays intact as a fallback). On first synced run
 // with an empty synced database, legacy data is copied over automatically.
-const SYNCED_DB_PATH: &str = "kratt-data/kratt-synced.db";
-
 enum DbHandle {
     Local(Database),
     Synced(turso::sync::Database),
@@ -66,7 +64,7 @@ fn database() -> &'static DbHandle {
     // OnceLock::get_or_init requires FnOnce() -> T — no way to propagate errors
     DATABASE.get_or_init(|| {
         runtime().block_on(async {
-            std::fs::create_dir_all(DATA_DIR).expect("create data dir");
+            std::fs::create_dir_all(paths::data_dir()).expect("create data dir");
             match sync_credentials() {
                 Some((url, token)) => DbHandle::Synced(open_synced(&url, &token).await),
                 None => DbHandle::Local(open_local().await),
@@ -77,7 +75,7 @@ fn database() -> &'static DbHandle {
 
 #[allow(clippy::expect_used)]
 async fn open_local() -> Database {
-    let database = Builder::new_local(DB_PATH)
+    let database = Builder::new_local(&paths::data_file("kratt.db"))
         .experimental_index_method(true)
         .build()
         .await
@@ -89,7 +87,7 @@ async fn open_local() -> Database {
 
 #[allow(clippy::expect_used)]
 async fn open_synced(url: &str, token: &str) -> turso::sync::Database {
-    let database = turso::sync::Builder::new_remote(SYNCED_DB_PATH)
+    let database = turso::sync::Builder::new_remote(&paths::data_file("kratt-synced.db"))
         .with_remote_url(url)
         .with_auth_token(token)
         .experimental_index_method(true)
@@ -255,11 +253,12 @@ async fn migrate_legacy_if_empty(conn: &Connection) -> Result<(), Box<dyn Error 
     if node_count(conn).await? > 0 {
         return Ok(());
     }
-    if !std::path::Path::new(DB_PATH).exists() {
+    let legacy_path = paths::data_file("kratt.db");
+    if !std::path::Path::new(&legacy_path).exists() {
         return Ok(());
     }
     crate::runlog::log("sync", "migrating legacy kratt.db into synced database");
-    let legacy = Builder::new_local(DB_PATH)
+    let legacy = Builder::new_local(&legacy_path)
         .experimental_index_method(true)
         .build()
         .await?;
