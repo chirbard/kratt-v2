@@ -20,6 +20,13 @@ pub fn today_iso() -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+// Hour of the current day on the server clock (0-23), derived from the same
+// epoch computation as the rest of the app — the dream window is expressed in
+// these terms.
+pub fn current_hour() -> u32 {
+    ((epoch_seconds_now() % 86_400) / 3_600) as u32
+}
+
 pub fn epoch_seconds_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
