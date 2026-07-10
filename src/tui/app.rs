@@ -6,7 +6,6 @@ use crate::memory::{self, DreamEvent, ExploreEvent, IngestEvent, MemoryEvent};
 use crate::session;
 use crate::web::SearchClient;
 
-pub(crate) const RECENT_TURNS: usize = 2;
 // replay-tunable.
 pub(crate) const SCHEDULER_IDLE_TICKS: u64 = 1875; // replay-tunable. ~30 seconds at 62.5fps (1000ms/16ms polling)
 pub(crate) const SCHEDULER_MAX_CONSECUTIVE: u32 = 6;
@@ -630,19 +629,25 @@ fn run_scheduler(app: &mut App) {
         }
     }
 
-    // Check if we've exceeded the maximum consecutive actions
-    if app.scheduler_consecutive_actions >= SCHEDULER_MAX_CONSECUTIVE {
-        app.autonomous_mode = false;
-        crate::runlog::log(
-            "sched",
-            &format!(
-                "autonomous mode disabled after {} consecutive actions with no user interaction",
-                SCHEDULER_MAX_CONSECUTIVE
-            ),
-        );
-        app.scheduler_consecutive_actions = 0;
-    }
+    enforce_runaway_guard(app);
 
     // Unpause scheduler - it will be paused again if another action starts
     app.scheduler_paused = false;
+}
+
+// Runaway guard: bounds API spend by switching autonomous mode off after too
+// many consecutive dispatches with no user interaction.
+fn enforce_runaway_guard(app: &mut App) {
+    if app.scheduler_consecutive_actions < SCHEDULER_MAX_CONSECUTIVE {
+        return;
+    }
+    app.autonomous_mode = false;
+    crate::runlog::log(
+        "sched",
+        &format!(
+            "autonomous mode disabled after {} consecutive actions with no user interaction",
+            SCHEDULER_MAX_CONSECUTIVE
+        ),
+    );
+    app.scheduler_consecutive_actions = 0;
 }

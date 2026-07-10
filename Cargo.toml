@@ -11,6 +11,7 @@ ratatui = "0.30.2"
 reqwest = { version = "0.13.4", features = ["blocking", "json"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+signal-hook = "0.4.4"
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 toon = "0.1"
 turso = { version = "0.6.1", features = ["fts", "sync"] }

@@ -12,9 +12,12 @@
 
 mod api;
 mod memory;
+mod paths;
 mod prompts;
 mod runlog;
 mod session;
+mod telegram;
+mod turn;
 mod timeutil;
 mod tui;
 mod web;
@@ -58,8 +61,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let (embed_tx, _embed_rx) = std::sync::mpsc::channel::<memory::MemoryEvent>();
     memory::run_embed_pass(Arc::clone(&embed), &embed_tx);
-    let session_path = session::new_session_path();
-    let result = tui::run(chat_llm, memory_llm, embed, search, session_path);
+    // Same binary, two faces: --telegram runs the headless gateway daemon, no
+    // args runs the interactive TUI. One process owns kratt-data/.
+    let result = if telegram_mode() {
+        telegram::run(chat_llm, memory_llm, embed, search)
+    } else {
+        let session_path = session::new_session_path();
+        tui::run(chat_llm, memory_llm, embed, search, session_path)
+    };
     memory::sync_push_best_effort("app exit");
     result
+}
+
+fn telegram_mode() -> bool {
+    for arg in std::env::args() {
+        if arg == "--telegram" {
+            return true;
+        }
+    }
+    false
 }

@@ -121,7 +121,7 @@ fn load_entries(path: &Path) -> Vec<SessionEntry> {
 }
 
 fn list_session_files() -> Vec<PathBuf> {
-    let read_dir = match std::fs::read_dir(Path::new("kratt-data").join("sessions")) {
+    let read_dir = match std::fs::read_dir(crate::session::sessions_dir()) {
         Ok(read_dir) => read_dir,
         Err(_) => return Vec::new(),
     };

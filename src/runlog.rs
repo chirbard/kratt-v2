@@ -1,16 +1,16 @@
 use std::io::Write;
 
+use crate::paths;
 use crate::timeutil;
-
-const LOG_DIR: &str = "kratt-data/logs";
 
 pub fn log(area: &str, text: &str) {
     if area.trim().is_empty() || text.trim().is_empty() {
         return;
     }
     let day = timeutil::today_iso();
-    let path = format!("{LOG_DIR}/kratt-{day}.log");
-    if std::fs::create_dir_all(LOG_DIR).is_err() {
+    let log_dir = paths::data_file("logs");
+    let path = format!("{log_dir}/kratt-{day}.log");
+    if std::fs::create_dir_all(&log_dir).is_err() {
         return;
     }
     let mut file = match std::fs::OpenOptions::new()

@@ -1,0 +1,191 @@
+2026-07-10T18:16:34 [sync] pull ok — changed: false
+2026-07-10T18:16:35 [sync] push ok (embed)
+2026-07-10T18:16:35 [embed] 37 edges embedded
+2026-07-10T18:16:35 [tg] gateway started — long polling
+2026-07-10T18:16:49 [tg] update from 8300795606 in chat 8300795606
+2026-07-10T18:16:49 [tg] opened session tg-2026-07-10
+2026-07-10T18:16:51 [routing] routing: historian 0.16 (pos+dir)
+2026-07-10T18:16:51 [chat] injected edges: 60
+2026-07-10T18:16:51 [chat] memory context built in 1576ms
+2026-07-10T18:17:17 [mem] turn classified: chat
+2026-07-10T18:17:17 [mem] refreshed decay clock on 60 injected edges
+2026-07-10T18:17:22 [extract] iteration 1: calling LLM…
+2026-07-10T18:17:27 [extract] iteration 1: 0 tool calls
+2026-07-10T18:17:27 [extract] done
+2026-07-10T18:17:27 [consolidate] iteration 1: calling LLM…
+2026-07-10T18:17:31 [consolidate] iteration 1: 0 tool calls
+2026-07-10T18:17:31 [consolidate] done
+2026-07-10T18:17:31 [memory] saved — 881 nodes, 1283 edges
+2026-07-10T18:17:34 [sync] push ok (memory agent)
+2026-07-10T18:17:34 [tg] answer sent
+2026-07-10T18:17:34 [tg] update from 8300795606 in chat 8300795606
+2026-07-10T18:17:35 [routing] routing: historian 0.03 (pos+dir)
+2026-07-10T18:17:35 [chat] injected edges: 150
+2026-07-10T18:17:35 [chat] memory context built in 873ms
+2026-07-10T18:17:38 [mem] turn classified: chat
+2026-07-10T18:17:38 [mem] refreshed decay clock on 150 injected edges
+2026-07-10T18:17:43 [extract] iteration 1: calling LLM…
+2026-07-10T18:17:48 [extract] iteration 1: 0 tool calls
+2026-07-10T18:17:49 [extract] done
+2026-07-10T18:17:49 [consolidate] iteration 1: calling LLM…
+2026-07-10T18:17:51 [consolidate] iteration 1: 0 tool calls
+2026-07-10T18:17:51 [consolidate] done
+2026-07-10T18:17:51 [memory] saved — 881 nodes, 1283 edges
+2026-07-10T18:17:52 [sync] push ok (memory agent)
+2026-07-10T18:17:52 [tg] answer sent
+2026-07-10T18:18:43 [sync] push ok (telegram exit)
+2026-07-10T18:18:43 [tg] gateway stopped
+2026-07-10T18:18:43 [sync] push ok (app exit)
+2026-07-10T18:23:52 [sync] pull ok — changed: true
+2026-07-10T18:24:11 [sync] push ok (embed)
+2026-07-10T18:24:11 [embed] 1101 edges embedded
+2026-07-10T18:24:11 [tg] gateway started — long polling
+2026-07-10T18:24:11 [tg] update from 8300795606 in chat 8300795606
+2026-07-10T18:24:11 [tg] opened session tg-2026-07-10
+2026-07-10T18:24:13 [routing] routing: historian 0.24 (pos+dir)
+2026-07-10T18:24:13 [chat] injected edges: 60
+2026-07-10T18:24:13 [chat] memory context built in 1432ms
+2026-07-10T18:24:27 [mem] turn classified: chat
+2026-07-10T18:24:27 [mem] refreshed decay clock on 60 injected edges
+2026-07-10T18:24:32 [extract] iteration 1: calling LLM…
+2026-07-10T18:24:40 [extract] iteration 1: 12 tool calls
+2026-07-10T18:24:40 [extract] upsert_node: fable-5-suspended-then-lifted (fact)
+2026-07-10T18:24:40 [extract] upsert_edge: assistant → fable-5-suspended-then-lifted
+2026-07-10T18:24:40 [extract] upsert_node: gemini-3_5_pro-july-launch-awaiting-federal-review (fact)
+2026-07-10T18:24:40 [extract] upsert_edge: assistant → gemini-3_5_pro-july-launch-awaiting-federal-review
+2026-07-10T18:24:40 [extract] upsert_node: white-house-ai-standards-framework (fact)
+2026-07-10T18:24:40 [extract] upsert_edge: assistant → white-house-ai-standards-framework
+2026-07-10T18:24:40 [extract] upsert_node: 1m-context-open-models (fact)
+2026-07-10T18:24:40 [extract] upsert_edge: assistant → 1m-context-open-models
+2026-07-10T18:24:40 [extract] upsert_node: david-ondrej-open-sourced-agent-skills (fact)
+2026-07-10T18:24:40 [extract] upsert_edge: assistant → david-ondrej-open-sourced-agent-skills
+2026-07-10T18:24:40 [extract] upsert_node: tufa-labs-demo-llm-python-repl-agent (fact)
+2026-07-10T18:24:40 [extract] upsert_edge: assistant → tufa-labs-demo-llm-python-repl-agent
+2026-07-10T18:24:40 [extract] iteration 2: calling LLM…
+2026-07-10T18:24:55 [extract] iteration 2: 8 tool calls
+2026-07-10T18:24:55 [extract] upsert_node: openai-gpt-5.6 (entity)
+2026-07-10T18:24:55 [extract] upsert_node: sakana-ai-fugu-ultra (entity)
+2026-07-10T18:24:55 [extract] upsert_node: openai-gpt-5.6-preview-broad-access (fact)
+2026-07-10T18:24:55 [extract] upsert_node: sakana-ai-fugu-ultra-launched (fact)
+2026-07-10T18:24:55 [extract] upsert_edge: openai-gpt-5.6 → openai-gpt-5.6-preview-broad-access
+2026-07-10T18:24:55 [extract] upsert_edge: openai-gpt-5.6-preview-broad-access → openai-gpt-5.6
+2026-07-10T18:24:55 [extract] upsert_edge: sakana-ai-fugu-ultra → sakana-ai-fugu-ultra-launched
+2026-07-10T18:24:55 [extract] upsert_edge: sakana-ai-fugu-ultra-launched → sakana-ai-fugu-ultra
+2026-07-10T18:24:55 [extract] iteration 3: calling LLM…
+2026-07-10T18:25:03 [extract] iteration 3: 6 tool calls
+2026-07-10T18:25:03 [extract] upsert_node: openai-gpt-5.6-preview-june-26-2026 (fact)
+2026-07-10T18:25:03 [extract] upsert_edge: openai-gpt-5.6 → openai-gpt-5.6-preview-june-26-2026
+2026-07-10T18:25:03 [extract] upsert_edge: openai-gpt-5.6-preview-june-26-2026 → openai-gpt-5.6
+2026-07-10T18:25:03 [extract] upsert_node: 1m-context-open-models-released-june-2026 (fact)
+2026-07-10T18:25:03 [extract] upsert_edge: 1m-context-open-models → 1m-context-open-models-released-june-2026
+2026-07-10T18:25:03 [extract] upsert_edge: 1m-context-open-models-released-june-2026 → 1m-context-open-models
+2026-07-10T18:25:03 [extract] iteration 4: calling LLM…
+2026-07-10T18:25:22 [extract] iteration 4: 7 tool calls
+2026-07-10T18:25:22 [extract] upsert_node: Google Gemini 3.5 Pro (entity)
+2026-07-10T18:25:22 [extract] upsert_node: gemini-3_5_pro-cleared-for-july-launch (fact)
+2026-07-10T18:25:22 [extract] upsert_edge: gemini-3_5_pro-cleared-for-july-launch → google-gemini-3.5-pro
+2026-07-10T18:25:22 [extract] upsert_edge: google-gemini-3.5-pro → gemini-3_5_pro-cleared-for-july-launch
+2026-07-10T18:25:22 [extract] upsert_node: openai-gpt-5.6-preview-limited-to-20-gov-orgs (fact)
+2026-07-10T18:25:22 [extract] upsert_edge: openai-gpt-5.6-preview-limited-to-20-gov-orgs → openai-gpt-5.6
+2026-07-10T18:25:22 [extract] upsert_edge: openai-gpt-5.6 → openai-gpt-5.6-preview-limited-to-20-gov-orgs
+2026-07-10T18:25:22 [extract] done
+2026-07-10T18:25:22 [consolidate] iteration 1: calling LLM…
+2026-07-10T18:25:47 [consolidate] iteration 1: 7 tool calls
+2026-07-10T18:25:47 [consolidate] delete_node: 1m-context-open-models
+2026-07-10T18:25:47 [consolidate] upsert_node: 1m-context-open-models-released-june-2026 (fact)
+2026-07-10T18:25:47 [consolidate] upsert_node: david-ondrej-open-sourced-agent-skills (fact)
+2026-07-10T18:25:47 [consolidate] upsert_node: gemini-3_5_pro-cleared-for-july-launch (fact)
+2026-07-10T18:25:47 [consolidate] upsert_node: david-ondrej (entity)
+2026-07-10T18:25:47 [consolidate] upsert_node: tufa-labs (entity)
+2026-07-10T18:25:47 [consolidate] upsert_node: white-house (entity)
+2026-07-10T18:25:47 [consolidate] iteration 2: calling LLM…
+2026-07-10T18:25:56 [consolidate] iteration 2: 0 tool calls
+2026-07-10T18:25:56 [consolidate] done
+2026-07-10T18:25:56 [memory] saved — 898 nodes, 1298 edges
+2026-07-10T18:26:01 [sync] push ok (memory agent)
+2026-07-10T18:26:01 [tg] answer sent
+2026-07-10T18:27:17 [tg] shutting down gracefully — finishing in-flight turn and saving memory (Ctrl-C again to force quit)
+2026-07-10T18:27:42 [sync] push ok (telegram exit)
+2026-07-10T18:27:42 [tg] gateway stopped
+2026-07-10T18:27:42 [sync] push ok (app exit)
+2026-07-10T18:30:42 [sync] pull ok — changed: true
+2026-07-10T18:30:43 [sync] push ok (embed)
+2026-07-10T18:30:43 [embed] 15 edges embedded
+2026-07-10T18:30:43 [tg] kratt telegram gateway ready — long polling (Ctrl-C to stop)
+2026-07-10T18:31:19 [tg] update from 8300795606 in chat 8300795606
+2026-07-10T18:31:19 [tg] opened session tg-2026-07-10
+2026-07-10T18:31:21 [routing] routing: historian 0.21 (pos+dir)
+2026-07-10T18:31:21 [chat] injected edges: 60
+2026-07-10T18:31:21 [chat] memory context built in 1598ms
+2026-07-10T18:31:37 [mem] turn classified: task
+2026-07-10T18:31:37 [mem] refreshed decay clock on 60 injected edges
+2026-07-10T18:31:37 [scribe] iteration 1: calling LLM…
+2026-07-10T18:31:40 [scribe] iteration 1: 5 tool calls
+2026-07-10T18:31:40 [scribe] upsert_node: gpt-56-availability (fact)
+2026-07-10T18:31:40 [scribe] upsert_node: assistant (entity)
+2026-07-10T18:31:40 [scribe] upsert_node: llm-news-table (entity)
+2026-07-10T18:31:40 [mem] episodic edge assistant → gpt-56-availability (session tg-2026-07-10)
+2026-07-10T18:31:40 [scribe] upsert_edge: assistant → gpt-56-availability
+2026-07-10T18:31:40 [mem] episodic edge assistant → llm-news-table (session tg-2026-07-10)
+2026-07-10T18:31:40 [scribe] upsert_edge: assistant → llm-news-table
+2026-07-10T18:31:40 [scribe] done
+2026-07-10T18:31:41 [sync] push ok (memory agent)
+2026-07-10T18:31:42 [tg] answer sent
+2026-07-10T18:34:18 [tg] shutting down gracefully — finishing in-flight turn and saving memory (Ctrl-C again to force quit)
+2026-07-10T18:35:03 [sync] push ok (telegram exit)
+2026-07-10T18:35:03 [tg] gateway stopped
+2026-07-10T18:35:03 [sync] push ok (app exit)
+2026-07-10T18:35:12 [sync] pull ok — changed: true
+2026-07-10T18:35:13 [sync] push ok (embed)
+2026-07-10T18:35:13 [embed] 2 edges embedded
+2026-07-10T18:35:13 [tg] kratt telegram gateway ready — long polling (Ctrl-C to stop)
+2026-07-10T18:35:31 [tg] update from 8300795606 in chat 8300795606
+2026-07-10T18:35:31 [tg] opened session tg-2026-07-10
+2026-07-10T18:35:33 [routing] routing: historian 0.25 (pos+dir)
+2026-07-10T18:35:33 [chat] injected edges: 60
+2026-07-10T18:35:33 [chat] memory context built in 1493ms
+2026-07-10T18:36:05 [mem] turn classified: chat
+2026-07-10T18:36:05 [mem] refreshed decay clock on 60 injected edges
+2026-07-10T18:36:10 [extract] iteration 1: calling LLM…
+2026-07-10T18:36:36 [extract] iteration 1: 8 tool calls
+2026-07-10T18:36:36 [extract] upsert_node: gemma4 (fact)
+2026-07-10T18:36:36 [extract] upsert_node: gemma4-has-256k-context (fact)
+2026-07-10T18:36:36 [extract] upsert_node: qwen35small (fact)
+2026-07-10T18:36:36 [extract] upsert_node: qwen35small-has-0p8b (fact)
+2026-07-10T18:36:37 [extract] upsert_node: phi4mini (fact)
+2026-07-10T18:36:37 [extract] upsert_node: smolLM2 (fact)
+2026-07-10T18:36:37 [extract] upsert_edge: gemma4-has-256k-context → 256k-context-window
+2026-07-10T18:36:37 [extract] upsert_edge: qwen35small-has-0p8b → qwen3-5-0.8b
+2026-07-10T18:36:37 [extract] iteration 2: calling LLM…
+2026-07-10T18:36:46 [extract] iteration 2: 5 tool calls
+2026-07-10T18:36:46 [extract] upsert_node: NVIDIA Nemotron 3 Nano Omni (fact)
+2026-07-10T18:36:46 [extract] upsert_node: Tiiny AI Pocket Lab (fact)
+2026-07-10T18:36:46 [extract] upsert_node: CES 2026 (fact)
+2026-07-10T18:36:46 [extract] upsert_node: Tiny Model Trend 2026 (fact)
+2026-07-10T18:36:46 [extract] upsert_node: Gemma 4 2B runs on smartphones (fact)
+2026-07-10T18:36:46 [extract] iteration 3: calling LLM…
+2026-07-10T18:37:02 [extract] iteration 3: 8 tool calls
+2026-07-10T18:37:02 [extract] upsert_node: gemma4-is-multimodal (fact)
+2026-07-10T18:37:02 [extract] upsert_edge: gemma4-is-multimodal → gemma4
+2026-07-10T18:37:02 [extract] upsert_node: qwen35small-beats-gpt (fact)
+2026-07-10T18:37:02 [extract] upsert_edge: qwen35small-beats-gpt → qwen35small
+2026-07-10T18:37:02 [extract] upsert_node: phi4mini-best-small-reasoner (fact)
+2026-07-10T18:37:02 [extract] upsert_edge: phi4mini-best-small-reasoner → phi4mini
+2026-07-10T18:37:02 [extract] upsert_node: gemma4-languages (fact)
+2026-07-10T18:37:02 [extract] upsert_edge: gemma4-languages → gemma4
+2026-07-10T18:37:02 [extract] iteration 4: calling LLM…
+2026-07-10T18:37:16 [extract] iteration 4: 6 tool calls
+2026-07-10T18:37:16 [extract] upsert_node: gemma4-released-license-smartphones (fact)
+2026-07-10T18:37:16 [extract] upsert_node: qwen35small-9B-beats-built-ondevice (fact)
+2026-07-10T18:37:16 [extract] upsert_edge: gemma4 → gemma4-released-license-smartphones
+2026-07-10T18:37:16 [extract] upsert_edge: qwen35small → qwen35small-9b-beats-built-ondevice
+2026-07-10T18:37:16 [extract] upsert_edge: gemma4-released-license-smartphones → gemma4
+2026-07-10T18:37:16 [extract] upsert_edge: qwen35small-9b-beats-built-ondevice → qwen35small
+2026-07-10T18:37:16 [extract] done
+2026-07-10T18:37:16 [consolidate] iteration 1: calling LLM…
+2026-07-10T18:37:42 [consolidate] iteration 1: 0 tool calls
+2026-07-10T18:37:42 [consolidate] done
+2026-07-10T18:37:42 [memory] saved — 917 nodes, 1310 edges
+2026-07-10T18:37:46 [sync] push ok (memory agent)
+2026-07-10T18:37:47 [tg] answer sent
+2026-07-10T18:38:07 [tg] shutting down gracefully — finishing in-flight turn and saving memory (Ctrl-C again to force quit)
