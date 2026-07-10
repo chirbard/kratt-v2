@@ -101,7 +101,9 @@ KRATT_DATA_DIR=kratt-data-dev TELEGRAM_BOT_TOKEN=<dev bot> TELEGRAM_USER_ID=<you
 
 Never run two pollers on one token (they fight over `getUpdates`), and never
 run the TUI and the daemon against the same data dir at the same time (the
-write lock is in-process only).
+write lock is in-process only). A custom `KRATT_DATA_DIR` automatically
+disables Turso cloud sync so dev runs can never write into the live cloud
+database (`KRATT_SYNC=1` opts back in deliberately).
 
 Home-server deploy: build with `--release`, run under systemd with
 `Restart=on-failure`, `.env` in the working directory, `KRATT_DATA_DIR` unset

@@ -50,6 +50,12 @@ enum DbHandle {
 }
 
 fn sync_credentials() -> Option<(String, String)> {
+    // Dev isolation, safe by default: a custom KRATT_DATA_DIR never syncs
+    // against the cloud primary — one shared TURSO_DATABASE_URL in .env must
+    // not let a dev run write into the live database. KRATT_SYNC=1 opts in.
+    if paths::data_dir() != "kratt-data" && std::env::var("KRATT_SYNC").is_err() {
+        return None;
+    }
     let url = std::env::var("TURSO_DATABASE_URL").ok()?;
     let token = std::env::var("TURSO_AUTH_TOKEN").ok()?;
     if url.trim().is_empty() || token.trim().is_empty() {
