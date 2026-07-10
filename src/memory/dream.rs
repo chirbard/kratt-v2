@@ -21,6 +21,11 @@ use super::synthesis::{self, SynthesisPolicy};
 
 const DREAM_CONFIDENCE_CAP: f64 = 0.6;
 const DREAM_STABILITY: f64 = 0.3;
+// A gist is an induced generalization — stronger than a raw dream hypothesis
+// (0.6) is allowed to be, but only slightly.
+const GIST_CONFIDENCE_CAP: f64 = 0.7; // replay-tunable.
+const GIST_IMPORTANCE: f64 = 0.5; // replay-tunable.
+const GIST_MIN_SUPPORTS: usize = 2; // replay-tunable.
 const MAX_PRUNES_PER_PASS: usize = 3; // replay-tunable.
 const PRUNE_GUARD_THRESHOLD: f64 = 0.7; // replay-tunable.
 pub const DOMAIN_AGENT_NAMES: [&str; 3] = ["biologist", "historian", "economist"];
@@ -435,6 +440,24 @@ fn apply_dream_call<'scope, 'policy>(
             DreamExpireEdgeCall::new(source, target, rewritten_content),
         ),
         ToolCall::PromoteEdge { source, target } => apply_dream_promote_edge(ctx, source, target),
+        ToolCall::GistEdge {
+            source,
+            target,
+            content,
+            confidence,
+            stability,
+            supported_by,
+        } => apply_dream_gist_edge(
+            ctx,
+            DreamGistCall {
+                source,
+                target,
+                content,
+                confidence,
+                stability,
+                supported_by,
+            },
+        ),
     }
 }
 
@@ -451,6 +474,104 @@ fn apply_dream_promote_edge<'scope, 'policy>(
         ctx.events,
     )?;
     Ok((description, false))
+}
+
+struct DreamGistCall {
+    source: String,
+    target: String,
+    content: String,
+    confidence: f64,
+    stability: f64,
+    supported_by: Vec<(String, String)>,
+}
+
+// Lossy consolidation: writes a new semantic edge for a cross-episode gist and
+// records its provenance on the ledger. The supporting episodic edges are left
+// untouched — they decay away on the fast episodic curve while the gist
+// outlives them, which is the "lossy" half.
+fn apply_dream_gist_edge<'scope, 'policy>(
+    ctx: &mut DreamCallContext<'scope, 'policy>,
+    call: DreamGistCall,
+) -> Result<(String, bool), Box<dyn Error + Send + Sync>> {
+    let supports = collect_gist_supports(ctx.conn, &call.supported_by)?;
+    if supports.len() < GIST_MIN_SUPPORTS {
+        return Ok((gist_denied_message(&call), false));
+    }
+    let source = normalize_id(&call.source);
+    let target = normalize_id(&call.target);
+    let edge = gist_edge(&source, &target, &call);
+    db::write_edge(ctx.conn, &edge, ctx.source_id)?;
+    ctx.events.push(Event::updated(
+        Actor::new("system", "consolidation"),
+        EdgeRef::new(&source, &target),
+        EventContext::new(ctx.source_id, ""),
+        gist_payload(&supports),
+    ));
+    Ok((
+        format!(
+            "gist_edge: {source} → {target} (from {} episodes)",
+            supports.len()
+        ),
+        true,
+    ))
+}
+
+// Keeps only refs that resolve to an existing episodic edge; unknown or
+// non-episodic refs are dropped with a log line (they may drop the count
+// below the minimum, which the caller then denies).
+fn collect_gist_supports(
+    conn: &Connection,
+    refs: &[(String, String)],
+) -> Result<Vec<(String, String)>, Box<dyn Error + Send + Sync>> {
+    let mut kept = Vec::new();
+    for (source, target) in refs {
+        match db::load_edge(conn, source, target)? {
+            Some(edge) if edge.memory_type == "episodic" => {
+                kept.push((source.clone(), target.clone()));
+            }
+            Some(_) => runlog::log(
+                "dream",
+                &format!("gist support dropped (not episodic): {source} → {target}"),
+            ),
+            None => runlog::log(
+                "dream",
+                &format!("gist support dropped (unknown): {source} → {target}"),
+            ),
+        }
+    }
+    Ok(kept)
+}
+
+fn gist_edge(source: &str, target: &str, call: &DreamGistCall) -> Edge {
+    Edge {
+        source: source.to_string(),
+        target: target.to_string(),
+        content: call.content.clone(),
+        stability: call.stability.clamp(0.0, 1.0),
+        confidence: call.confidence.clamp(0.0, GIST_CONFIDENCE_CAP),
+        importance: GIST_IMPORTANCE,
+        subject: false,
+        date: crate::prompts::today_iso(),
+        occurred_at: None,
+        expired_at: None,
+        memory_type: "semantic".to_string(),
+        origin_session: String::new(),
+    }
+}
+
+fn gist_payload(supports: &[(String, String)]) -> String {
+    let mut refs = Vec::new();
+    for (source, target) in supports {
+        refs.push(format!("{source} → {target}"));
+    }
+    serde_json::json!({ "gist_of": refs }).to_string()
+}
+
+fn gist_denied_message(call: &DreamGistCall) -> String {
+    format!(
+        "gist_edge denied: {} → {} needs {GIST_MIN_SUPPORTS}+ episodic supports — use promote_edge for one episode that is itself the lesson",
+        call.source, call.target
+    )
 }
 
 struct DreamApplyState<'policy> {
@@ -772,4 +893,230 @@ fn send_log(sender: &std::sync::mpsc::Sender<DreamEvent>, phase: &'static str, t
 
 fn send_append(sender: &std::sync::mpsc::Sender<DreamEvent>, phase: &'static str, text: String) {
     let _ = sender.send(DreamEvent::Append { phase, text });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DreamApplyState, DreamCallContext, DreamGistCall, Edge, Event, SynthesisPolicy,
+        apply_dream_gist_edge,
+    };
+    use crate::memory::agent::{self, ToolCall};
+    use crate::memory::db;
+    use crate::memory::ledger::{Actor, EventContext};
+    use std::collections::{HashMap, HashSet};
+    use turso::{Builder, Connection};
+
+    const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', PRIMARY KEY (source, target))";
+    const EVENTS_DDL: &str = "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')";
+
+    fn harness() -> Connection {
+        db::block_on(async {
+            let Ok(database) = Builder::new_local(":memory:").build().await else {
+                unreachable!("in-memory database builds")
+            };
+            let Ok(conn) = database.connect() else {
+                unreachable!("in-memory database connects")
+            };
+            let _ = conn.execute(EDGES_DDL, ()).await;
+            let _ = conn.execute(EVENTS_DDL, ()).await;
+            conn
+        })
+    }
+
+    fn edge(source: &str, target: &str, memory_type: &str) -> Edge {
+        Edge {
+            source: source.to_string(),
+            target: target.to_string(),
+            content: "x".to_string(),
+            stability: 0.2,
+            confidence: 0.3,
+            importance: 0.1,
+            subject: false,
+            date: "2020-01-01".to_string(),
+            occurred_at: None,
+            expired_at: None,
+            memory_type: memory_type.to_string(),
+            origin_session: "session-1".to_string(),
+        }
+    }
+
+    fn insert(conn: &Connection, source: &str, target: &str, memory_type: &str) {
+        let stored = edge(source, target, memory_type);
+        let Ok(()) = db::write_edge(conn, &stored, "") else {
+            unreachable!("edge written")
+        };
+    }
+
+    fn gist_call(supports: &[(&str, &str)], confidence: f64) -> DreamGistCall {
+        let mut supported_by = Vec::new();
+        for (source, target) in supports {
+            supported_by.push(((*source).to_string(), (*target).to_string()));
+        }
+        DreamGistCall {
+            source: "queen-sorties".to_string(),
+            target: "chess-openings".to_string(),
+            content: "early queen sorties get punished".to_string(),
+            confidence,
+            stability: 0.5,
+            supported_by,
+        }
+    }
+
+    fn empty_policy() -> SynthesisPolicy {
+        SynthesisPolicy {
+            synthesis_nodes: HashSet::new(),
+            edge_overrides: HashMap::new(),
+        }
+    }
+
+    fn run_gist(
+        conn: &Connection,
+        call: DreamGistCall,
+    ) -> ((String, bool), Vec<Event>) {
+        let policy = empty_policy();
+        let mut events: Vec<Event> = Vec::new();
+        let mut apply_state = DreamApplyState::new(&policy);
+        let mut ctx = DreamCallContext {
+            conn,
+            source_id: "dream:test",
+            events: &mut events,
+            apply_state: &mut apply_state,
+        };
+        let Ok(outcome) = apply_dream_gist_edge(&mut ctx, call) else {
+            unreachable!("apply runs")
+        };
+        (outcome, events)
+    }
+
+    fn loaded(conn: &Connection, source: &str, target: &str) -> Option<Edge> {
+        let Ok(edge) = db::load_edge(conn, source, target) else {
+            unreachable!("load runs")
+        };
+        edge
+    }
+
+    fn must_load(conn: &Connection, source: &str, target: &str) -> Edge {
+        let Some(edge) = loaded(conn, source, target) else {
+            unreachable!("edge exists")
+        };
+        edge
+    }
+
+    // Two episodic supports, gisted at confidence 0.6. Returns the events.
+    fn gist_two_supports(conn: &Connection) -> Vec<Event> {
+        insert(conn, "game3-hub", "move-qh5", "episodic");
+        insert(conn, "game4-hub", "move-qf3", "episodic");
+        let ((description, added), events) = run_gist(
+            conn,
+            gist_call(&[("game3-hub", "move-qh5"), ("game4-hub", "move-qf3")], 0.6),
+        );
+        assert!(added, "a gist edge was written");
+        assert!(description.starts_with("gist_edge:"));
+        events
+    }
+
+    #[test]
+    fn two_episodic_supports_write_a_semantic_gist() {
+        let conn = harness();
+        let _ = gist_two_supports(&conn);
+        let written = must_load(&conn, "queen-sorties", "chess-openings");
+        assert_eq!(written.memory_type, "semantic");
+        assert_eq!(written.date, crate::prompts::today_iso());
+        assert!((written.confidence - 0.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_gist_records_provenance_and_spares_its_supporters() {
+        let conn = harness();
+        let events = gist_two_supports(&conn);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "updated");
+        assert!(events[0].payload.contains("gist_of"));
+        assert!(events[0].payload.contains("game3-hub → move-qh5"));
+        assert!(events[0].payload.contains("game4-hub → move-qf3"));
+
+        // Supporters are left untouched — still episodic, not expired.
+        let support = must_load(&conn, "game3-hub", "move-qh5");
+        assert_eq!(support.memory_type, "episodic");
+        assert!(support.expired_at.is_none());
+    }
+
+    #[test]
+    fn confidence_is_clamped_to_the_gist_cap() {
+        let conn = harness();
+        insert(&conn, "game3-hub", "move-qh5", "episodic");
+        insert(&conn, "game4-hub", "move-qf3", "episodic");
+        let (_, _) = run_gist(
+            &conn,
+            gist_call(&[("game3-hub", "move-qh5"), ("game4-hub", "move-qf3")], 0.95),
+        );
+        let written = must_load(&conn, "queen-sorties", "chess-openings");
+        assert!((written.confidence - 0.7).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_single_support_is_denied_with_the_promote_edge_hint() {
+        let conn = harness();
+        insert(&conn, "game3-hub", "move-qh5", "episodic");
+        let ((description, added), events) =
+            run_gist(&conn, gist_call(&[("game3-hub", "move-qh5")], 0.6));
+        assert!(!added);
+        assert!(description.contains("denied"));
+        assert!(description.contains("promote_edge"));
+        assert!(events.is_empty());
+        assert!(loaded(&conn, "queen-sorties", "chess-openings").is_none());
+    }
+
+    #[test]
+    fn an_unknown_ref_drops_the_count_below_the_minimum() {
+        let conn = harness();
+        insert(&conn, "game3-hub", "move-qh5", "episodic");
+        let ((description, added), _) = run_gist(
+            &conn,
+            gist_call(&[("game3-hub", "move-qh5"), ("ghost", "nowhere")], 0.6),
+        );
+        assert!(!added);
+        assert!(description.contains("denied"));
+    }
+
+    #[test]
+    fn a_semantic_support_is_dropped() {
+        let conn = harness();
+        insert(&conn, "game3-hub", "move-qh5", "episodic");
+        insert(&conn, "old-belief", "chess", "semantic");
+        let ((_, added), _) = run_gist(
+            &conn,
+            gist_call(&[("game3-hub", "move-qh5"), ("old-belief", "chess")], 0.6),
+        );
+        assert!(!added, "the semantic ref is dropped, leaving one support");
+    }
+
+    #[test]
+    fn the_chat_apply_path_denies_gist_edge() {
+        let conn = harness();
+        let call = ToolCall::GistEdge {
+            source: "a".to_string(),
+            target: "b".to_string(),
+            content: "c".to_string(),
+            confidence: 0.6,
+            stability: 0.5,
+            supported_by: vec![("x".to_string(), "y".to_string())],
+        };
+        let options = agent::ApplyToolOptions {
+            actor: Actor::new("system", "chat"),
+            context: EventContext::new("session-1", "turn-1"),
+            source_message_id: "msg-1",
+            event_payload: "",
+            confidence_cap: None,
+            default_memory_type: "semantic",
+        };
+        let mut events: Vec<Event> = Vec::new();
+        let Ok(description) = agent::apply_tool_call(call, &conn, &options, &mut events) else {
+            unreachable!("apply runs")
+        };
+        assert!(description.contains("gist_edge is a dreaming tool"));
+        assert!(events.is_empty());
+    }
 }

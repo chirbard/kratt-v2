@@ -589,6 +589,29 @@ fn normalize_call(call: &ToolCall, confidence: f64) -> ToolCall {
         ToolCall::DeleteNode { .. } => normalize_delete_node(call),
         ToolCall::ExpireEdge { .. } => normalize_expire_edge(call),
         ToolCall::PromoteEdge { .. } => normalize_promote_edge(call),
+        ToolCall::GistEdge { .. } => normalize_gist_edge(call),
+    }
+}
+
+fn normalize_gist_edge(call: &ToolCall) -> ToolCall {
+    let ToolCall::GistEdge {
+        source,
+        target,
+        content,
+        confidence,
+        stability,
+        supported_by,
+    } = call
+    else {
+        unreachable!("normalize_gist_edge called with non-gist_edge");
+    };
+    ToolCall::GistEdge {
+        source: source.clone(),
+        target: target.clone(),
+        content: content.clone(),
+        confidence: *confidence,
+        stability: *stability,
+        supported_by: supported_by.clone(),
     }
 }
 
@@ -698,10 +721,19 @@ fn apply_policy_overrides(cluster: &Cluster, calls: &[ToolCall], policy: &mut Sy
             ToolCall::DeleteNode { .. }
             | ToolCall::DeleteEdge { .. }
             | ToolCall::ExpireEdge { .. }
-            | ToolCall::PromoteEdge { .. } => {}
+            | ToolCall::PromoteEdge { .. }
+            | ToolCall::GistEdge { .. } => {}
         }
         idx += 1;
     }
+}
+
+fn gist_refs(supported_by: &[(String, String)]) -> Vec<String> {
+    let mut refs = Vec::new();
+    for (source, target) in supported_by {
+        refs.push(format!("{source} → {target}"));
+    }
+    refs
 }
 
 fn tool_calls_json(calls: &[ToolCall]) -> String {
@@ -724,19 +756,7 @@ fn tool_call_json(call: &ToolCall) -> serde_json::Value {
         } => {
             json!({"tool":"upsert_node","args":{"name":name,"type":node_type,"body":body,"date":date}})
         }
-        ToolCall::UpsertEdge {
-            source,
-            target,
-            content,
-            stability,
-            confidence,
-            importance,
-            subject,
-            date,
-            memory_type,
-        } => {
-            json!({"tool":"upsert_edge","args":{"source":source,"target":target,"content":content,"stability":stability,"confidence":confidence,"importance":importance,"subject":subject,"date":date,"memory_type":memory_type}})
-        }
+        ToolCall::UpsertEdge { .. } => upsert_edge_json(call),
         ToolCall::DeleteNode { name } => json!({"tool":"delete_node","args":{"name":name}}),
         ToolCall::DeleteEdge { source, target } => {
             json!({"tool":"delete_edge","args":{"source":source,"target":target}})
@@ -751,7 +771,41 @@ fn tool_call_json(call: &ToolCall) -> serde_json::Value {
         ToolCall::PromoteEdge { source, target } => {
             json!({"tool":"promote_edge","args":{"source":source,"target":target}})
         }
+        ToolCall::GistEdge { .. } => gist_edge_json(call),
     }
+}
+
+fn upsert_edge_json(call: &ToolCall) -> serde_json::Value {
+    let ToolCall::UpsertEdge {
+        source,
+        target,
+        content,
+        stability,
+        confidence,
+        importance,
+        subject,
+        date,
+        memory_type,
+    } = call
+    else {
+        unreachable!("upsert_edge_json called with non-upsert_edge");
+    };
+    json!({"tool":"upsert_edge","args":{"source":source,"target":target,"content":content,"stability":stability,"confidence":confidence,"importance":importance,"subject":subject,"date":date,"memory_type":memory_type}})
+}
+
+fn gist_edge_json(call: &ToolCall) -> serde_json::Value {
+    let ToolCall::GistEdge {
+        source,
+        target,
+        content,
+        confidence,
+        stability,
+        supported_by,
+    } = call
+    else {
+        unreachable!("gist_edge_json called with non-gist_edge");
+    };
+    json!({"tool":"gist_edge","args":{"source":source,"target":target,"content":content,"confidence":confidence,"stability":stability,"supported_by":gist_refs(supported_by)}})
 }
 
 fn format_blocks(blocks: &[(String, String)]) -> String {

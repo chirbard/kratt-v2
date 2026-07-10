@@ -83,6 +83,18 @@ pub(crate) enum ToolCall {
         source: String,
         target: String,
     },
+    // Lossy consolidation: a new semantic generalization induced from several
+    // episodic edges. supported_by holds the (source, target) refs of those
+    // episodes, already normalized. Dream-side only — the chat apply path
+    // denies it.
+    GistEdge {
+        source: String,
+        target: String,
+        content: String,
+        confidence: f64,
+        stability: f64,
+        supported_by: Vec<(String, String)>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -578,6 +590,7 @@ fn parse_single_tool(obj: &serde_json::Value) -> Option<ToolCall> {
         "delete_edge" => parse_delete_edge(args),
         "expire_edge" => parse_expire_edge(args),
         "promote_edge" => parse_promote_edge(args),
+        "gist_edge" => parse_gist_edge(args),
         _ => None,
     }
 }
@@ -751,6 +764,56 @@ fn parse_promote_edge(args: &serde_json::Value) -> Option<ToolCall> {
     Some(ToolCall::PromoteEdge { source, target })
 }
 
+// supported_by is mandatory and must be an array — a gist without provenance
+// is a dream hypothesis, not a consolidation, so a missing/malformed field
+// rejects the whole call rather than degrading it silently.
+fn parse_gist_edge(args: &serde_json::Value) -> Option<ToolCall> {
+    let source = json_str(args, "source");
+    let target = json_str(args, "target");
+    if source.is_empty() || target.is_empty() {
+        return None;
+    }
+    let refs = args.get("supported_by")?.as_array()?;
+    let mut supported_by = Vec::new();
+    for value in refs {
+        if let Some(text) = value.as_str()
+            && let Some(edge_ref) = parse_support_ref(text)
+        {
+            supported_by.push(edge_ref);
+        }
+    }
+    let stability = match args.get("stability") {
+        Some(value) => value.as_f64().unwrap_or(0.5),
+        None => 0.5,
+    };
+    Some(ToolCall::GistEdge {
+        source,
+        target,
+        content: json_str(args, "content"),
+        confidence: json_f64(args, "confidence"),
+        stability,
+        supported_by,
+    })
+}
+
+// Accepts both "a → b" and "a->b" spellings and normalizes both endpoints.
+fn parse_support_ref(text: &str) -> Option<(String, String)> {
+    let (raw_source, raw_target) = split_support_ref(text)?;
+    let source = normalize_id(raw_source);
+    let target = normalize_id(raw_target);
+    if source.is_empty() || target.is_empty() {
+        return None;
+    }
+    Some((source, target))
+}
+
+fn split_support_ref(text: &str) -> Option<(&str, &str)> {
+    if let Some(parts) = text.split_once('→') {
+        return Some(parts);
+    }
+    text.split_once("->")
+}
+
 fn parse_delete_node(args: &serde_json::Value) -> Option<ToolCall> {
     let name = json_str(args, "name");
     if name.is_empty() {
@@ -880,6 +943,8 @@ pub(crate) fn apply_tool_call<'scope>(
             apply_expire_edge(conn, ExpireEdgeCall { source, target, rewritten_content }, options, events),
         ToolCall::PromoteEdge { source, target } =>
             apply_promote_edge(conn, EdgeRef::new(&source, &target), options.actor.clone(), options.context.clone(), events),
+        ToolCall::GistEdge { .. } =>
+            Ok("gist_edge denied: gist_edge is a dreaming tool".to_string()),
     }
 }
 
@@ -1256,6 +1321,53 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert!(matches!(calls[0], ToolCall::UpsertNode { .. }));
         assert!(matches!(calls[1], ToolCall::UpsertEdge { .. }));
+    }
+
+    #[test]
+    fn gist_edge_parses_full_args_and_both_ref_spellings() {
+        let arrow = r#"{"tools":[{"tool":"gist_edge","args":{"source":"early-queen-sorties","target":"chess-openings","content":"queen sorties get punished","confidence":0.6,"stability":0.4,"supported_by":["game3-hub → move-qh5","game4-hub->move-qf3"]}}]}"#;
+        let calls = parse_tool_calls(arrow);
+        assert_eq!(calls.len(), 1);
+        let ToolCall::GistEdge {
+            source,
+            supported_by,
+            confidence,
+            stability,
+            ..
+        } = &calls[0]
+        else {
+            unreachable!("parsed as gist_edge")
+        };
+        assert_eq!(source, "early-queen-sorties");
+        assert!((*confidence - 0.6).abs() < 1e-9);
+        assert!((*stability - 0.4).abs() < 1e-9);
+        // Both "a → b" and "a->b" normalize to the same (source, target) refs.
+        assert_eq!(
+            supported_by,
+            &vec![
+                ("game3-hub".to_string(), "move-qh5".to_string()),
+                ("game4-hub".to_string(), "move-qf3".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn gist_edge_without_supported_by_is_rejected() {
+        let missing = r#"{"tool":"gist_edge","args":{"source":"a","target":"b","content":"c"}}"#;
+        assert!(parse_tool_calls(missing).is_empty());
+        let not_array = r#"{"tool":"gist_edge","args":{"source":"a","target":"b","content":"c","supported_by":"x → y"}}"#;
+        assert!(parse_tool_calls(not_array).is_empty());
+    }
+
+    #[test]
+    fn gist_edge_stability_defaults_to_half_when_absent() {
+        let no_stability = r#"{"tool":"gist_edge","args":{"source":"a","target":"b","content":"c","supported_by":["x → y","p → q"]}}"#;
+        let calls = parse_tool_calls(no_stability);
+        assert_eq!(calls.len(), 1);
+        let ToolCall::GistEdge { stability, .. } = &calls[0] else {
+            unreachable!("parsed as gist_edge")
+        };
+        assert!((*stability - 0.5).abs() < 1e-9);
     }
 
     #[test]
