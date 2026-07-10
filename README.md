@@ -53,6 +53,61 @@ Notes:
 - Sync failures show as a red `⚠ sync` warning in the status line; press S to
   retry. The warning clears on the next successful sync.
 
+## Telegram gateway (headless daily driver)
+
+The same binary runs headless behind Telegram: `cargo run --release -- --telegram`
+long-polls the Bot API and answers through the exact chat-turn pipeline the TUI
+uses (memory injection, tool loop, memory pass after every turn). No inbound
+port needed — works behind NAT.
+
+Setup:
+
+1. Create a bot with [@BotFather](https://t.me/BotFather) → token.
+2. Get your numeric user id (message [@userinfobot](https://t.me/userinfobot)).
+3. Put both in `.env` (see `.env.example`):
+
+```sh
+TELEGRAM_BOT_TOKEN=123456:ABC-...
+TELEGRAM_USER_ID=123456789
+```
+
+4. Run `cargo run --release -- --telegram` — the console prints
+   `kratt telegram gateway ready` when polling starts.
+
+Behavior and rules:
+
+- **Allowlist**: only `TELEGRAM_USER_ID` is answered; everyone else is dropped
+  with a log line. This is the entire security model — set it correctly.
+- **Sessions are per calendar day** (`tg-YYYY-MM-DD`), unlike the TUI's
+  session-per-launch.
+- Turns are strictly sequential: answer → memory pass → next message. Messages
+  sent while a turn (or the daemon) is busy queue on Telegram's side and are
+  picked up in order; you'll see "typing…" the whole time a turn is running.
+- Answers are rendered to Telegram HTML (headers→bold, bullets, code blocks;
+  tables land as monospace blocks). The system prompt tells the model it is on
+  a phone, so it avoids tables in the first place.
+- Ctrl-C / SIGTERM shuts down gracefully (finishes the in-flight turn and
+  memory pass, syncs, exits — the console says so). A second Ctrl-C force-quits.
+- Observability = the same run logs: `kratt-data/logs/kratt-YYYY-MM-DD.log`
+  (gateway lines are tagged `[tg]`).
+
+Development without touching the live brain — two axes, both required:
+
+```sh
+# separate data dir AND a separate dev bot token
+KRATT_DATA_DIR=kratt-data-dev TELEGRAM_BOT_TOKEN=<dev bot> TELEGRAM_USER_ID=<you> \
+  cargo run -- --telegram
+```
+
+Never run two pollers on one token (they fight over `getUpdates`), and never
+run the TUI and the daemon against the same data dir at the same time (the
+write lock is in-process only).
+
+Home-server deploy: build with `--release`, run under systemd with
+`Restart=on-failure`, `.env` in the working directory, `KRATT_DATA_DIR` unset
+(live data root + Turso sync as backup). Deploys lose nothing: Telegram queues
+messages while the daemon is down and long polling picks them up on restart.
+
 ## using cargo-modules to see boundary violations
 
 for LLM (90% of the time codebase-memory-mcp does the job good enough)
