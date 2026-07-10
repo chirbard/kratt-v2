@@ -1,4 +1,5 @@
 mod bot;
+mod night;
 mod render;
 
 use std::error::Error;
@@ -65,13 +66,18 @@ pub fn run(
         Ok(transport) => transport,
         Err(err) => return Err(err.to_string().into()),
     };
+    let mut night = night::NightCycle::from_env(
+        Arc::clone(&memory_llm),
+        Arc::clone(&embed),
+        search.clone(),
+    )?;
     let mut handler = LiveTurnHandler::new(chat_llm, memory_llm, embed, search);
     let shutdown = install_shutdown_flag();
     let banner = "kratt telegram gateway ready — long polling (Ctrl-C to stop)";
     println!("{banner}");
     runlog::log("tg", banner);
     let mut gateway = Gateway::new(config.allowed_user_id);
-    gateway.poll_loop(&transport, &mut handler, &shutdown);
+    gateway.poll_loop(&transport, &mut handler, &mut night, &shutdown);
     memory::sync_push_best_effort("telegram exit");
     runlog::log("tg", "gateway stopped");
     Ok(())
@@ -134,24 +140,32 @@ impl Gateway {
         &mut self,
         transport: &dyn BotTransport,
         handler: &mut dyn TurnHandler,
+        night: &mut night::NightCycle,
         shutdown: &AtomicBool,
     ) {
         while !shutdown.load(Ordering::Relaxed) {
-            self.poll_once(transport, handler, shutdown);
+            // The idle path (no updates) is where the night cycle runs: a poll
+            // that returned messages spent this cycle answering them.
+            if self.poll_once(transport, handler, shutdown) {
+                night.maybe_run(shutdown);
+            }
         }
     }
 
+    // Returns true when the poll was idle (no updates delivered) — the signal
+    // the night cycle gates on.
     fn poll_once(
         &mut self,
         transport: &dyn BotTransport,
         handler: &mut dyn TurnHandler,
         shutdown: &AtomicBool,
-    ) {
+    ) -> bool {
         match transport.get_updates(self.offset) {
             Ok(value) => self.handle_batch(transport, handler, &value, shutdown),
             Err(err) => {
                 runlog::log("tg", &format!("poll error: {err}"));
                 std::thread::sleep(self.backoff);
+                false
             }
         }
     }
@@ -162,18 +176,21 @@ impl Gateway {
         handler: &mut dyn TurnHandler,
         value: &serde_json::Value,
         shutdown: &AtomicBool,
-    ) {
-        for raw in parse_updates(value) {
+    ) -> bool {
+        let updates = parse_updates(value);
+        let idle = updates.is_empty();
+        for raw in updates {
             // Leave the offset untouched on shutdown so an unhandled update is
             // re-delivered when the daemon restarts.
             if shutdown.load(Ordering::Relaxed) {
-                return;
+                return idle;
             }
             self.offset = self.offset.max(raw.update_id + 1);
             if let Some(message) = raw.message {
                 self.dispatch(transport, handler, &message);
             }
         }
+        idle
     }
 
     fn dispatch(
