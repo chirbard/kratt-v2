@@ -1,6 +1,6 @@
 /target
 .env
-/kratt-data/
+/kratt-data*/
 /ai-plans/
 /kratt-roadmap/
 /ingest-docs/
