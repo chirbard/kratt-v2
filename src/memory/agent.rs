@@ -3,8 +3,9 @@ use std::sync::Arc;
 
 use crate::api::{Chunk, LlmClient, ToolCallRequest};
 use crate::prompts::{
-    AgentPrompt, CONSOLIDATE_EXPLANATION, EXTRACT_EXPLANATION, build_agent_prompt,
-    build_classify_prompt, build_continue_prompt, build_scribe_prompt,
+    AgentPrompt, CONSOLIDATE_EXPLANATION, EXTRACT_EXPLANATION, SCRIBE_EXPLANATION,
+    build_agent_prompt, build_classify_prompt, build_continue_prompt, build_scribe_continue_prompt,
+    build_scribe_prompt,
 };
 use crate::runlog;
 use turso::Connection;
@@ -55,6 +56,10 @@ struct AgentRun<'run> {
 // A heavy pass emits a few tool calls per response and is re-prompted until it
 // says DONE, so no single response has to carry the whole pass.
 const MAX_PASS_ITERATIONS: usize = 4; // replay-tunable
+// The scribe runs post-turn (not in the chat critical path) and one continuation
+// is enough to catch an under-emitted setup turn (define_task + both opening
+// plies), so its own cap is tighter than the heavy passes'.
+const MAX_SCRIBE_ITERATIONS: usize = 2; // replay-tunable
 
 struct PassSpec {
     phase: &'static str,
@@ -62,6 +67,12 @@ struct PassSpec {
     // Re-sent on every continuation so the pass keeps its role; a generic
     // continuation prompt turned consolidate into a second extractor.
     explanation: &'static str,
+    // Per-pass iteration cap — the heavy passes get MAX_PASS_ITERATIONS, the
+    // scribe the tighter MAX_SCRIBE_ITERATIONS.
+    max_iterations: usize,
+    // Builds the continuation prompt for this pass — heavy passes reuse the
+    // heavy tool docs, the scribe keeps its own tool set.
+    continue_prompt: fn(&str, &str, &str, &[String]) -> String,
 }
 
 struct IterationOutcome {
@@ -298,13 +309,14 @@ impl<'run> AgentRun<'run> {
         let conn = db::open_connection()?;
         self.refresh_injected_clock(&conn)?;
         let prompt = build_scribe_prompt(self.user_msg, self.assistant_msg);
-        // Single-shot on purpose: the scribe records a handful of moves in a
-        // few seconds, and loop latency would sit in the chat critical path.
+        // Looped (cap MAX_SCRIBE_ITERATIONS): the scribe runs post-turn, so a
+        // second iteration only costs latency when the first response
+        // under-emitted an opening turn — and then it recovers the lost plies.
         let ctx = PassCtx {
             llm: &self.seats.scribe,
             conn: &conn,
         };
-        self.run_single_pass(&ctx, &scribe_pass(), prompt)?;
+        self.run_pass(&ctx, &scribe_pass(), prompt)?;
         Ok(())
     }
 
@@ -384,17 +396,6 @@ impl<'run> AgentRun<'run> {
         })
     }
 
-    fn run_single_pass(
-        &self,
-        ctx: &PassCtx<'_>,
-        pass: &PassSpec,
-        prompt: String,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        self.run_iteration(ctx, pass, 1, prompt)?;
-        self.send_log(pass.phase, "done".to_string());
-        Ok(())
-    }
-
     // Emit → apply → re-prompt. Continuations carry only the exchange and a
     // one-line summary of what was applied, never the full graph again.
     fn drive_pass<Iterate>(
@@ -408,15 +409,15 @@ impl<'run> AgentRun<'run> {
     {
         let mut prompt = first_prompt;
         let mut applied: Vec<String> = Vec::new();
-        for iteration in 1..=MAX_PASS_ITERATIONS {
+        for iteration in 1..=pass.max_iterations {
             let outcome = iterate(iteration, prompt)?;
-            if outcome.done || iteration == MAX_PASS_ITERATIONS {
+            if outcome.done || iteration == pass.max_iterations {
                 break;
             }
             // Continuations must list everything applied so far, not just the
             // latest iteration, or the model re-emits earlier calls.
             applied.extend(outcome.descriptions);
-            prompt = build_continue_prompt(
+            prompt = (pass.continue_prompt)(
                 pass.explanation,
                 self.user_msg,
                 self.assistant_msg,
@@ -514,6 +515,8 @@ fn heavy_pass(phase: &'static str) -> PassSpec {
         phase,
         default_memory_type: "semantic",
         explanation,
+        max_iterations: MAX_PASS_ITERATIONS,
+        continue_prompt: build_continue_prompt,
     }
 }
 
@@ -521,8 +524,11 @@ fn scribe_pass() -> PassSpec {
     PassSpec {
         phase: "scribe",
         default_memory_type: "episodic",
-        // Never used: the scribe is single-shot and does not continue.
-        explanation: "",
+        // Re-sent on each continuation so the scribe keeps its role and its own
+        // tool set (record_move/define_task/record_rule/record_outcome).
+        explanation: SCRIBE_EXPLANATION,
+        max_iterations: MAX_SCRIBE_ITERATIONS,
+        continue_prompt: build_scribe_continue_prompt,
     }
 }
 
@@ -1665,6 +1671,62 @@ mod tests {
         assert!(result.is_ok());
         drop(receiver);
         iterations
+    }
+
+    // Same as count_iterations but drives the scribe pass, whose tighter cap
+    // (MAX_SCRIBE_ITERATIONS) is what these tests exercise.
+    fn count_scribe_iterations(responses: &[&str]) -> usize {
+        let (sender, receiver): (Sender<MemoryEvent>, Receiver<MemoryEvent>) =
+            std::sync::mpsc::channel();
+        let llm = ScriptedClient::scripted(responses);
+        let agent_run = AgentRun {
+            seats: super::MemorySeats::uniform(llm),
+            user_msg: "user",
+            assistant_msg: "assistant",
+            sender: &sender,
+            user_message_id: "msg-1",
+        };
+        let mut iterations = 0usize;
+        let pass = super::scribe_pass();
+        let result = agent_run.drive_pass(&pass, "first prompt".to_string(), |_index, prompt| {
+            iterations += 1;
+            let call_text = stream_collect(Arc::clone(&agent_run.seats.scribe), prompt, drop, drop)?;
+            let tool_calls = parse_tool_calls(&call_text);
+            let done = tool_calls.is_empty() || says_done(&call_text);
+            let mut descriptions = Vec::new();
+            for _call in &tool_calls {
+                descriptions.push("recorded".to_string());
+            }
+            Ok(IterationOutcome { descriptions, done })
+        });
+        assert!(result.is_ok());
+        drop(receiver);
+        iterations
+    }
+
+    #[test]
+    fn scribe_continues_once_to_catch_an_under_emitted_turn() {
+        // First response records something, the continuation says DONE: two
+        // iterations, exactly the recovery the cap is meant to allow.
+        assert_eq!(count_scribe_iterations(&[ONE_CALL, "DONE"]), 2);
+    }
+
+    #[test]
+    fn scribe_stops_at_its_two_iteration_cap() {
+        // The model keeps emitting calls and never says DONE — the tighter
+        // scribe cap halts it at two, not the heavy MAX_PASS_ITERATIONS.
+        let responses = vec![ONE_CALL; MAX_PASS_ITERATIONS];
+        assert_eq!(count_scribe_iterations(&responses), 2);
+    }
+
+    #[test]
+    fn scribe_single_shot_stops_at_one_iteration() {
+        // A setup turn the first response fully captures: DONE on the first
+        // pass ends it immediately, no continuation latency.
+        let done = format!("{ONE_CALL}\nDONE");
+        assert_eq!(count_scribe_iterations(&[&done]), 1);
+        // Zero tool calls also reads as finished on the first iteration.
+        assert_eq!(count_scribe_iterations(&["nothing to record"]), 1);
     }
 
     #[test]

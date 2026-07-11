@@ -394,6 +394,69 @@ Rules:
 
 Respond with raw JSON tool calls only. Use the standard format. These will be applied immediately."#;
 
+// Scribe continuation: keeps the scribe role and its own tool set (record_move
+// / define_task / record_rule / record_outcome + episodic upserts) — never the
+// heavy TOOL_DEFINITIONS/MEMORY_RULES, which would offer the wrong tools.
+pub fn build_scribe_continue_prompt(
+    explanation: &str,
+    user_msg: &str,
+    assistant_msg: &str,
+    applied: &[String],
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str(explanation);
+    prompt.push_str("\n\n");
+    prompt.push_str(CONTINUE_PASS);
+    prompt.push_str("\n\n**Today's date: ");
+    prompt.push_str(&today_iso());
+    prompt.push_str("**\n\n");
+    prompt.push_str(JSON_OUTPUT_RULES);
+    prompt.push_str("\n\n");
+    prompt.push_str(SCRIBE_TOOL_DEFINITIONS);
+    prompt.push_str("\n\n## Already recorded\n\n");
+    if applied.is_empty() {
+        prompt.push_str("(nothing)");
+    }
+    for description in applied {
+        prompt.push_str("- ");
+        prompt.push_str(description);
+        prompt.push('\n');
+    }
+    prompt.push_str("\n## Exchange being recorded\n\nUser: ");
+    prompt.push_str(user_msg);
+    prompt.push_str("\nAssistant: ");
+    prompt.push_str(assistant_msg);
+    prompt
+}
+
+pub const DREAM_STRATEGY: &str = r#"You are the strategy consolidator for the game named in the Game section below. You have its definition, its current rules and strategies, the move chains of games actually played, and each game's recorded outcome. Your output is parsed directly as tool calls and applied to the database.
+
+Your job: derive or refine a few portable STRATEGY LESSONS anchored to the game node, learned from how these games actually went.
+
+Rules:
+- Every NEW lesson needs its node created in the same response, BEFORE the edge that points at it: {"tool":"upsert_node","args":{"name":"kebab-lesson","type":"fact","body":"the lesson as one sentence","date":""}} — an edge to a node that does not exist is invalid and will be expired.
+- gist_edge for a lesson INDUCED FROM PLAYED MOVES — cite the supporting chain edges in supported_by (at least two). Each ref is the chain edge written exactly "hub → move-node", e.g. "task-<session> → task-<session>-ply-003" (the hub is the source, the ply node the target — copy them from the chain sections below). Phrase content as the transferable lesson ("an early queen sortie gets punished by tempo loss"), never as one game's narration. {"tool":"gist_edge","args":{"source":"game-<name>","target":"kebab-lesson","content":"string","confidence":0.6,"supported_by":["task-<session> → task-<session>-ply-003","task-<session> → task-<session>-ply-005"]}}
+- upsert_edge onto the game node ONLY for a lesson implied by the rules alone (before any game teaches otherwise). {"tool":"upsert_edge","args":{"source":"game-<name>","target":"kebab-lesson","content":"string","stability":0.4,"confidence":0.5,"importance":0.5,"subject":false,"date":"YYYY-MM-DD"}}
+- REVISE ON EVIDENCE: an existing strategy contradicted by a lost game gets expire_edge (or a rewritten upsert at lower confidence). The outcomes are given to you precisely so a lesson that keeps losing is corrected, not preserved. {"tool":"expire_edge","args":{"source":"game-<name>","target":"kebab-lesson","rewritten_content":"string"}}
+- Never narrate a single game. Never restate a rule as a strategy. Five solid lessons beat twenty.
+- Emit at most 8 tool calls. Anchor every strategy to the game node.
+
+Respond with raw JSON tool calls only. These will be applied immediately."#;
+
+pub fn build_strategy_prompt(game_name: &str, context: &str) -> String {
+    let mut prompt = String::new();
+    prompt.push_str(DREAM_STRATEGY);
+    prompt.push_str("\n\n**Today's date: ");
+    prompt.push_str(&today_iso());
+    prompt.push_str("**\n\n");
+    prompt.push_str(JSON_OUTPUT_RULES);
+    prompt.push_str("\n\n## Game: ");
+    prompt.push_str(game_name);
+    prompt.push_str("\n\n");
+    prompt.push_str(context);
+    prompt
+}
+
 pub const SYNTHESIS_DRIFTER: &str = r#"You are the Drifter in a synthesis brainstorm. Generate surprising hypotheses from this cluster.
 
 - Seek non-obvious links across multiple edges, not restatements of a single edge.
