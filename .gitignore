@@ -4,5 +4,6 @@
 /ai-plans/
 /kratt-roadmap/
 /ingest-docs/
+.codebase-memory/
 
 .DS_Store
