@@ -27,6 +27,17 @@ pub struct SynthesisPolicy {
     pub edge_overrides: HashMap<(String, String), SynthesisEdgeOverride>,
 }
 
+impl SynthesisPolicy {
+    // A policy that overrides nothing — used by passes (the strategy stage) that
+    // apply through the dream path without a synthesis brainstorm behind them.
+    pub fn empty() -> Self {
+        Self {
+            synthesis_nodes: HashSet::new(),
+            edge_overrides: HashMap::new(),
+        }
+    }
+}
+
 pub struct SynthesisStageResult {
     pub proposal_text: String,
     pub policy: SynthesisPolicy,

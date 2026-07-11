@@ -806,6 +806,92 @@ pub fn load_game_edges(
     })
 }
 
+// Every game-definition node (node_type = "game"), each with its id and node.
+// The strategy stage walks these to find games worth consolidating.
+pub fn load_game_nodes(
+    conn: &Connection,
+) -> Result<Vec<(String, Node)>, Box<dyn Error + Send + Sync>> {
+    runtime().block_on(async {
+        let mut rows = conn
+            .query(
+                "SELECT id, node_type, body, date FROM nodes WHERE node_type = 'game'",
+                (),
+            )
+            .await?;
+        let mut games = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let game_id = normalize_id(&text(row.get_value(0)?));
+            let node = Node {
+                node_type: text(row.get_value(1)?),
+                body: text(row.get_value(2)?),
+                date: text(row.get_value(3)?),
+            };
+            games.push((game_id, node));
+        }
+        Ok(games)
+    })
+}
+
+// The live task hubs that played this game: sources of episodic hub→game edges
+// (written by define_task). Expired links and other games' hubs are excluded by
+// the target + expiry filter. Each hub id embeds its session as `task-<id>`.
+pub fn load_game_hubs(
+    conn: &Connection,
+    game_id: &str,
+) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+    runtime().block_on(async {
+        let mut rows = conn
+            .query(
+                "SELECT DISTINCT source FROM edges WHERE target = ?1 AND memory_type = 'episodic' AND expired_at IS NULL AND source LIKE 'task-%'",
+                params![game_id],
+            )
+            .await?;
+        let mut hubs = Vec::new();
+        while let Some(row) = rows.next().await? {
+            hubs.push(text(row.get_value(0)?));
+        }
+        Ok(hubs)
+    })
+}
+
+// The recorded game outcome for a session, if any: the (score, comment) of its
+// most recent `outcome` event. score is the assistant-perspective weight
+// (win +1 / draw 0 / loss -1); comment is pulled from the event payload.
+pub fn load_session_outcome(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<(f64, String)>, Box<dyn Error + Send + Sync>> {
+    runtime().block_on(async {
+        let mut rows = conn
+            .query(
+                "SELECT weight, payload FROM events WHERE session_id = ?1 AND event_type = 'outcome' ORDER BY id DESC LIMIT 1",
+                params![session_id],
+            )
+            .await?;
+        if let Some(row) = rows.next().await? {
+            let score = real(row.get_value(0)?);
+            let comment = outcome_comment(&text(row.get_value(1)?));
+            return Ok(Some((score, comment)));
+        }
+        Ok(None)
+    })
+}
+
+// Pulls the human comment out of an outcome event payload; a missing or
+// unparseable payload just yields an empty comment.
+fn outcome_comment(payload: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return String::new();
+    };
+    let Some(comment) = value.get("comment") else {
+        return String::new();
+    };
+    match comment.as_str() {
+        Some(text) => text.to_string(),
+        None => String::new(),
+    }
+}
+
 // Creates the task hub node on the first move of a game and is a no-op
 // afterwards — INSERT OR IGNORE preserves the original row so repeated moves
 // never reset it.
