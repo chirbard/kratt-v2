@@ -591,6 +591,15 @@ fn normalize_call(call: &ToolCall, confidence: f64) -> ToolCall {
         ToolCall::PromoteEdge { .. } => normalize_promote_edge(call),
         ToolCall::GistEdge { .. } => normalize_gist_edge(call),
         ToolCall::RecordMove { .. } => normalize_record_move(call),
+        ToolCall::DefineTask { name, description } => ToolCall::DefineTask {
+            name: name.clone(),
+            description: description.clone(),
+        },
+        ToolCall::RecordRule { rule } => ToolCall::RecordRule { rule: rule.clone() },
+        ToolCall::RecordOutcome { result, comment } => ToolCall::RecordOutcome {
+            result: result.clone(),
+            comment: comment.clone(),
+        },
     }
 }
 
@@ -736,7 +745,10 @@ fn apply_policy_overrides(cluster: &Cluster, calls: &[ToolCall], policy: &mut Sy
             | ToolCall::ExpireEdge { .. }
             | ToolCall::PromoteEdge { .. }
             | ToolCall::GistEdge { .. }
-            | ToolCall::RecordMove { .. } => {}
+            | ToolCall::RecordMove { .. }
+            | ToolCall::DefineTask { .. }
+            | ToolCall::RecordRule { .. }
+            | ToolCall::RecordOutcome { .. } => {}
         }
         idx += 1;
     }
@@ -788,6 +800,13 @@ fn tool_call_json(call: &ToolCall) -> serde_json::Value {
         ToolCall::GistEdge { .. } => gist_edge_json(call),
         ToolCall::RecordMove { move_text, actor } => {
             json!({"tool":"record_move","args":{"move":move_text,"actor":actor}})
+        }
+        ToolCall::DefineTask { name, description } => {
+            json!({"tool":"define_task","args":{"name":name,"description":description}})
+        }
+        ToolCall::RecordRule { rule } => json!({"tool":"record_rule","args":{"rule":rule}}),
+        ToolCall::RecordOutcome { result, comment } => {
+            json!({"tool":"record_outcome","args":{"result":result,"comment":comment}})
         }
     }
 }

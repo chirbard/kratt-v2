@@ -7,6 +7,68 @@ use super::ledger::EdgeRef;
 // pathological chain blowing the context — a chess game never reaches it.
 pub const MAX_CHAIN_INJECT: usize = 240; // replay-tunable
 
+// Rules + strategies loaded onto a game block. Like the chain, this is outside
+// TOP_K — the rules of the game you are playing are mandatory context.
+pub const MAX_GAME_KNOWLEDGE: usize = 60; // replay-tunable
+
+// The definition body, rules and strategies of the game this session is
+// playing, ready for injection. Empty when the session has no game link.
+pub struct GameKnowledge {
+    pub block: String,
+    pub refs: Vec<EdgeRef>,
+}
+
+// The display name of a game node — its id minus the "game-" prefix.
+pub(crate) fn game_display_name(game_id: &str) -> String {
+    game_id.strip_prefix("game-").unwrap_or(game_id).to_string()
+}
+
+// Loads the game-definition body plus all live semantic rule/strategy edges on
+// the game node this session's hub links to. No game link → empty block and no
+// refs, so a normal chat turn pays nothing.
+pub fn load_game_knowledge(session_id: &str) -> GameKnowledge {
+    let Ok(conn) = db::open_connection() else {
+        return empty_knowledge();
+    };
+    let hub_id = normalize_id(&format!("task-{session_id}"));
+    let Ok(Some((game_id, node))) = db::load_session_game(&conn, &hub_id) else {
+        return empty_knowledge();
+    };
+    let edges = match db::load_game_edges(&conn, &game_id, MAX_GAME_KNOWLEDGE) {
+        Ok(edges) => edges,
+        Err(_) => return empty_knowledge(),
+    };
+    let name = game_display_name(&game_id);
+    let block = render_game_knowledge(&name, &node.body, &edges);
+    let mut refs = Vec::new();
+    for edge in &edges {
+        refs.push(EdgeRef::new(&edge.source, &edge.target));
+    }
+    GameKnowledge { block, refs }
+}
+
+fn empty_knowledge() -> GameKnowledge {
+    GameKnowledge {
+        block: String::new(),
+        refs: Vec::new(),
+    }
+}
+
+// Definition body first (presentation rules live there — injected every turn),
+// then one line per rule/strategy edge.
+fn render_game_knowledge(name: &str, body: &str, edges: &[Edge]) -> String {
+    let mut block = format!("## Game: {name}\n");
+    if !body.is_empty() {
+        block.push_str(body);
+        block.push('\n');
+    }
+    for edge in edges {
+        block.push_str(&edge.content);
+        block.push('\n');
+    }
+    block
+}
+
 // The ordered same-session move chain, ready for injection: the rendered block
 // and the edge refs whose `injected` events retrieval must record.
 pub struct TaskChain {
@@ -71,8 +133,50 @@ fn render_task_chain(edges: &[Edge]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::render_task_chain;
+    use super::{game_display_name, render_game_knowledge, render_task_chain};
     use crate::memory::graph::Edge;
+
+    fn game_edge(content: &str, confidence: f64) -> Edge {
+        Edge {
+            source: "game-chess".to_string(),
+            target: "the-king-moves-one-square".to_string(),
+            content: content.to_string(),
+            stability: 0.9,
+            confidence,
+            importance: 1.0,
+            subject: false,
+            date: String::new(),
+            occurred_at: None,
+            expired_at: None,
+            memory_type: "semantic".to_string(),
+            origin_session: String::new(),
+        }
+    }
+
+    #[test]
+    fn game_display_name_strips_the_prefix() {
+        assert_eq!(game_display_name("game-chess"), "chess");
+        assert_eq!(game_display_name("chess"), "chess");
+    }
+
+    #[test]
+    fn game_block_renders_definition_body_then_one_line_per_edge() {
+        let edges = vec![
+            game_edge("the king moves one square", 0.9),
+            game_edge("develop knights before bishops", 0.6),
+        ];
+        let block = render_game_knowledge("chess", "user plays White, reply with the move only", &edges);
+        assert_eq!(
+            block,
+            "## Game: chess\nuser plays White, reply with the move only\nthe king moves one square\ndevelop knights before bishops\n"
+        );
+    }
+
+    #[test]
+    fn game_block_omits_an_empty_definition_body() {
+        let block = render_game_knowledge("chess", "", &[game_edge("a rule", 0.9)]);
+        assert_eq!(block, "## Game: chess\na rule\n");
+    }
 
     fn ply_edge(content: &str) -> Edge {
         Edge {

@@ -731,6 +731,81 @@ pub fn load_edges_for_node(
     runtime().block_on(load_edges_for_node_async(conn, node_id))
 }
 
+pub fn load_node(
+    conn: &Connection,
+    node_id: &str,
+) -> Result<Option<Node>, Box<dyn Error + Send + Sync>> {
+    runtime().block_on(async {
+        let mut rows = conn
+            .query(
+                "SELECT node_type, body, date FROM nodes WHERE id = ?1 LIMIT 1",
+                params![node_id],
+            )
+            .await?;
+        if let Some(row) = rows.next().await? {
+            return Ok(Some(Node {
+                node_type: text(row.get_value(0)?),
+                body: text(row.get_value(1)?),
+                date: text(row.get_value(2)?),
+            }));
+        }
+        Ok(None)
+    })
+}
+
+// The game-definition node a session's task hub is linked to (episodic
+// hub→game edge), if any. Returns the normalized game id and its node so the
+// caller can render the definition body and anchor rules/strategies.
+pub fn load_session_game(
+    conn: &Connection,
+    hub_id: &str,
+) -> Result<Option<(String, Node)>, Box<dyn Error + Send + Sync>> {
+    runtime().block_on(async {
+        let mut rows = conn
+            .query(
+                "SELECT n.id, n.node_type, n.body, n.date FROM nodes n JOIN edges e ON e.target = n.id WHERE e.source = ?1 AND n.node_type = 'game' AND e.expired_at IS NULL LIMIT 1",
+                params![hub_id],
+            )
+            .await?;
+        if let Some(row) = rows.next().await? {
+            let game_id = normalize_id(&text(row.get_value(0)?));
+            let node = Node {
+                node_type: text(row.get_value(1)?),
+                body: text(row.get_value(2)?),
+                date: text(row.get_value(3)?),
+            };
+            return Ok(Some((game_id, node)));
+        }
+        Ok(None)
+    })
+}
+
+// All live semantic edges incident to a game node (rules + strategies, both
+// directions), highest-confidence first and capped. The episodic hub→game link
+// is excluded by the semantic filter. This is not TOP_K-ranked: the rules of
+// the game you are playing are mandatory context.
+pub fn load_game_edges(
+    conn: &Connection,
+    game_id: &str,
+    cap: usize,
+) -> Result<Vec<Edge>, Box<dyn Error + Send + Sync>> {
+    runtime().block_on(async {
+        let mut rows = conn
+            .query(
+                "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session FROM edges WHERE (source = ?1 OR target = ?1) AND memory_type = 'semantic' AND expired_at IS NULL ORDER BY confidence DESC LIMIT ?2",
+                params![game_id, cap as i64],
+            )
+            .await?;
+        let mut edges = Vec::new();
+        while let Some(row) = rows.next().await? {
+            if let Some(edge) = parse_edge_row(&row) {
+                edges.push(edge);
+            }
+        }
+        Ok(edges)
+    })
+}
+
 // Creates the task hub node on the first move of a game and is a no-op
 // afterwards — INSERT OR IGNORE preserves the original row so repeated moves
 // never reset it.
@@ -1670,10 +1745,11 @@ pub(crate) fn int(val: Value) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{block_on, load_task_chain};
+    use super::{block_on, load_game_edges, load_session_game, load_task_chain};
     use turso::{Builder, Connection, params};
 
     const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', PRIMARY KEY (source, target))";
+    const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
 
     async fn harness() -> Connection {
         let Ok(database) = Builder::new_local(":memory:").build().await else {
@@ -1684,6 +1760,79 @@ mod tests {
         };
         let _ = conn.execute(EDGES_DDL, ()).await;
         conn
+    }
+
+    async fn game_harness() -> Connection {
+        let conn = harness().await;
+        let _ = conn.execute(NODES_DDL, ()).await;
+        let _ = conn
+            .execute(
+                "INSERT INTO nodes (id, node_type, body) VALUES ('game-chess', 'game', 'the rules')",
+                (),
+            )
+            .await;
+        // Episodic hub → game link (excluded from the semantic knowledge load).
+        let _ = conn
+            .execute(
+                "INSERT INTO edges (source, target, content, memory_type, origin_session) VALUES ('task-game-1', 'game-chess', 'this session plays chess', 'episodic', 'game-1')",
+                (),
+            )
+            .await;
+        conn
+    }
+
+    async fn insert_game_edge(
+        conn: &Connection,
+        target: &str,
+        confidence: f64,
+        expired: Option<&str>,
+    ) {
+        let _ = conn
+            .execute(
+                "INSERT INTO edges (source, target, content, confidence, memory_type, expired_at) VALUES ('game-chess', ?1, ?1, ?2, 'semantic', ?3)",
+                params![target, confidence, expired],
+            )
+            .await;
+    }
+
+    #[test]
+    fn session_game_returns_the_linked_definition_and_none_without_a_link() {
+        let conn = block_on(game_harness());
+        let Ok(Some((game_id, node))) = load_session_game(&conn, "task-game-1") else {
+            unreachable!("game is linked")
+        };
+        assert_eq!(game_id, "game-chess");
+        assert_eq!(node.body, "the rules");
+        let Ok(missing) = load_session_game(&conn, "task-game-2") else {
+            unreachable!("load succeeds")
+        };
+        assert!(missing.is_none());
+    }
+
+    #[test]
+    fn game_edges_load_highest_confidence_first_and_exclude_expired() {
+        let conn = block_on(game_harness());
+        block_on(insert_game_edge(&conn, "rule-low", 0.4, None));
+        block_on(insert_game_edge(&conn, "rule-high", 0.9, None));
+        block_on(insert_game_edge(&conn, "rule-gone", 0.95, Some("2026-01-01")));
+        let Ok(edges) = load_game_edges(&conn, "game-chess", 60) else {
+            unreachable!("edges load")
+        };
+        assert_eq!(edges.len(), 2, "expired excluded, episodic link excluded");
+        assert_eq!(edges[0].target, "rule-high");
+        assert_eq!(edges[1].target, "rule-low");
+    }
+
+    #[test]
+    fn game_edges_cap_keeps_the_highest_confidence() {
+        let conn = block_on(game_harness());
+        block_on(insert_game_edge(&conn, "rule-a", 0.3, None));
+        block_on(insert_game_edge(&conn, "rule-b", 0.9, None));
+        let Ok(edges) = load_game_edges(&conn, "game-chess", 1) else {
+            unreachable!("edges load")
+        };
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target, "rule-b");
     }
 
     async fn insert_ply(

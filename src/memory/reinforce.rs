@@ -44,6 +44,20 @@ pub fn record_move_outcome(
     apply_outcome(session_id, turn_id, outcome_score, payload)
 }
 
+// In-transaction outcome: reinforce the session's active edges inside a
+// transaction the caller already opened (the scribe pass at game end). The
+// public record_outcome acquires the write lock and begins its own
+// transaction — calling it from inside the scribe pass would deadlock and
+// nest transactions, so game-end outcomes route through here instead.
+pub(super) fn record_outcome_in_tx(
+    conn: &Connection,
+    session_id: &str,
+    outcome_score: f64,
+    payload: &str,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    run_reinforcement(conn, session_id, "", outcome_score.clamp(-1.0, 1.0), payload)
+}
+
 fn apply_outcome(
     session_id: &str,
     turn_id: &str,
