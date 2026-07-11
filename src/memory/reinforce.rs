@@ -279,6 +279,9 @@ fn load_session_slice(
     db::block_on(load_session_slice_async(conn, session_id, turn_id))
 }
 
+// The slice an outcome reinforces: exploration retrievals/marks, plus
+// game-tagged injections (chain + game knowledge) — NOT the 60 ranked beliefs
+// of every chat turn, which would drown credit assignment in noise.
 async fn load_session_slice_async(
     conn: &Connection,
     session_id: &str,
@@ -286,13 +289,13 @@ async fn load_session_slice_async(
 ) -> Result<Vec<SliceEvent>, Box<dyn Error + Send + Sync>> {
     let mut rows = if turn_id.is_empty() {
         conn.query(
-            "SELECT source, target, weight FROM events WHERE session_id = ?1 AND event_type IN ('retrieved','marked') ORDER BY id",
+            "SELECT source, target, weight FROM events WHERE session_id = ?1 AND (event_type IN ('retrieved','marked') OR (event_type = 'injected' AND actor_id = 'game')) ORDER BY id",
             params![session_id],
         )
         .await?
     } else {
         conn.query(
-            "SELECT source, target, weight FROM events WHERE session_id = ?1 AND turn_id = ?2 AND event_type IN ('retrieved','marked') ORDER BY id",
+            "SELECT source, target, weight FROM events WHERE session_id = ?1 AND turn_id = ?2 AND (event_type IN ('retrieved','marked') OR (event_type = 'injected' AND actor_id = 'game')) ORDER BY id",
             params![session_id, turn_id],
         )
         .await?
@@ -331,6 +334,40 @@ mod tests {
             target: target.to_string(),
             activity_weight,
         }
+    }
+
+    const EVENTS_DDL: &str = "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')";
+
+    async fn insert_event(conn: &turso::Connection, event_type: &str, actor_id: &str) {
+        let _ = conn
+            .execute(
+                "INSERT INTO events (session_id, actor_id, event_type, source, target) VALUES ('s1', ?1, ?2, 'a', 'b')",
+                turso::params![actor_id, event_type],
+            )
+            .await;
+    }
+
+    // A game outcome must credit what the game used (game-tagged injections)
+    // but never the ranked beliefs of every chat turn (local-tagged ones).
+    #[test]
+    fn outcome_slice_includes_game_injections_but_not_ranked_ones() {
+        let slice = crate::memory::db::block_on(async {
+            let Ok(database) = turso::Builder::new_local(":memory:").build().await else {
+                unreachable!("in-memory database builds")
+            };
+            let Ok(conn) = database.connect() else {
+                unreachable!("in-memory database connects")
+            };
+            let _ = conn.execute(EVENTS_DDL, ()).await;
+            insert_event(&conn, "injected", "game").await;
+            insert_event(&conn, "injected", "local").await;
+            insert_event(&conn, "retrieved", "explorer").await;
+            let Ok(slice) = super::load_session_slice_async(&conn, "s1", "").await else {
+                unreachable!("slice loads")
+            };
+            slice
+        });
+        assert_eq!(slice.len(), 2, "game injection + retrieval, not the ranked one");
     }
 
     #[test]

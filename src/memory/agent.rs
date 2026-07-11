@@ -252,6 +252,34 @@ impl<'run> AgentRun<'run> {
         }
     }
 
+    fn consolidate_prompt(
+        &self,
+        pre_extract_graph: &super::graph::Graph,
+        pre_extract_toon: &str,
+        active_game: Option<&str>,
+    ) -> String {
+        let post_extract_graph = db::load_graph();
+        let diff = db::graph_diff_toon(pre_extract_graph, &post_extract_graph);
+        build_agent_prompt(&AgentPrompt {
+            explanation: CONSOLIDATE_EXPLANATION,
+            toon: pre_extract_toon,
+            user_msg: self.user_msg,
+            assistant_msg: self.assistant_msg,
+            diff_text: if diff.is_empty() { None } else { Some(&diff) },
+            injected_toon: None,
+            active_game,
+        })
+    }
+
+    // The display name of the game this session plays, if any — deterministic
+    // context for the heavy prompt so rules/outcomes route to the game tools.
+    fn active_game_name(&self, conn: &Connection) -> Option<String> {
+        let session_id = db::source_session_id(self.user_message_id)?;
+        let hub_id = normalize_id(&format!("task-{session_id}"));
+        let (game_id, _) = db::load_session_game(conn, &hub_id).ok()??;
+        Some(super::task_chain::game_display_name(&game_id))
+    }
+
     // Does this turn's session already have a live move chain? Best-effort:
     // any failure reads as "no chain" and classification proceeds unbiased.
     fn session_has_chain(&self) -> bool {
@@ -290,6 +318,7 @@ impl<'run> AgentRun<'run> {
         let pre_extract_graph = graph.clone();
         let pre_extract_toon = toon::encode(&graph_to_json(&pre_extract_graph), None);
         let injected_toon = injected_toon(&injected);
+        let active_game = self.active_game_name(&conn);
         let extract_prompt = build_agent_prompt(&AgentPrompt {
             explanation: EXTRACT_EXPLANATION,
             toon: &pre_extract_toon,
@@ -297,19 +326,12 @@ impl<'run> AgentRun<'run> {
             assistant_msg: self.assistant_msg,
             diff_text: None,
             injected_toon: injected_toon.as_deref(),
+            active_game: active_game.as_deref(),
         });
         self.run_pass(&ctx, &heavy_pass("extract"), extract_prompt)?;
 
-        let post_extract_graph = db::load_graph();
-        let diff = db::graph_diff_toon(&pre_extract_graph, &post_extract_graph);
-        let consolidate_prompt = build_agent_prompt(&AgentPrompt {
-            explanation: CONSOLIDATE_EXPLANATION,
-            toon: &pre_extract_toon,
-            user_msg: self.user_msg,
-            assistant_msg: self.assistant_msg,
-            diff_text: if diff.is_empty() { None } else { Some(&diff) },
-            injected_toon: None,
-        });
+        let consolidate_prompt =
+            self.consolidate_prompt(&pre_extract_graph, &pre_extract_toon, active_game.as_deref());
         self.run_pass(&ctx, &heavy_pass("consolidate"), consolidate_prompt)?;
 
         let final_graph = db::load_graph();
@@ -1295,8 +1317,10 @@ fn apply_record_outcome_call<'scope>(
     options: &ApplyToolOptions<'scope>,
     call: RecordOutcomeCall,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
-    if options.actor.actor_id != "scribe" {
-        return Ok("record_outcome denied: record_outcome is a scribe tool".to_string());
+    if !rule_seat_allowed(&options.actor.actor_id) {
+        return Ok(
+            "record_outcome denied: record_outcome is a scribe or heavy tool".to_string(),
+        );
     }
     let session_id = options.context.session_id.clone();
     let hub_id = normalize_id(&format!("task-{session_id}"));
@@ -2044,12 +2068,16 @@ mod tests {
         }
 
         #[test]
-        fn record_outcome_records_the_game_result_and_is_scribe_only() {
+        fn record_outcome_works_from_scribe_and_heavy_but_not_dream_or_ingest() {
             let conn = db::block_on(harness());
             apply(&conn, &options_for_phase("scribe"), define("chess", "rules"));
             let description = apply(&conn, &options_for_phase("scribe"), outcome("loss"));
             assert!(description.contains("loss") && description.contains("chess"), "{description}");
-            let denied = apply(&conn, &options_for_phase("extract"), outcome("win"));
+            // Game-end turns legitimately classify chat ("I resign — good
+            // game" has no new move), so the heavy pass must be able to score.
+            let from_extract = apply(&conn, &options_for_phase("extract"), outcome("win"));
+            assert!(from_extract.contains("win"), "{from_extract}");
+            let denied = apply(&conn, &options_for_phase("ingest"), outcome("win"));
             assert!(denied.contains("denied"), "{denied}");
         }
 
