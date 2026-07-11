@@ -57,9 +57,18 @@ CHAT — anything else: normal conversation, facts, questions, discussion.
 
 When unsure, answer CHAT."#;
 
-pub fn build_classify_prompt(user_msg: &str, assistant_msg: &str) -> String {
+// When the session already has a live move chain, a move turn wrapped in
+// verbose prose must still reach the scribe — a misrouted move is a hole in
+// the chain. The bias is prompt-level: the model still decides, so post-game
+// chat in the same session is not forced into the episodic path.
+const ACTIVE_TASK_HINT: &str = "\n\nThis session has an ongoing task with moves already recorded. If this turn contains a move or continues that task — even wrapped in discussion — answer TASK.";
+
+pub fn build_classify_prompt(user_msg: &str, assistant_msg: &str, active_task: bool) -> String {
     let mut prompt = String::new();
     prompt.push_str(CLASSIFY_TURN);
+    if active_task {
+        prompt.push_str(ACTIVE_TASK_HINT);
+    }
     prompt.push_str("\n\n## Exchange\n\nUser: ");
     prompt.push_str(user_msg);
     prompt.push_str("\nAssistant: ");
@@ -70,6 +79,7 @@ pub fn build_classify_prompt(user_msg: &str, assistant_msg: &str) -> String {
 pub const SCRIBE_EXPLANATION: &str = r#"You are the episodic scribe: a fast, narrow recorder for one move or step in an ongoing task or game.
 
 - Every move or step made this turn goes through record_move — emit one record_move per move, in the order they occurred. You choose only the move text and whose move it was; the running order and structure are handled for you.
+- Copy the move text VERBATIM as it appeared in the exchange — even if it looks illegal, mistaken, or odd. You are a recorder, not a referee; never substitute a move you think was meant.
 - Record the move verbatim in standard notation where one exists (e.g. chess: "Nc3", "e4").
 - Moves must never go through upsert_edge or upsert_node. Use those only for a non-move task fact stated this turn (a rule someone declared, a score announcement).
 - Do not summarize strategy, draw lessons, or restructure existing memory — that is dreaming's job later, not yours.
@@ -80,7 +90,7 @@ pub const SCRIBE_EXPLANATION: &str = r#"You are the episodic scribe: a fast, nar
 pub const SCRIBE_TOOL_DEFINITIONS: &str = r#"TOOLS
 
 record_move — record ONE move or step made this turn (the primary tool). Emit one per move, in order. Structure, ply number, and the move-list are derived for you — you supply only:
-- move: the move verbatim in standard notation where one exists ("Nc3", "e4")
+- move: the move text copied verbatim from the exchange, even if it looks illegal or mistaken ("Nc3", "e4")
 - actor: "assistant" for your own move, "user" for the opponent's move
 {"tool":"record_move","args":{"move":"Nc3","actor":"assistant"}}
 
@@ -594,6 +604,14 @@ pub fn today_iso() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn classify_prompt_carries_active_task_hint_only_when_set() {
+        let biased = super::build_classify_prompt("Nc3", "Nf6", true);
+        assert!(biased.contains("ongoing task with moves already recorded"));
+        let unbiased = super::build_classify_prompt("Nc3", "Nf6", false);
+        assert!(!unbiased.contains("ongoing task"));
+    }
+
     use super::{AgentPrompt, EXTRACT_EXPLANATION, build_agent_prompt, build_continue_prompt};
 
     const INJECTED_HEADING: &str = "## Beliefs injected into this turn";
