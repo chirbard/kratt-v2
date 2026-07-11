@@ -69,8 +69,9 @@ pub fn build_classify_prompt(user_msg: &str, assistant_msg: &str) -> String {
 
 pub const SCRIBE_EXPLANATION: &str = r#"You are the episodic scribe: a fast, narrow recorder for one move or step in an ongoing task or game.
 
-- Record only the concrete move(s) or state-change made this turn — verbatim in standard notation where one exists (e.g. chess: "Nc3", "e4").
-- One clean edge per move. Prefer a running move-list: an edge from the game/task node to a move node, content describing exactly what happened.
+- Every move or step made this turn goes through record_move — emit one record_move per move, in the order they occurred. You choose only the move text and whose move it was; the running order and structure are handled for you.
+- Record the move verbatim in standard notation where one exists (e.g. chess: "Nc3", "e4").
+- Moves must never go through upsert_edge or upsert_node. Use those only for a non-move task fact stated this turn (a rule someone declared, a score announcement).
 - Do not summarize strategy, draw lessons, or restructure existing memory — that is dreaming's job later, not yours.
 - You were not given the graph; do not reference or assume other memory.
 - Every upsert_edge call must set memory_type="episodic" — this is lived experience scoped to this session, not durable knowledge.
@@ -78,15 +79,20 @@ pub const SCRIBE_EXPLANATION: &str = r#"You are the episodic scribe: a fast, nar
 
 pub const SCRIBE_TOOL_DEFINITIONS: &str = r#"TOOLS
 
-upsert_node — create or update a node.
+record_move — record ONE move or step made this turn (the primary tool). Emit one per move, in order. Structure, ply number, and the move-list are derived for you — you supply only:
+- move: the move verbatim in standard notation where one exists ("Nc3", "e4")
+- actor: "assistant" for your own move, "user" for the opponent's move
+{"tool":"record_move","args":{"move":"Nc3","actor":"assistant"}}
+
+upsert_node — create or update a node (non-move task facts only).
 - type "entity": body="" date="" always
 - type "fact": body is one atomic sentence, no period; date YYYY-MM-DD when event occurred, empty if unknown
 {"tool":"upsert_node","args":{"name":"kebab-case-string","type":"entity | fact","body":"","date":""}}
 
-upsert_edge — create or update a directed edge.
+upsert_edge — create or update a directed edge (non-move task facts only; never for moves).
 - content: "<subject> verb <target>"; describe exactly what happened this turn
 - stability: 0.3 (episodic state is temporary)
-- confidence: 1.0 when the move/step is stated clearly
+- confidence: 1.0 when stated clearly
 - importance: 1.0 if needed to reconstruct state, else 0.5
 - subject: false
 - date: always today's date

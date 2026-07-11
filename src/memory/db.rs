@@ -731,6 +731,88 @@ pub fn load_edges_for_node(
     runtime().block_on(load_edges_for_node_async(conn, node_id))
 }
 
+// Creates the task hub node on the first move of a game and is a no-op
+// afterwards — INSERT OR IGNORE preserves the original row so repeated moves
+// never reset it.
+pub fn ensure_task_hub(
+    conn: &Connection,
+    hub_id: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    runtime().block_on(async {
+        conn.execute(
+            "INSERT OR IGNORE INTO nodes (id, node_type, body, date) VALUES (?1, 'task', '', '')",
+            params![hub_id],
+        )
+        .await?;
+        Ok(())
+    })
+}
+
+// Live ply count on a task hub, counted from the DB so ply numbering survives a
+// restart (no in-memory counter). Only move edges (target `<hub>-ply-%`) count,
+// so non-move task facts attached to the hub never inflate the number.
+pub fn count_task_chain(
+    conn: &Connection,
+    hub_id: &str,
+) -> Result<usize, Box<dyn Error + Send + Sync>> {
+    count_chain_edges(conn, hub_id, "AND expired_at IS NULL")
+}
+
+// Ply numbering must be monotonic: an expired ply still owns its number, or
+// the next record_move would upsert over it and resurrect it. Count everything.
+pub fn next_ply(conn: &Connection, hub_id: &str) -> Result<usize, Box<dyn Error + Send + Sync>> {
+    Ok(count_chain_edges(conn, hub_id, "")? + 1)
+}
+
+fn count_chain_edges(
+    conn: &Connection,
+    hub_id: &str,
+    expiry_filter: &str,
+) -> Result<usize, Box<dyn Error + Send + Sync>> {
+    let pattern = format!("{hub_id}-ply-%");
+    let query =
+        format!("SELECT COUNT(*) FROM edges WHERE source = ?1 AND target LIKE ?2 {expiry_filter}");
+    runtime().block_on(async {
+        let mut rows = conn
+            .query(&query, params![hub_id, pattern.as_str()])
+            .await?;
+        if let Some(row) = rows.next().await? {
+            return Ok(real(row.get_value(0)?) as usize);
+        }
+        Ok(0)
+    })
+}
+
+// The current session's task-hub move chain, ordered by ply (zero-padded
+// move-node ids sort lexically = numerically), expired edges excluded. Caps at
+// `cap` keeping the most recent plies — a normal game never hits the cap; a
+// pathological chain must not blow the context.
+pub fn load_task_chain(
+    conn: &Connection,
+    session_id: &str,
+    cap: usize,
+) -> Result<Vec<Edge>, Box<dyn Error + Send + Sync>> {
+    let hub_id = normalize_id(&format!("task-{session_id}"));
+    let pattern = format!("{hub_id}-ply-%");
+    runtime().block_on(async {
+        let mut rows = conn
+            .query(
+                "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session FROM edges WHERE source = ?1 AND target LIKE ?2 AND memory_type = 'episodic' AND expired_at IS NULL ORDER BY target DESC LIMIT ?3",
+                params![hub_id.as_str(), pattern.as_str(), cap as i64],
+            )
+            .await?;
+        let mut edges = Vec::new();
+        while let Some(row) = rows.next().await? {
+            if let Some(edge) = parse_edge_row(&row) {
+                edges.push(edge);
+            }
+        }
+        // Loaded newest-first to honor the cap; flip back to ply order.
+        edges.reverse();
+        Ok(edges)
+    })
+}
+
 pub fn update_edge_confidence(
     conn: &Connection,
     source: &str,
@@ -1583,5 +1665,85 @@ pub(crate) fn int(val: Value) -> i64 {
     match val {
         Value::Integer(int) => int,
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{block_on, load_task_chain};
+    use turso::{Builder, Connection, params};
+
+    const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', PRIMARY KEY (source, target))";
+
+    async fn harness() -> Connection {
+        let Ok(database) = Builder::new_local(":memory:").build().await else {
+            unreachable!("in-memory database builds")
+        };
+        let Ok(conn) = database.connect() else {
+            unreachable!("in-memory database connects")
+        };
+        let _ = conn.execute(EDGES_DDL, ()).await;
+        conn
+    }
+
+    async fn insert_ply(
+        conn: &Connection,
+        hub: &str,
+        ply: usize,
+        session: &str,
+        expired: Option<&str>,
+    ) {
+        let target = format!("{hub}-ply-{ply:03}");
+        let content = format!("ply {ply} (assistant): move{ply}");
+        let _ = conn
+            .execute(
+                "INSERT INTO edges (source, target, content, memory_type, origin_session, expired_at) VALUES (?1, ?2, ?3, 'episodic', ?4, ?5)",
+                params![hub, target.as_str(), content.as_str(), session, expired],
+            )
+            .await;
+    }
+
+    #[test]
+    fn chain_returns_plies_in_order_for_this_session_only() {
+        let conn = block_on(harness());
+        block_on(insert_ply(&conn, "task-game-1", 2, "game-1", None));
+        block_on(insert_ply(&conn, "task-game-1", 1, "game-1", None));
+        // A different session's hub must never leak in.
+        block_on(insert_ply(&conn, "task-game-2", 1, "game-2", None));
+
+        let Ok(chain) = load_task_chain(&conn, "game-1", 240) else {
+            unreachable!("chain loads")
+        };
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].target, "task-game-1-ply-001");
+        assert_eq!(chain[1].target, "task-game-1-ply-002");
+    }
+
+    #[test]
+    fn chain_excludes_expired_plies() {
+        let conn = block_on(harness());
+        block_on(insert_ply(&conn, "task-game-1", 1, "game-1", None));
+        block_on(insert_ply(&conn, "task-game-1", 2, "game-1", Some("2026-01-01")));
+
+        let Ok(chain) = load_task_chain(&conn, "game-1", 240) else {
+            unreachable!("chain loads")
+        };
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].target, "task-game-1-ply-001");
+    }
+
+    #[test]
+    fn cap_keeps_the_most_recent_plies_in_order() {
+        let conn = block_on(harness());
+        for ply in 1..=5 {
+            block_on(insert_ply(&conn, "task-game-1", ply, "game-1", None));
+        }
+        let Ok(chain) = load_task_chain(&conn, "game-1", 2) else {
+            unreachable!("chain loads")
+        };
+        assert_eq!(chain.len(), 2);
+        // Newest two plies, still in ascending order.
+        assert_eq!(chain[0].target, "task-game-1-ply-004");
+        assert_eq!(chain[1].target, "task-game-1-ply-005");
     }
 }

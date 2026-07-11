@@ -458,6 +458,10 @@ fn apply_dream_call<'scope, 'policy>(
                 supported_by,
             },
         ),
+        ToolCall::RecordMove { .. } => Ok((
+            "record_move denied: record_move is a scribe tool".to_string(),
+            false,
+        )),
     }
 }
 

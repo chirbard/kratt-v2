@@ -590,6 +590,19 @@ fn normalize_call(call: &ToolCall, confidence: f64) -> ToolCall {
         ToolCall::ExpireEdge { .. } => normalize_expire_edge(call),
         ToolCall::PromoteEdge { .. } => normalize_promote_edge(call),
         ToolCall::GistEdge { .. } => normalize_gist_edge(call),
+        ToolCall::RecordMove { .. } => normalize_record_move(call),
+    }
+}
+
+// Synthesis never emits record_move (it is a scribe-only tool), but the match
+// must stay exhaustive — pass it through unchanged.
+fn normalize_record_move(call: &ToolCall) -> ToolCall {
+    let ToolCall::RecordMove { move_text, actor } = call else {
+        unreachable!("normalize_record_move called with non-record_move");
+    };
+    ToolCall::RecordMove {
+        move_text: move_text.clone(),
+        actor: actor.clone(),
     }
 }
 
@@ -722,7 +735,8 @@ fn apply_policy_overrides(cluster: &Cluster, calls: &[ToolCall], policy: &mut Sy
             | ToolCall::DeleteEdge { .. }
             | ToolCall::ExpireEdge { .. }
             | ToolCall::PromoteEdge { .. }
-            | ToolCall::GistEdge { .. } => {}
+            | ToolCall::GistEdge { .. }
+            | ToolCall::RecordMove { .. } => {}
         }
         idx += 1;
     }
@@ -772,6 +786,9 @@ fn tool_call_json(call: &ToolCall) -> serde_json::Value {
             json!({"tool":"promote_edge","args":{"source":source,"target":target}})
         }
         ToolCall::GistEdge { .. } => gist_edge_json(call),
+        ToolCall::RecordMove { move_text, actor } => {
+            json!({"tool":"record_move","args":{"move":move_text,"actor":actor}})
+        }
     }
 }
 
