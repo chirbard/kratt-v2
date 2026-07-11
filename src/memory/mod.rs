@@ -13,7 +13,8 @@ mod routing;
 pub mod scheduler;
 mod synthesis;
 
-pub use agent::{MemoryEvent, run_memory_agent};
+pub use agent::{MemoryEvent, MemorySeats, run_memory_agent};
+pub(crate) use agent::{classify_reply_label, describe_tool_call, parse_tool_calls};
 pub use db::{
     db_init, insert_message, last_sync_error, latest_session_id, read_message_context,
     register_session, search_messages_fts, sync_now, sync_pull_best_effort, sync_push_best_effort,

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::api::{Chunk, EmbeddingClient, LlmClient, Stats};
-use crate::memory::{self, DreamEvent, ExploreEvent, IngestEvent, MemoryEvent};
+use crate::memory::{self, DreamEvent, ExploreEvent, IngestEvent, MemoryEvent, MemorySeats};
 use crate::session;
 use crate::web::SearchClient;
 
@@ -64,7 +64,9 @@ pub(crate) struct Message {
 
 pub(crate) struct App {
     pub(crate) chat_llm: Arc<dyn LlmClient>,
-    pub(crate) memory_llm: Arc<dyn LlmClient>,
+    // The memory pass runs on per-seat clients (classifier/scribe/heavy). The
+    // heavy seat is also the model for dream/explore/ingest passes.
+    pub(crate) seats: MemorySeats,
     pub(crate) embed: Arc<dyn EmbeddingClient>,
     pub(crate) search: Option<Arc<dyn SearchClient>>,
     pub(crate) input: String,
@@ -112,14 +114,14 @@ impl App {
     #[allow(clippy::too_many_lines)]
     pub(crate) fn new(
         chat_llm: Arc<dyn LlmClient>,
-        memory_llm: Arc<dyn LlmClient>,
+        seats: MemorySeats,
         embed: Arc<dyn EmbeddingClient>,
         search: Option<Arc<dyn SearchClient>>,
         session_path: PathBuf,
     ) -> Self {
         Self {
             chat_llm,
-            memory_llm,
+            seats,
             embed,
             search,
             input: String::new(),
@@ -380,10 +382,10 @@ fn start_memory_update(app: &mut App) {
     let user_message_id = app.last_user_message_id.clone();
     app.memory_log.clear();
     let (sender, receiver) = std::sync::mpsc::channel::<MemoryEvent>();
-    let llm = Arc::clone(&app.memory_llm);
+    let seats = app.seats.clone();
     std::thread::spawn(move || {
         let _ = memory::run_memory_agent(
-            llm,
+            seats,
             &user_content,
             &assistant_content,
             &user_message_id,
@@ -398,7 +400,7 @@ pub(crate) fn start_dream(app: &mut App) {
     app.dream_log.clear();
     app.dream_summary.clear();
     let (sender, receiver) = std::sync::mpsc::channel::<DreamEvent>();
-    let llm = Arc::clone(&app.memory_llm);
+    let llm = Arc::clone(&app.seats.heavy);
     let embed = Arc::clone(&app.embed);
     std::thread::spawn(move || {
         let _ = memory::run_dream_pass(llm, embed, sender);
@@ -411,7 +413,7 @@ pub(crate) fn start_exploration(app: &mut App) {
     app.explore_log.clear();
     app.explore_summary.clear();
     let (sender, receiver) = std::sync::mpsc::channel::<ExploreEvent>();
-    let llm = Arc::clone(&app.memory_llm);
+    let llm = Arc::clone(&app.seats.heavy);
     let embed = Arc::clone(&app.embed);
     let search = clone_search_client(app);
     std::thread::spawn(move || {
@@ -432,7 +434,7 @@ pub(crate) fn start_ingestion(app: &mut App, path: PathBuf) {
     app.ingest_log.clear();
     app.ingest_summary.clear();
     let (sender, receiver) = std::sync::mpsc::channel::<IngestEvent>();
-    let llm = Arc::clone(&app.memory_llm);
+    let llm = Arc::clone(&app.seats.heavy);
     let embed = Arc::clone(&app.embed);
     let search = clone_search_client(app);
     std::thread::spawn(move || {

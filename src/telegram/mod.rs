@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::api::{EmbeddingClient, LlmClient};
-use crate::memory::{self, MemoryEvent};
+use crate::memory::{self, MemoryEvent, MemorySeats};
 use crate::runlog;
 use crate::session;
 use crate::timeutil;
@@ -58,7 +58,7 @@ impl Config {
 
 pub fn run(
     chat_llm: Arc<dyn LlmClient>,
-    memory_llm: Arc<dyn LlmClient>,
+    seats: MemorySeats,
     embed: Arc<dyn EmbeddingClient>,
     search: Option<Arc<dyn SearchClient>>,
 ) -> Result<(), Box<dyn Error>> {
@@ -67,16 +67,18 @@ pub fn run(
         Ok(transport) => transport,
         Err(err) => return Err(err.to_string().into()),
     };
+    // Dream, exploration and the daily report all run on the heavy seat
+    // (MEMORY_MODEL); only the live memory pass consults the split seats.
     let mut night = night::NightCycle::from_env(
-        Arc::clone(&memory_llm),
+        Arc::clone(&seats.heavy),
         Arc::clone(&embed),
         search.clone(),
     )?;
     let mut report = report::ReportCycle::from_env(
-        Arc::clone(&memory_llm),
+        Arc::clone(&seats.heavy),
         config.allowed_user_id,
     )?;
-    let mut handler = LiveTurnHandler::new(chat_llm, memory_llm, embed, search);
+    let mut handler = LiveTurnHandler::new(chat_llm, seats, embed, search);
     let shutdown = install_shutdown_flag();
     let banner = "kratt telegram gateway ready — long polling (Ctrl-C to stop)";
     println!("{banner}");
@@ -303,7 +305,7 @@ fn send_chunk(
 
 struct LiveTurnHandler {
     chat_llm: Arc<dyn LlmClient>,
-    memory_llm: Arc<dyn LlmClient>,
+    seats: MemorySeats,
     embed: Arc<dyn EmbeddingClient>,
     search: Option<Arc<dyn SearchClient>>,
     day: DaySession,
@@ -312,13 +314,13 @@ struct LiveTurnHandler {
 impl LiveTurnHandler {
     fn new(
         chat_llm: Arc<dyn LlmClient>,
-        memory_llm: Arc<dyn LlmClient>,
+        seats: MemorySeats,
         embed: Arc<dyn EmbeddingClient>,
         search: Option<Arc<dyn SearchClient>>,
     ) -> Self {
         Self {
             chat_llm,
-            memory_llm,
+            seats,
             embed,
             search,
             day: DaySession::new(),
@@ -349,7 +351,7 @@ impl TurnHandler for LiveTurnHandler {
         };
         let answer = turn::run_turn_collecting(&clients, text, &session_path, &turn_id)?;
         session::append_entry(&session_path, "assistant", &answer);
-        run_memory_to_completion(Arc::clone(&self.memory_llm), text, &answer, &turn_id);
+        run_memory_to_completion(self.seats.clone(), text, &answer, &turn_id);
         Ok(answer)
     }
 }
@@ -357,13 +359,13 @@ impl TurnHandler for LiveTurnHandler {
 // Runs the same memory classifier/pass as the TUI, but inline: the events are
 // drained to completion here rather than into a panel.
 fn run_memory_to_completion(
-    llm: Arc<dyn LlmClient>,
+    seats: MemorySeats,
     user_msg: &str,
     assistant_msg: &str,
     turn_id: &str,
 ) {
     let (sender, receiver) = std::sync::mpsc::channel::<MemoryEvent>();
-    if let Err(err) = memory::run_memory_agent(llm, user_msg, assistant_msg, turn_id, sender) {
+    if let Err(err) = memory::run_memory_agent(seats, user_msg, assistant_msg, turn_id, sender) {
         runlog::log("tg", &format!("memory pass failed: {err}"));
     }
     // The agent already returned and dropped its sender; drain the buffered

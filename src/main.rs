@@ -15,6 +15,7 @@ mod memory;
 mod paths;
 mod prompts;
 mod runlog;
+mod seat_replay;
 mod session;
 mod telegram;
 mod turn;
@@ -46,10 +47,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let embed_model = DEFAULT_EMBED_MODEL.to_string();
     let chat_llm: Arc<dyn api::LlmClient> = Arc::new(api::new_client(api_key.clone(), chat_model));
-    let memory_llm: Arc<dyn api::LlmClient> =
-        Arc::new(api::new_client(api_key.clone(), memory_model));
+    // The three memory seats. Heavy is always MEMORY_MODEL; classifier and
+    // scribe default to it unless CLASSIFIER_MODEL/SCRIBE_MODEL override them
+    // (which may be an "ollama:" local model). Unset → all three identical.
+    let seats = build_memory_seats(&api_key, &memory_model);
     let embed: Arc<dyn api::EmbeddingClient> =
         Arc::new(api::new_embed_client(api_key.clone(), embed_model));
+    if seat_replay_mode() {
+        return seat_replay::run(&seats);
+    }
     let search: Option<Arc<dyn web::SearchClient>> = if tavily_key.is_empty() {
         None
     } else {
@@ -64,10 +70,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Same binary, two faces: --telegram runs the headless gateway daemon, no
     // args runs the interactive TUI. One process owns kratt-data/.
     let result = if telegram_mode() {
-        telegram::run(chat_llm, memory_llm, embed, search)
+        telegram::run(chat_llm, seats, embed, search)
     } else {
         let session_path = session::new_session_path();
-        tui::run(chat_llm, memory_llm, embed, search, session_path)
+        tui::run(chat_llm, seats, embed, search, session_path)
     };
     memory::sync_push_best_effort("app exit");
     result
@@ -80,4 +86,33 @@ fn telegram_mode() -> bool {
         }
     }
     false
+}
+
+fn seat_replay_mode() -> bool {
+    for arg in std::env::args() {
+        if arg == "--seat-replay" {
+            return true;
+        }
+    }
+    false
+}
+
+// Heavy is always MEMORY_MODEL. classifier/scribe follow their own env spec
+// (which may be an "ollama:" local model); unset falls back to MEMORY_MODEL so
+// default configuration is byte-identical to the pre-split single client.
+fn build_memory_seats(api_key: &str, memory_model: &str) -> memory::MemorySeats {
+    let heavy = api::resolve_model_client(memory_model, api_key);
+    let classifier = match std::env::var("CLASSIFIER_MODEL") {
+        Ok(spec) => api::resolve_model_client(&spec, api_key),
+        Err(_) => Arc::clone(&heavy),
+    };
+    let scribe = match std::env::var("SCRIBE_MODEL") {
+        Ok(spec) => api::resolve_model_client(&spec, api_key),
+        Err(_) => Arc::clone(&heavy),
+    };
+    memory::MemorySeats {
+        classifier,
+        scribe,
+        heavy,
+    }
 }
