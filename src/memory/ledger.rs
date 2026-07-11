@@ -337,6 +337,201 @@ pub fn load_actor_direction(actor_type: &str, actor_id: &str) -> Option<Vec<f64>
     db::block_on(load_actor_direction_async(&conn, actor_type, actor_id)).unwrap_or_default()
 }
 
+// Deterministic aggregate of one civil day's ledger slice (events where the
+// ts date equals `day`, UTC — the same day convention as everything else). The
+// daily report renders this to text and hands it to one small phrasing call.
+#[derive(Default)]
+pub struct DayDigest {
+    pub day: String,
+    pub turns: usize,
+    pub created: usize,
+    pub updated: usize,
+    pub pruned: usize,
+    pub dream_events: usize,
+    // gist edge refs ("source → target") — the night's crown output.
+    pub gists: Vec<String>,
+    // Up to 5 most-injected edges: what memory was actually used for.
+    pub top_injected: Vec<String>,
+    // Up to 5 example new edge refs, for concreteness.
+    pub new_edges: Vec<String>,
+}
+
+impl DayDigest {
+    // A quiet day left no trace in the ledger — nothing to report on.
+    pub fn is_quiet(&self) -> bool {
+        self.turns == 0
+            && self.created == 0
+            && self.updated == 0
+            && self.pruned == 0
+            && self.dream_events == 0
+            && self.top_injected.is_empty()
+    }
+}
+
+// Best-effort: any query failure yields an empty (quiet-looking) digest rather
+// than blocking the report path.
+pub fn day_digest(day: &str) -> DayDigest {
+    let conn = match db::open_connection() {
+        Ok(conn) => conn,
+        Err(_) => return DayDigest::default(),
+    };
+    db::block_on(day_digest_async(&conn, day)).unwrap_or_default()
+}
+
+// The id of the most recently registered dream session, if any — the verdict
+// scores the newest dream alongside the day's tg session.
+pub fn newest_dream_session_id() -> Option<String> {
+    let conn = db::open_connection().ok()?;
+    db::block_on(newest_dream_session_id_async(&conn)).unwrap_or_default()
+}
+
+async fn day_digest_async(
+    conn: &Connection,
+    day: &str,
+) -> Result<DayDigest, Box<dyn Error + Send + Sync>> {
+    Ok(DayDigest {
+        day: day.to_string(),
+        turns: count_day_turns(conn, day).await?,
+        created: count_day_event_type(conn, day, "created").await?,
+        updated: count_day_event_type(conn, day, "updated").await?,
+        pruned: count_day_event_type(conn, day, "pruned").await?,
+        dream_events: count_day_dream_events(conn, day).await?,
+        gists: load_day_gists(conn, day).await?,
+        top_injected: load_day_top_injected(conn, day).await?,
+        new_edges: load_day_new_edges(conn, day).await?,
+    })
+}
+
+async fn count_day_turns(
+    conn: &Connection,
+    day: &str,
+) -> Result<usize, Box<dyn Error + Send + Sync>> {
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(DISTINCT turn_id) FROM events WHERE substr(ts, 1, 10) = ?1 AND turn_id != '' AND session_id NOT LIKE 'dream-%'",
+            params![day],
+        )
+        .await?;
+    count_from(&mut rows).await
+}
+
+async fn count_day_event_type(
+    conn: &Connection,
+    day: &str,
+    event_type: &str,
+) -> Result<usize, Box<dyn Error + Send + Sync>> {
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*) FROM events WHERE substr(ts, 1, 10) = ?1 AND event_type = ?2",
+            params![day, event_type],
+        )
+        .await?;
+    count_from(&mut rows).await
+}
+
+async fn count_day_dream_events(
+    conn: &Connection,
+    day: &str,
+) -> Result<usize, Box<dyn Error + Send + Sync>> {
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*) FROM events WHERE substr(ts, 1, 10) = ?1 AND session_id LIKE 'dream-%'",
+            params![day],
+        )
+        .await?;
+    count_from(&mut rows).await
+}
+
+async fn count_from(
+    rows: &mut turso::Rows,
+) -> Result<usize, Box<dyn Error + Send + Sync>> {
+    if let Some(row) = rows.next().await? {
+        return Ok(db::real(row.get_value(0)?) as usize);
+    }
+    Ok(0)
+}
+
+// gist_of provenance lives on the consolidation's 'updated' events; each names
+// the supporting episodes. We surface the gist edge ref itself.
+async fn load_day_gists(
+    conn: &Connection,
+    day: &str,
+) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+    let mut rows = conn
+        .query(
+            "SELECT source, target FROM events WHERE substr(ts, 1, 10) = ?1 AND event_type = 'updated' AND payload LIKE '%gist_of%'",
+            params![day],
+        )
+        .await?;
+    let mut gists = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let source = db::text(row.get_value(0)?);
+        let target = db::text(row.get_value(1)?);
+        if !source.is_empty() && !target.is_empty() {
+            gists.push(format!("{source} → {target}"));
+        }
+    }
+    Ok(gists)
+}
+
+async fn load_day_top_injected(
+    conn: &Connection,
+    day: &str,
+) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+    let mut rows = conn
+        .query(
+            "SELECT source, target, COUNT(*) AS freq FROM events WHERE substr(ts, 1, 10) = ?1 AND event_type = 'injected' AND source != '' AND target != '' GROUP BY source, target ORDER BY freq DESC LIMIT 5",
+            params![day],
+        )
+        .await?;
+    collect_edge_refs(&mut rows).await
+}
+
+async fn load_day_new_edges(
+    conn: &Connection,
+    day: &str,
+) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+    let mut rows = conn
+        .query(
+            "SELECT source, target FROM events WHERE substr(ts, 1, 10) = ?1 AND event_type = 'created' AND source != '' AND target != '' LIMIT 5",
+            params![day],
+        )
+        .await?;
+    collect_edge_refs(&mut rows).await
+}
+
+async fn collect_edge_refs(
+    rows: &mut turso::Rows,
+) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+    let mut refs = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let source = db::text(row.get_value(0)?);
+        let target = db::text(row.get_value(1)?);
+        if !source.is_empty() && !target.is_empty() {
+            refs.push(format!("{source} → {target}"));
+        }
+    }
+    Ok(refs)
+}
+
+async fn newest_dream_session_id_async(
+    conn: &Connection,
+) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+    let mut rows = conn
+        .query(
+            "SELECT id FROM sessions WHERE session_type = 'dream' ORDER BY created_at DESC LIMIT 1",
+            (),
+        )
+        .await?;
+    if let Some(row) = rows.next().await? {
+        let session_id = db::text(row.get_value(0)?);
+        if !session_id.is_empty() {
+            return Ok(Some(session_id));
+        }
+    }
+    Ok(None)
+}
+
 pub fn turn_attribution(turn_id: &str) -> Attribution {
     let conn = match db::open_connection() {
         Ok(conn) => conn,
@@ -1125,5 +1320,117 @@ mod tests {
             db::block_on(edge_date(&conn, "carol", "delhi")),
             "2020-01-01"
         );
+    }
+
+    const SESSIONS_DDL: &str = "CREATE TABLE sessions (id TEXT PRIMARY KEY, session_type TEXT NOT NULL DEFAULT 'conversation', created_at TEXT NOT NULL DEFAULT '')";
+
+    const YESTERDAY: &str = "2026-07-10";
+    const TODAY: &str = "2026-07-11";
+
+    // Bare events+sessions harness for the digest queries.
+    async fn digest_harness() -> Connection {
+        let Ok(database) = Builder::new_local(":memory:").build().await else {
+            unreachable!("in-memory database builds")
+        };
+        let Ok(conn) = database.connect() else {
+            unreachable!("in-memory database connects")
+        };
+        let _ = conn.execute(EVENTS_DDL, ()).await;
+        let _ = conn.execute(SESSIONS_DDL, ()).await;
+        conn
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_event(
+        conn: &Connection,
+        day: &str,
+        session_id: &str,
+        turn_id: &str,
+        event_type: &str,
+        source: &str,
+        target: &str,
+        payload: &str,
+    ) {
+        let timestamp = format!("{day}T04:00:00");
+        let _ = conn
+            .execute(
+                "INSERT INTO events (ts, session_id, turn_id, event_type, source, target, payload) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![timestamp, session_id, turn_id, event_type, source, target, payload],
+            )
+            .await;
+    }
+
+    async fn insert_dream_session(conn: &Connection, session_id: &str, created_at: &str) {
+        let _ = conn
+            .execute(
+                "INSERT INTO sessions (id, session_type, created_at) VALUES (?1, 'dream', ?2)",
+                params![session_id, created_at],
+            )
+            .await;
+    }
+
+    fn digest(conn: &Connection, day: &str) -> super::DayDigest {
+        let Ok(digest) = db::block_on(super::day_digest_async(conn, day)) else {
+            unreachable!("digest query runs")
+        };
+        digest
+    }
+
+    #[test]
+    fn digest_counts_only_yesterdays_slice() {
+        let conn = db::block_on(digest_harness());
+        db::block_on(insert_event(&conn, YESTERDAY, "tg-2026-07-10", "turn-a", "created", "a", "b", ""));
+        db::block_on(insert_event(&conn, YESTERDAY, "tg-2026-07-10", "turn-b", "updated", "c", "d", ""));
+        // Today's events must not leak into yesterday's digest.
+        db::block_on(insert_event(&conn, TODAY, "tg-2026-07-11", "turn-c", "created", "e", "f", ""));
+
+        let digest = digest(&conn, YESTERDAY);
+        assert_eq!(digest.turns, 2);
+        assert_eq!(digest.created, 1);
+        assert_eq!(digest.updated, 1);
+        assert_eq!(digest.new_edges, vec!["a → b".to_string()]);
+    }
+
+    #[test]
+    fn digest_counts_dream_events_and_surfaces_gists() {
+        let conn = db::block_on(digest_harness());
+        db::block_on(insert_event(&conn, YESTERDAY, "dream-100", "", "created", "x", "y", ""));
+        let gist_payload = serde_json::json!({"gist_of": ["g3 → m5"]}).to_string();
+        db::block_on(insert_event(&conn, YESTERDAY, "dream-100", "", "updated", "lesson", "topic", &gist_payload));
+
+        let digest = digest(&conn, YESTERDAY);
+        assert_eq!(digest.dream_events, 2);
+        // Dream events carry no turn_id, so they never count as turns.
+        assert_eq!(digest.turns, 0);
+        assert_eq!(digest.gists, vec!["lesson → topic".to_string()]);
+    }
+
+    #[test]
+    fn digest_ranks_injected_edges_by_frequency() {
+        let conn = db::block_on(digest_harness());
+        for _ in 0..3 {
+            db::block_on(insert_event(&conn, YESTERDAY, "tg-2026-07-10", "turn-a", "injected", "hot", "node", ""));
+        }
+        db::block_on(insert_event(&conn, YESTERDAY, "tg-2026-07-10", "turn-a", "injected", "cold", "node", ""));
+
+        let digest = digest(&conn, YESTERDAY);
+        assert_eq!(digest.top_injected.first(), Some(&"hot → node".to_string()));
+        assert_eq!(digest.top_injected.len(), 2);
+    }
+
+    fn newest_dream(conn: &Connection) -> Option<String> {
+        let Ok(newest) = db::block_on(super::newest_dream_session_id_async(conn)) else {
+            unreachable!("dream session query runs")
+        };
+        newest
+    }
+
+    #[test]
+    fn newest_dream_session_is_the_most_recent() {
+        let conn = db::block_on(digest_harness());
+        assert!(newest_dream(&conn).is_none());
+        db::block_on(insert_dream_session(&conn, "dream-100", "2026-07-10T04:00:00"));
+        db::block_on(insert_dream_session(&conn, "dream-200", "2026-07-11T04:00:00"));
+        assert_eq!(newest_dream(&conn), Some("dream-200".to_string()));
     }
 }
