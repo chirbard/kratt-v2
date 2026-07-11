@@ -142,21 +142,46 @@ pub(crate) fn build_memory_block(
             memory::EventContext::new(session_id, turn_id),
         ));
     }
+    // The current game's move chain: complete and ordered, outside TOP_K. Its
+    // edges get `injected` events too, so attribution and the spacing-effect
+    // clock refresh apply exactly like any other injection.
+    let chain = memory::load_task_chain(session_id);
+    for edge_ref in &chain.refs {
+        events.push(memory::Event::injected(
+            memory::Actor::new("user", "local"),
+            edge_ref.clone(),
+            memory::EventContext::new(session_id, turn_id),
+        ));
+    }
     // Best-effort bookkeeping: a failed ledger write must never abort the turn.
     if let Err(err) = memory::record_events(&events) {
         runlog::log("ledger", &format!("write failed: {err}"));
     }
-    let block = if edges.is_empty() {
-        String::new()
-    } else {
-        memory::edges_to_toon(&edges)
-    };
+    let block = assemble_memory_block(&edges, &chain);
     MemoryBuild {
         block,
         debug_log: routing_debug_line(&selection.routing),
-        injected_edges: edges.len(),
+        injected_edges: edges.len() + chain.refs.len(),
         elapsed_ms: started.elapsed().as_millis(),
     }
+}
+
+// Belief section first (semantic-ranked TOON), then the ordered task chain as
+// its own block. Either half may be empty; an empty chain adds nothing.
+fn assemble_memory_block(edges: &[memory::SemanticEdge], chain: &memory::TaskChain) -> String {
+    let mut block = if edges.is_empty() {
+        String::new()
+    } else {
+        memory::edges_to_toon(edges)
+    };
+    if chain.block.is_empty() {
+        return block;
+    }
+    if !block.is_empty() {
+        block.push_str("\n\n");
+    }
+    block.push_str(&chain.block);
+    block
 }
 
 fn routed_payload(expert: &Option<String>, score: f64) -> String {

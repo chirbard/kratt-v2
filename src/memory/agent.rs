@@ -124,6 +124,13 @@ pub(crate) enum ToolCall {
         stability: f64,
         supported_by: Vec<(String, String)>,
     },
+    // Scribe-only: the model supplies only the move text and whose move it was;
+    // code derives the task hub, ply number, and move-node id (apply_record_move).
+    // Denied on every non-scribe apply path.
+    RecordMove {
+        move_text: String,
+        actor: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,6 +175,7 @@ pub(crate) fn describe_tool_call(call: &ToolCall) -> String {
         ToolCall::ExpireEdge { source, target, .. } => format!("expire_edge {source} → {target}"),
         ToolCall::PromoteEdge { source, target } => format!("promote_edge {source} → {target}"),
         ToolCall::GistEdge { source, target, .. } => format!("gist_edge {source} → {target}"),
+        ToolCall::RecordMove { move_text, actor } => format!("record_move {move_text} ({actor})"),
     }
 }
 
@@ -646,6 +654,7 @@ fn parse_single_tool(obj: &serde_json::Value) -> Option<ToolCall> {
         "expire_edge" => parse_expire_edge(args),
         "promote_edge" => parse_promote_edge(args),
         "gist_edge" => parse_gist_edge(args),
+        "record_move" => parse_record_move(args),
         _ => None,
     }
 }
@@ -851,6 +860,19 @@ fn parse_gist_edge(args: &serde_json::Value) -> Option<ToolCall> {
     })
 }
 
+// The move text is the only required field: without it there is nothing to
+// record. actor defaults to empty and is mapped to a valid seat at apply time.
+fn parse_record_move(args: &serde_json::Value) -> Option<ToolCall> {
+    let move_text = json_str(args, "move");
+    if move_text.is_empty() {
+        return None;
+    }
+    Some(ToolCall::RecordMove {
+        move_text,
+        actor: json_str(args, "actor"),
+    })
+}
+
 // Accepts both "a → b" and "a->b" spellings and normalizes both endpoints.
 fn parse_support_ref(text: &str) -> Option<(String, String)> {
     let (raw_source, raw_target) = split_support_ref(text)?;
@@ -1000,6 +1022,74 @@ pub(crate) fn apply_tool_call<'scope>(
             apply_promote_edge(conn, EdgeRef::new(&source, &target), options.actor.clone(), options.context.clone(), events),
         ToolCall::GistEdge { .. } =>
             Ok("gist_edge denied: gist_edge is a dreaming tool".to_string()),
+        ToolCall::RecordMove { move_text, actor } =>
+            apply_record_move_call(conn, options, events, RecordMoveCall { move_text, actor }),
+    }
+}
+
+struct RecordMoveCall {
+    move_text: String,
+    actor: String,
+}
+
+// record_move is a scribe tool: only the episodic scribe pass may append to a
+// task chain. The heavy pass and dream deny it, mirroring gist_edge's
+// dream-only apply. The phase travels in options.actor.actor_id.
+fn apply_record_move_call<'scope>(
+    conn: &Connection,
+    options: &ApplyToolOptions<'scope>,
+    events: &mut Vec<Event>,
+    call: RecordMoveCall,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    if options.actor.actor_id != "scribe" {
+        return Ok("record_move denied: record_move is a scribe tool".to_string());
+    }
+    let actor = normalize_move_actor(&call.actor);
+    let session_id = options.context.session_id.clone();
+    let hub_id = normalize_id(&format!("task-{session_id}"));
+    db::ensure_task_hub(conn, &hub_id)?;
+    let ply = db::next_ply(conn, &hub_id)?;
+    let move_id = format!("{hub_id}-ply-{ply:03}");
+    let today = crate::prompts::today_iso();
+    apply_upsert_node(
+        conn,
+        move_id.clone(),
+        "move".to_string(),
+        call.move_text.clone(),
+        String::new(),
+    )?;
+    let edge = Edge {
+        source: hub_id,
+        target: move_id,
+        content: format!("ply {ply} ({actor}): {}", call.move_text),
+        stability: 0.3,
+        confidence: 1.0,
+        importance: 1.0,
+        subject: false,
+        date: today,
+        occurred_at: None,
+        expired_at: None,
+        memory_type: "episodic".to_string(),
+        origin_session: session_id,
+    };
+    apply_upsert_edge(conn, edge, options, events)?;
+    Ok(format!("record_move: ply {ply} ({actor}) {}", call.move_text))
+}
+
+// A game turn has exactly two sides: user = the opponent's move, assistant =
+// our own. Anything else is a scribe slip — record it as the opponent's move
+// rather than dropping it, and leave a trace.
+fn normalize_move_actor(raw: &str) -> String {
+    match raw {
+        "assistant" => "assistant".to_string(),
+        "user" => "user".to_string(),
+        other => {
+            runlog::log(
+                "scribe",
+                &format!("record_move: unknown actor '{other}' mapped to user"),
+            );
+            "user".to_string()
+        }
     }
 }
 
@@ -1430,5 +1520,145 @@ mod tests {
         let wrapped = r#"Here are the extracted facts: {"tools":[{"tool":"delete_edge","args":{"source":"a","target":"b"}}]} done."#;
         let calls = parse_tool_calls(wrapped);
         assert_eq!(calls.len(), 1);
+    }
+
+    mod record_move {
+        use super::super::{ApplyToolOptions, ToolCall, apply_tool_call, parse_tool_calls};
+        use crate::memory::db;
+        use crate::memory::ledger::{Actor, Event, EventContext};
+        use turso::Builder;
+
+        const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
+        const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', PRIMARY KEY (source, target))";
+
+        async fn harness() -> turso::Connection {
+            let Ok(database) = Builder::new_local(":memory:").build().await else {
+                unreachable!("in-memory database builds")
+            };
+            let Ok(conn) = database.connect() else {
+                unreachable!("in-memory database connects")
+            };
+            let _ = conn.execute(NODES_DDL, ()).await;
+            let _ = conn.execute(EDGES_DDL, ()).await;
+            conn
+        }
+
+        fn options_for_phase(phase: &'static str) -> ApplyToolOptions<'static> {
+            ApplyToolOptions {
+                actor: Actor::new("system", phase),
+                context: EventContext::new("game-1", "game-1:user:ts"),
+                source_message_id: "game-1:user:ts",
+                event_payload: "",
+                confidence_cap: None,
+                default_memory_type: "episodic",
+            }
+        }
+
+        fn record(move_text: &str, actor: &str) -> ToolCall {
+            ToolCall::RecordMove {
+                move_text: move_text.to_string(),
+                actor: actor.to_string(),
+            }
+        }
+
+        fn apply<'opt>(
+            conn: &turso::Connection,
+            options: &ApplyToolOptions<'opt>,
+            call: ToolCall,
+        ) -> String {
+            let mut events: Vec<Event> = Vec::new();
+            let Ok(description) = apply_tool_call(call, conn, options, &mut events) else {
+                unreachable!("apply succeeds")
+            };
+            description
+        }
+
+        fn chain(conn: &turso::Connection) -> Vec<crate::memory::graph::Edge> {
+            let Ok(chain) = db::load_task_chain(conn, "game-1", 240) else {
+                unreachable!("chain loads")
+            };
+            chain
+        }
+
+        #[test]
+        fn valid_args_parse_and_missing_move_is_rejected() {
+            let calls = parse_tool_calls(
+                r#"{"tool":"record_move","args":{"move":"Nc3","actor":"assistant"}}"#,
+            );
+            assert_eq!(calls.len(), 1);
+            assert!(matches!(calls[0], ToolCall::RecordMove { .. }));
+            assert!(
+                parse_tool_calls(r#"{"tool":"record_move","args":{"actor":"user"}}"#).is_empty()
+            );
+        }
+
+        // Two moves applied as two separate calls: the second call reads the ply
+        // counter back from the DB (simulated restart), so it appends rather than
+        // restarting at 1.
+        fn two_move_chain(conn: &turso::Connection) -> Vec<crate::memory::graph::Edge> {
+            let options = options_for_phase("scribe");
+            let first = apply(conn, &options, record("e4", "assistant"));
+            assert!(first.contains("ply 1"), "{first}");
+            let second = apply(conn, &options, record("e5", "user"));
+            assert!(second.contains("ply 2"), "{second}");
+            chain(conn)
+        }
+
+        fn targets(chain: &[crate::memory::graph::Edge]) -> Vec<String> {
+            let mut ids = Vec::new();
+            for edge in chain {
+                ids.push(edge.target.clone());
+            }
+            ids
+        }
+
+        fn contents(chain: &[crate::memory::graph::Edge]) -> Vec<String> {
+            let mut lines = Vec::new();
+            for edge in chain {
+                lines.push(edge.content.clone());
+            }
+            lines
+        }
+
+        #[test]
+        fn scribe_numbers_plies_in_order_from_the_db() {
+            let conn = db::block_on(harness());
+            let chain = two_move_chain(&conn);
+            assert_eq!(
+                targets(&chain),
+                vec!["task-game-1-ply-001", "task-game-1-ply-002"]
+            );
+        }
+
+        #[test]
+        fn scribe_writes_episodic_edges_with_actor_content() {
+            let conn = db::block_on(harness());
+            let chain = two_move_chain(&conn);
+            assert_eq!(
+                contents(&chain),
+                vec!["ply 1 (assistant): e4", "ply 2 (user): e5"]
+            );
+            assert_eq!(chain[0].memory_type, "episodic");
+            assert_eq!(chain[0].origin_session, "game-1");
+        }
+
+        #[test]
+        fn unknown_actor_maps_to_user_without_panicking() {
+            let conn = db::block_on(harness());
+            let options = options_for_phase("scribe");
+            let description = apply(&conn, &options, record("Qh5", "white"));
+            assert!(description.contains("(user)"), "{description}");
+        }
+
+        #[test]
+        fn heavy_and_dream_paths_deny_the_tool() {
+            let conn = db::block_on(harness());
+            for phase in ["extract", "consolidate", "consolidation"] {
+                let options = options_for_phase(phase);
+                let description = apply(&conn, &options, record("e4", "assistant"));
+                assert!(description.contains("denied"), "{phase}: {description}");
+            }
+            assert!(chain(&conn).is_empty(), "denied calls write nothing");
+        }
     }
 }
