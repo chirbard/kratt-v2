@@ -20,6 +20,15 @@ pub fn today_iso() -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+// The civil day before today, UTC — the daily report digests yesterday's
+// ledger slice. Same epoch computation as today_iso, one day earlier.
+pub fn yesterday_iso() -> String {
+    let seconds_since_epoch = epoch_seconds_now().saturating_sub(86_400);
+    let days_since_epoch = (seconds_since_epoch / 86_400) as i64;
+    let (year, month, day) = civil_from_days(days_since_epoch);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
 // Hour of the current day on the server clock (0-23), derived from the same
 // epoch computation as the rest of the app — the dream window is expressed in
 // these terms.

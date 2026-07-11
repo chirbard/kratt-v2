@@ -23,8 +23,8 @@ pub use embed::{edges_to_toon, run_embed_pass, select_semantic_edges_routed};
 pub use explore::{ExploreEvent, run_exploration_pass};
 pub use ingest::{IngestEvent, run_ingestion_pass};
 pub use ledger::{
-    Actor, Attribution, EdgeRef, Event, EventContext, recompute_positions, record_events,
-    turn_attribution,
+    Actor, Attribution, DayDigest, EdgeRef, Event, EventContext, day_digest,
+    newest_dream_session_id, recompute_positions, record_events, turn_attribution,
 };
 #[allow(unused_imports)]
 pub use reinforce::{record_move_outcome, record_outcome};

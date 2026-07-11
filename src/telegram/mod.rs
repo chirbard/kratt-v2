@@ -1,6 +1,7 @@
 mod bot;
 mod night;
 mod render;
+mod report;
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -71,13 +72,23 @@ pub fn run(
         Arc::clone(&embed),
         search.clone(),
     )?;
+    let mut report = report::ReportCycle::from_env(
+        Arc::clone(&memory_llm),
+        config.allowed_user_id,
+    )?;
     let mut handler = LiveTurnHandler::new(chat_llm, memory_llm, embed, search);
     let shutdown = install_shutdown_flag();
     let banner = "kratt telegram gateway ready — long polling (Ctrl-C to stop)";
     println!("{banner}");
     runlog::log("tg", banner);
     let mut gateway = Gateway::new(config.allowed_user_id);
-    gateway.poll_loop(&transport, &mut handler, &mut night, &shutdown);
+    let mut ctx = PollCtx {
+        transport: &transport,
+        handler: &mut handler,
+        report: &mut report,
+        shutdown: &shutdown,
+    };
+    gateway.poll_loop(&mut ctx, &mut night);
     memory::sync_push_best_effort("telegram exit");
     runlog::log("tg", "gateway stopped");
     Ok(())
@@ -127,6 +138,17 @@ struct Gateway {
     backoff: Duration,
 }
 
+// The per-poll references threaded down the dispatch chain, bundled so the
+// chain stays under the argument cap. The night cycle is not in here: it is
+// used only at the top of the loop, and keeping it out lets the tests drive
+// poll_once without constructing one.
+struct PollCtx<'scope> {
+    transport: &'scope dyn BotTransport,
+    handler: &'scope mut dyn TurnHandler,
+    report: &'scope mut report::ReportCycle,
+    shutdown: &'scope AtomicBool,
+}
+
 impl Gateway {
     fn new(allowed_user_id: i64) -> Self {
         Self {
@@ -136,19 +158,15 @@ impl Gateway {
         }
     }
 
-    fn poll_loop(
-        &mut self,
-        transport: &dyn BotTransport,
-        handler: &mut dyn TurnHandler,
-        night: &mut night::NightCycle,
-        shutdown: &AtomicBool,
-    ) {
-        while !shutdown.load(Ordering::Relaxed) {
-            // The idle path (no updates) is where the night cycle runs: a poll
-            // that returned messages spent this cycle answering them — and
-            // changed state, so the night cycle must re-evaluate next chance.
-            if self.poll_once(transport, handler, shutdown) {
-                night.maybe_run(shutdown);
+    fn poll_loop(&mut self, ctx: &mut PollCtx, night: &mut night::NightCycle) {
+        while !ctx.shutdown.load(Ordering::Relaxed) {
+            // The idle path (no updates) is where the night cycle and the daily
+            // report run: a poll that returned messages spent this cycle
+            // answering them — and changed state, so the night cycle must
+            // re-evaluate next chance.
+            if self.poll_once(ctx) {
+                night.maybe_run(ctx.shutdown);
+                ctx.report.maybe_send(ctx.transport);
             } else {
                 night.mark_dirty();
             }
@@ -157,14 +175,9 @@ impl Gateway {
 
     // Returns true when the poll was idle (no updates delivered) — the signal
     // the night cycle gates on.
-    fn poll_once(
-        &mut self,
-        transport: &dyn BotTransport,
-        handler: &mut dyn TurnHandler,
-        shutdown: &AtomicBool,
-    ) -> bool {
-        match transport.get_updates(self.offset) {
-            Ok(value) => self.handle_batch(transport, handler, &value, shutdown),
+    fn poll_once(&mut self, ctx: &mut PollCtx) -> bool {
+        match ctx.transport.get_updates(self.offset) {
+            Ok(value) => self.handle_batch(ctx, &value),
             Err(err) => {
                 runlog::log("tg", &format!("poll error: {err}"));
                 std::thread::sleep(self.backoff);
@@ -173,35 +186,24 @@ impl Gateway {
         }
     }
 
-    fn handle_batch(
-        &mut self,
-        transport: &dyn BotTransport,
-        handler: &mut dyn TurnHandler,
-        value: &serde_json::Value,
-        shutdown: &AtomicBool,
-    ) -> bool {
+    fn handle_batch(&mut self, ctx: &mut PollCtx, value: &serde_json::Value) -> bool {
         let updates = parse_updates(value);
         let idle = updates.is_empty();
         for raw in updates {
             // Leave the offset untouched on shutdown so an unhandled update is
             // re-delivered when the daemon restarts.
-            if shutdown.load(Ordering::Relaxed) {
+            if ctx.shutdown.load(Ordering::Relaxed) {
                 return idle;
             }
             self.offset = self.offset.max(raw.update_id + 1);
             if let Some(message) = raw.message {
-                self.dispatch(transport, handler, &message);
+                self.dispatch(ctx, &message);
             }
         }
         idle
     }
 
-    fn dispatch(
-        &self,
-        transport: &dyn BotTransport,
-        handler: &mut dyn TurnHandler,
-        message: &Update,
-    ) {
+    fn dispatch(&self, ctx: &mut PollCtx, message: &Update) {
         if message.user_id != self.allowed_user_id {
             runlog::log(
                 "tg",
@@ -213,14 +215,19 @@ impl Gateway {
             "tg",
             &format!("update from {} in chat {}", message.user_id, message.chat_id),
         );
-        let outcome = with_typing_indicator(transport, message.chat_id, || {
-            handler.handle(&message.text)
+        // A bare-number reply to a pending report is a control message, not a
+        // chat turn: score it and stop, skipping the turn and memory pipeline.
+        if ctx.report.try_handle_verdict(ctx.transport, &message.text) {
+            return;
+        }
+        let outcome = with_typing_indicator(ctx.transport, message.chat_id, || {
+            ctx.handler.handle(&message.text)
         });
         match outcome {
-            Ok(answer) => send_answer(transport, message.chat_id, &answer),
+            Ok(answer) => send_answer(ctx.transport, message.chat_id, &answer),
             Err(err) => {
                 runlog::log("tg", &format!("turn failed: {err}"));
-                let _ = transport.send_message(message.chat_id, BROKEN_TURN_REPLY);
+                let _ = ctx.transport.send_message(message.chat_id, BROKEN_TURN_REPLY);
             }
         }
     }
@@ -397,13 +404,56 @@ fn session_path_for_id(session_id: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{DaySession, Gateway, TurnHandler};
+    use super::{DaySession, Gateway, PollCtx, TurnHandler, report};
     use super::bot::BotTransport;
+    use crate::api::{Chunk, LlmClient, TurnOutcome};
     use std::error::Error;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc::Sender;
     use std::time::Duration;
     use serde_json::{Value, json};
+
+    // The gateway poll tests never trigger a report or verdict, so the LLM is
+    // never called — this stub only exists to construct a ReportCycle.
+    struct StubLlm;
+
+    impl LlmClient for StubLlm {
+        fn collect(&self, _prompt: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+            unreachable!("poll tests never call the LLM")
+        }
+        fn stream(&self, _prompt: String, _system: Option<String>, _sender: Sender<Chunk>) {}
+        fn stream_turn(
+            &self,
+            _messages: &[serde_json::Value],
+            _tools: Option<&serde_json::Value>,
+            _sender: &Sender<Chunk>,
+        ) -> Result<TurnOutcome, Box<dyn Error + Send + Sync>> {
+            unreachable!("poll tests never call the LLM")
+        }
+    }
+
+    fn fake_report() -> report::ReportCycle {
+        report::ReportCycle::for_test(Arc::new(StubLlm), 42)
+    }
+
+    // Drives one poll, scoping the PollCtx borrows so the tests can assert on
+    // the handler and transport afterwards.
+    fn poll(
+        gateway: &mut Gateway,
+        transport: &dyn BotTransport,
+        handler: &mut dyn TurnHandler,
+        report: &mut report::ReportCycle,
+        stop: &AtomicBool,
+    ) -> bool {
+        let mut ctx = PollCtx {
+            transport,
+            handler,
+            report,
+            shutdown: stop,
+        };
+        gateway.poll_once(&mut ctx)
+    }
 
     // Replays queued getUpdates results and records everything the gateway
     // tries to send — same fake-client shape as agent.rs's ScriptedClient.
@@ -501,8 +551,9 @@ mod tests {
             reply: "answer".to_string(),
         };
         let stop = AtomicBool::new(false);
+        let mut report = fake_report();
         let mut gateway = fast_gateway(42);
-        gateway.poll_once(&transport, &mut handler, &stop);
+        poll(&mut gateway, &transport, &mut handler, &mut report, &stop);
         assert!(handler.seen.is_empty(), "handler never ran");
         assert_eq!(transport.sent_count(), 0, "nothing sent");
     }
@@ -515,8 +566,9 @@ mod tests {
             reply: "answer".to_string(),
         };
         let stop = AtomicBool::new(false);
+        let mut report = fake_report();
         let mut gateway = fast_gateway(42);
-        gateway.poll_once(&transport, &mut handler, &stop);
+        poll(&mut gateway, &transport, &mut handler, &mut report, &stop);
         assert_eq!(handler.seen, vec!["hi".to_string()]);
         assert_eq!(transport.sent_count(), 1);
     }
@@ -534,8 +586,9 @@ mod tests {
             reply: "answer".to_string(),
         };
         let stop = AtomicBool::new(false);
+        let mut report = fake_report();
         let mut gateway = fast_gateway(42);
-        gateway.poll_once(&transport, &mut handler, &stop);
+        poll(&mut gateway, &transport, &mut handler, &mut report, &stop);
         assert!(handler.seen.is_empty());
         assert_eq!(gateway.offset, 9);
     }
@@ -551,10 +604,11 @@ mod tests {
             reply: "answer".to_string(),
         };
         let stop = AtomicBool::new(false);
+        let mut report = fake_report();
         let mut gateway = fast_gateway(42);
         // First poll errors (and sleeps zero), second delivers the update.
-        gateway.poll_once(&transport, &mut handler, &stop);
-        gateway.poll_once(&transport, &mut handler, &stop);
+        poll(&mut gateway, &transport, &mut handler, &mut report, &stop);
+        poll(&mut gateway, &transport, &mut handler, &mut report, &stop);
         assert_eq!(handler.seen, vec!["after error".to_string()]);
     }
 

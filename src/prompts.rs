@@ -493,6 +493,18 @@ pub fn build_dream_prompt(explanation: &str, toon: &str, context: Option<&str>) 
     prompt
 }
 
+pub const DAILY_REPORT: &str = r#"You are a learning agent writing a short morning note to the person steering your curiosity. Below is a deterministic digest of what you worked with yesterday and consolidated overnight.
+
+Write a first-person report, at most 200 words, plain text (no markdown headers, no lists of raw ids). Cover: what you worked with, what you consolidated overnight, and what you are uncertain about. Ground every sentence in the digest — invent nothing beyond it, and do not flatter. If the digest is thin, say so plainly and keep it short."#;
+
+pub fn build_daily_report_prompt(digest_text: &str) -> String {
+    let mut prompt = String::new();
+    prompt.push_str(DAILY_REPORT);
+    prompt.push_str("\n\n## Yesterday's digest\n\n");
+    prompt.push_str(digest_text);
+    prompt
+}
+
 pub fn build_chat_system_prompt(memory_block: &str, recent_entries: &[RecentEntry]) -> String {
     let mut prompt = String::from(CHAT_SYSTEM_PROMPT);
     prompt.push_str("\nToday's date is ");
