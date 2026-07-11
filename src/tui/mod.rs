@@ -18,6 +18,7 @@ use ratatui::backend::CrosstermBackend;
 
 use crate::api::EmbeddingClient;
 use crate::api::LlmClient;
+use crate::memory::MemorySeats;
 use crate::runlog;
 use crate::web::SearchClient;
 
@@ -27,7 +28,7 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 
 pub fn run(
     chat_llm: Arc<dyn LlmClient>,
-    memory_llm: Arc<dyn LlmClient>,
+    seats: MemorySeats,
     embed: Arc<dyn EmbeddingClient>,
     search: Option<Arc<dyn SearchClient>>,
     session_path: PathBuf,
@@ -38,7 +39,7 @@ pub fn run(
     tui_enter(&mut stdout)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let mut app = App::new(chat_llm, memory_llm, embed, search, session_path);
+    let mut app = App::new(chat_llm, seats, embed, search, session_path);
     let result = run_loop(&mut terminal, &mut app);
     disable_raw_mode()?;
     tui_exit(&mut terminal)?;

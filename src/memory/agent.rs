@@ -22,8 +22,30 @@ pub enum MemoryEvent {
     MaintenanceDone,
 }
 
+// The three model seats the memory pass runs on. classifier picks task-vs-chat;
+// scribe records episodic moves; heavy runs extract/consolidate. They are often
+// clones of the same client — default config wires all three to MEMORY_MODEL.
+#[derive(Clone)]
+pub struct MemorySeats {
+    pub classifier: Arc<dyn LlmClient>,
+    pub scribe: Arc<dyn LlmClient>,
+    pub heavy: Arc<dyn LlmClient>,
+}
+
+impl MemorySeats {
+    // All three seats on one client — the pre-split default.
+    #[cfg(test)]
+    pub fn uniform(llm: Arc<dyn LlmClient>) -> Self {
+        Self {
+            classifier: Arc::clone(&llm),
+            scribe: Arc::clone(&llm),
+            heavy: llm,
+        }
+    }
+}
+
 struct AgentRun<'run> {
-    llm: Arc<dyn LlmClient>,
+    seats: MemorySeats,
     user_msg: &'run str,
     assistant_msg: &'run str,
     sender: &'run std::sync::mpsc::Sender<MemoryEvent>,
@@ -45,6 +67,13 @@ struct PassSpec {
 struct IterationOutcome {
     descriptions: Vec<String>,
     done: bool,
+}
+
+// The client and connection a pass runs against — kept together so the
+// per-iteration signatures stay under the argument cap.
+struct PassCtx<'ctx> {
+    llm: &'ctx Arc<dyn LlmClient>,
+    conn: &'ctx Connection,
 }
 
 pub(crate) enum ToolCall {
@@ -120,6 +149,28 @@ fn classify_turn(llm: &Arc<dyn LlmClient>, user_msg: &str, assistant_msg: &str) 
     }
 }
 
+// Read-only classifier verdict label ("task"/"chat") for a raw model reply —
+// used by the seat-replay harness, which never touches the DB.
+pub(crate) fn classify_reply_label(reply: &str) -> &'static str {
+    parse_turn_mode(reply).label()
+}
+
+// One-line human description of a parsed tool call for eyeball inspection in
+// the replay report.
+pub(crate) fn describe_tool_call(call: &ToolCall) -> String {
+    match call {
+        ToolCall::UpsertNode { name, node_type, .. } => {
+            format!("upsert_node {name} ({node_type})")
+        }
+        ToolCall::UpsertEdge { source, target, .. } => format!("upsert_edge {source} → {target}"),
+        ToolCall::DeleteNode { name } => format!("delete_node {name}"),
+        ToolCall::DeleteEdge { source, target } => format!("delete_edge {source} → {target}"),
+        ToolCall::ExpireEdge { source, target, .. } => format!("expire_edge {source} → {target}"),
+        ToolCall::PromoteEdge { source, target } => format!("promote_edge {source} → {target}"),
+        ToolCall::GistEdge { source, target, .. } => format!("gist_edge {source} → {target}"),
+    }
+}
+
 fn parse_turn_mode(reply: &str) -> TurnMode {
     // Bias toward CHAT (the heavy semantic path): a conversation misclassified
     // as a task would record durable facts as fast-decaying episodic edges —
@@ -133,14 +184,14 @@ fn parse_turn_mode(reply: &str) -> TurnMode {
 }
 
 pub fn run_memory_agent(
-    llm: Arc<dyn LlmClient>,
+    seats: MemorySeats,
     user_msg: &str,
     assistant_msg: &str,
     user_message_id: &str,
     sender: std::sync::mpsc::Sender<MemoryEvent>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let agent_run = AgentRun {
-        llm,
+        seats,
         user_msg,
         assistant_msg,
         sender: &sender,
@@ -154,7 +205,7 @@ pub fn run_memory_agent(
 
 impl<'run> AgentRun<'run> {
     fn run(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let mode = classify_turn(&self.llm, self.user_msg, self.assistant_msg);
+        let mode = classify_turn(&self.seats.classifier, self.user_msg, self.assistant_msg);
         self.send_log("mem", format!("turn classified: {}", mode.label()));
         match mode {
             TurnMode::TaskMove => self.run_scribe(),
@@ -169,7 +220,11 @@ impl<'run> AgentRun<'run> {
         let prompt = build_scribe_prompt(self.user_msg, self.assistant_msg);
         // Single-shot on purpose: the scribe records a handful of moves in a
         // few seconds, and loop latency would sit in the chat critical path.
-        self.run_single_pass(&conn, &scribe_pass(), prompt)?;
+        let ctx = PassCtx {
+            llm: &self.seats.scribe,
+            conn: &conn,
+        };
+        self.run_single_pass(&ctx, &scribe_pass(), prompt)?;
         Ok(())
     }
 
@@ -179,7 +234,7 @@ impl<'run> AgentRun<'run> {
         // Before decay, so beliefs used this turn are not aged in the same pass.
         let injected = self.refresh_injected_clock(&conn)?;
         let graph = self.decayed_graph()?;
-
+        let ctx = PassCtx { llm: &self.seats.heavy, conn: &conn };
         let pre_extract_graph = graph.clone();
         let pre_extract_toon = toon::encode(&graph_to_json(&pre_extract_graph), None);
         let injected_toon = injected_toon(&injected);
@@ -191,7 +246,7 @@ impl<'run> AgentRun<'run> {
             diff_text: None,
             injected_toon: injected_toon.as_deref(),
         });
-        self.run_pass(&conn, &heavy_pass("extract"), extract_prompt)?;
+        self.run_pass(&ctx, &heavy_pass("extract"), extract_prompt)?;
 
         let post_extract_graph = db::load_graph();
         let diff = db::graph_diff_toon(&pre_extract_graph, &post_extract_graph);
@@ -203,7 +258,7 @@ impl<'run> AgentRun<'run> {
             diff_text: if diff.is_empty() { None } else { Some(&diff) },
             injected_toon: None,
         });
-        self.run_pass(&conn, &heavy_pass("consolidate"), consolidate_prompt)?;
+        self.run_pass(&ctx, &heavy_pass("consolidate"), consolidate_prompt)?;
 
         let final_graph = db::load_graph();
         self.send_log(
@@ -246,22 +301,22 @@ impl<'run> AgentRun<'run> {
 
     fn run_pass(
         &self,
-        conn: &Connection,
+        ctx: &PassCtx<'_>,
         pass: &PassSpec,
         prompt: String,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.drive_pass(pass, prompt, |iteration, iteration_prompt| {
-            self.run_iteration(conn, pass, iteration, iteration_prompt)
+            self.run_iteration(ctx, pass, iteration, iteration_prompt)
         })
     }
 
     fn run_single_pass(
         &self,
-        conn: &Connection,
+        ctx: &PassCtx<'_>,
         pass: &PassSpec,
         prompt: String,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        self.run_iteration(conn, pass, 1, prompt)?;
+        self.run_iteration(ctx, pass, 1, prompt)?;
         self.send_log(pass.phase, "done".to_string());
         Ok(())
     }
@@ -300,14 +355,14 @@ impl<'run> AgentRun<'run> {
 
     fn run_iteration(
         &self,
-        conn: &Connection,
+        ctx: &PassCtx<'_>,
         pass: &PassSpec,
         iteration: usize,
         prompt: String,
     ) -> Result<IterationOutcome, Box<dyn Error + Send + Sync>> {
         self.send_log(pass.phase, format!("iteration {iteration}: calling LLM…"));
         let call_text = match stream_collect(
-            Arc::clone(&self.llm),
+            Arc::clone(ctx.llm),
             prompt,
             |text| self.send_append("think", text),
             |text| self.send_append("debug", text),
@@ -325,7 +380,7 @@ impl<'run> AgentRun<'run> {
         );
         // A response may both apply calls and declare the pass finished.
         let done = tool_calls.is_empty() || says_done(&call_text);
-        match apply_tool_calls(self, conn, pass.phase, tool_calls, pass.default_memory_type) {
+        match apply_tool_calls(self, ctx.conn, pass.phase, tool_calls, pass.default_memory_type) {
             Ok(descriptions) => Ok(IterationOutcome { descriptions, done }),
             Err(err) => {
                 self.send_log(pass.phase, format!("error: {err}"));
@@ -1242,7 +1297,7 @@ mod tests {
             std::sync::mpsc::channel();
         let llm = ScriptedClient::scripted(responses);
         let agent_run = AgentRun {
-            llm,
+            seats: super::MemorySeats::uniform(llm),
             user_msg: "user",
             assistant_msg: "assistant",
             sender: &sender,
@@ -1252,7 +1307,7 @@ mod tests {
         let pass = super::heavy_pass("extract");
         let result = agent_run.drive_pass(&pass, "first prompt".to_string(), |_index, prompt| {
             iterations += 1;
-            let call_text = stream_collect(Arc::clone(&agent_run.llm), prompt, drop, drop)?;
+            let call_text = stream_collect(Arc::clone(&agent_run.seats.heavy), prompt, drop, drop)?;
             let tool_calls = parse_tool_calls(&call_text);
             let done = tool_calls.is_empty() || says_done(&call_text);
             let mut descriptions = Vec::new();

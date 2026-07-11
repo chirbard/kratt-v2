@@ -8,8 +8,6 @@ use serde_json::{Value, json};
 
 use super::{Chunk, LlmClient, Stats, ToolCallRequest, TurnOutcome};
 
-const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
-
 #[derive(Deserialize)]
 struct ToolCallFunctionDelta {
     name: Option<String>,
@@ -70,11 +68,19 @@ struct StreamState {
 pub(super) struct OpenRouterClient {
     api_key: String,
     model: String,
+    // Full chat-completions URL — OpenRouter's endpoint by default, or a local
+    // Ollama server's OpenAI-compatible endpoint when the model spec asked for
+    // one. The wire format is identical either way.
+    url: String,
 }
 
 impl OpenRouterClient {
-    pub(super) fn new(api_key: String, model: String) -> Self {
-        Self { api_key, model }
+    pub(super) fn new(api_key: String, model: String, url: String) -> Self {
+        Self {
+            api_key,
+            model,
+            url,
+        }
     }
 }
 
@@ -123,7 +129,7 @@ impl LlmClient for OpenRouterClient {
         tools: Option<&Value>,
         sender: &Sender<Chunk>,
     ) -> Result<TurnOutcome, Box<dyn std::error::Error + Send + Sync>> {
-        let resp = make_request_messages(&self.api_key, &self.model, messages, tools)?;
+        let resp = make_request_messages(&self.api_key, &self.model, &self.url, messages, tools)?;
         stream_response(resp, sender)
     }
 }
@@ -140,6 +146,7 @@ fn build_stream_messages(prompt: String, system: Option<String>) -> Vec<Value> {
 fn make_request_messages(
     api_key: &str,
     model: &str,
+    url: &str,
     messages: &[Value],
     tools: Option<&Value>,
 ) -> Result<reqwest::blocking::Response, String> {
@@ -153,7 +160,7 @@ fn make_request_messages(
         insert_tools(&mut body, tool_defs);
     }
     let resp = match Client::new()
-        .post(OPENROUTER_URL)
+        .post(url)
         .bearer_auth(api_key)
         .json(&body)
         .send()

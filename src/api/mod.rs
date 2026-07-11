@@ -2,7 +2,13 @@ mod client;
 mod embed;
 
 use std::error::Error;
+use std::sync::Arc;
 use std::sync::mpsc::Sender;
+
+const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
+// OpenAI-compatible base of a local Ollama server; `/chat/completions` is
+// appended to reach the endpoint. Override the base with OLLAMA_URL.
+const DEFAULT_OLLAMA_BASE: &str = "http://localhost:11434/v1";
 
 pub struct Stats {
     pub tokens_in: u32,
@@ -50,9 +56,56 @@ pub trait EmbeddingClient: Send + Sync {
 }
 
 pub(crate) fn new_client(api_key: String, model: String) -> impl LlmClient {
-    client::OpenRouterClient::new(api_key, model)
+    client::OpenRouterClient::new(api_key, model, OPENROUTER_URL.to_string())
+}
+
+// Resolves a model spec into the right client. A plain spec
+// ("openai/gpt-oss-20b:nitro") targets OpenRouter; an "ollama:" prefix
+// ("ollama:minicpm5-1b") targets a local Ollama server's OpenAI-compatible
+// endpoint, base URL from OLLAMA_URL or the default localhost port.
+pub(crate) fn resolve_model_client(spec: &str, api_key: &str) -> Arc<dyn LlmClient> {
+    let ollama_base = match std::env::var("OLLAMA_URL") {
+        Ok(base) => base,
+        Err(_) => DEFAULT_OLLAMA_BASE.to_string(),
+    };
+    let (model, url) = resolve_model_spec(spec, &ollama_base);
+    Arc::new(client::OpenRouterClient::new(api_key.to_string(), model, url))
+}
+
+// Pure spec → (model, url) split, no env access, so the routing is unit-testable.
+fn resolve_model_spec(spec: &str, ollama_base: &str) -> (String, String) {
+    if let Some(model) = spec.strip_prefix("ollama:") {
+        return (model.to_string(), format!("{ollama_base}/chat/completions"));
+    }
+    (spec.to_string(), OPENROUTER_URL.to_string())
 }
 
 pub(crate) fn new_embed_client(api_key: String, model: String) -> impl EmbeddingClient {
     embed::OpenRouterEmbedClient::new(api_key, model)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OPENROUTER_URL, resolve_model_spec};
+
+    #[test]
+    fn plain_spec_targets_openrouter() {
+        let (model, url) = resolve_model_spec("openai/gpt-oss-20b:nitro", "http://ignored/v1");
+        assert_eq!(model, "openai/gpt-oss-20b:nitro");
+        assert_eq!(url, OPENROUTER_URL);
+    }
+
+    #[test]
+    fn ollama_prefix_targets_local_endpoint() {
+        let (model, url) = resolve_model_spec("ollama:minicpm5-1b", "http://localhost:11434/v1");
+        assert_eq!(model, "minicpm5-1b");
+        assert_eq!(url, "http://localhost:11434/v1/chat/completions");
+    }
+
+    #[test]
+    fn ollama_base_override_is_respected() {
+        let (model, url) = resolve_model_spec("ollama:gemma-e2b", "http://box:9999/v1");
+        assert_eq!(model, "gemma-e2b");
+        assert_eq!(url, "http://box:9999/v1/chat/completions");
+    }
 }
