@@ -165,7 +165,7 @@ fn run_classifier_replay(
         candidate_ms: 0,
     };
     for (user_msg, assistant_msg) in pairs {
-        let prompt = build_classify_prompt(user_msg, assistant_msg);
+        let prompt = build_classify_prompt(user_msg, assistant_msg, false);
         let (base_reply, base_ms) = timed_collect(baseline, &prompt);
         let (cand_reply, cand_ms) = timed_collect(candidate, &prompt);
         result.baseline_ms += base_ms;

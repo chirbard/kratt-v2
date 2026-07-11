@@ -148,8 +148,13 @@ impl TurnMode {
     }
 }
 
-fn classify_turn(llm: &Arc<dyn LlmClient>, user_msg: &str, assistant_msg: &str) -> TurnMode {
-    let prompt = build_classify_prompt(user_msg, assistant_msg);
+fn classify_turn(
+    llm: &Arc<dyn LlmClient>,
+    user_msg: &str,
+    assistant_msg: &str,
+    active_task: bool,
+) -> TurnMode {
+    let prompt = build_classify_prompt(user_msg, assistant_msg, active_task);
     match llm.collect(&prompt) {
         Ok(reply) => parse_turn_mode(&reply),
         Err(_) => TurnMode::Conversation,
@@ -213,12 +218,31 @@ pub fn run_memory_agent(
 
 impl<'run> AgentRun<'run> {
     fn run(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let mode = classify_turn(&self.seats.classifier, self.user_msg, self.assistant_msg);
+        let active_task = self.session_has_chain();
+        let mode = classify_turn(
+            &self.seats.classifier,
+            self.user_msg,
+            self.assistant_msg,
+            active_task,
+        );
         self.send_log("mem", format!("turn classified: {}", mode.label()));
         match mode {
             TurnMode::TaskMove => self.run_scribe(),
             TurnMode::Conversation => self.run_heavy(),
         }
+    }
+
+    // Does this turn's session already have a live move chain? Best-effort:
+    // any failure reads as "no chain" and classification proceeds unbiased.
+    fn session_has_chain(&self) -> bool {
+        let Some(session_id) = db::source_session_id(self.user_message_id) else {
+            return false;
+        };
+        let Ok(conn) = db::open_connection() else {
+            return false;
+        };
+        let hub_id = normalize_id(&format!("task-{session_id}"));
+        db::count_task_chain(&conn, &hub_id).is_ok_and(|count| count > 0)
     }
 
     fn run_scribe(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
