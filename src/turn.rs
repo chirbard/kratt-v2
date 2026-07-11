@@ -136,21 +136,24 @@ pub(crate) fn build_memory_block(
         routed_payload(&selection.routing.expert, selection.routing.expert_score),
     ));
     for edge in &edges {
-        push_injected(&mut events, session_id, turn_id, &memory::EdgeRef::new(&edge.source, &edge.target));
+        let edge_ref = memory::EdgeRef::new(&edge.source, &edge.target);
+        push_injected(&mut events, (session_id, turn_id), "local", &edge_ref);
     }
     // The current game's move chain: complete and ordered, outside TOP_K. Its
     // edges get `injected` events too, so attribution and the spacing-effect
-    // clock refresh apply exactly like any other injection.
+    // clock refresh apply exactly like any other injection. Actor id "game"
+    // (vs "local" for ranked beliefs) marks them as part of the game's play —
+    // the Phase 23 outcome slice reinforces game-tagged injections only,
+    // otherwise a win would credit all 60 ranked beliefs of every turn.
     let chain = memory::load_task_chain(session_id);
     for edge_ref in &chain.refs {
-        push_injected(&mut events, session_id, turn_id, edge_ref);
+        push_injected(&mut events, (session_id, turn_id), "game", edge_ref);
     }
     // The game's rules and derived strategies: deterministic, outside TOP_K.
-    // Their `injected` events drive the same attribution + spacing refresh — a
-    // strategy used in a win must be attributable.
+    // A strategy used in a win must be attributable — same "game" tag.
     let knowledge = memory::load_game_knowledge(session_id);
     for edge_ref in &knowledge.refs {
-        push_injected(&mut events, session_id, turn_id, edge_ref);
+        push_injected(&mut events, (session_id, turn_id), "game", edge_ref);
     }
     // Best-effort bookkeeping: a failed ledger write must never abort the turn.
     if let Err(err) = memory::record_events(&events) {
@@ -167,12 +170,13 @@ pub(crate) fn build_memory_block(
 
 fn push_injected(
     events: &mut Vec<memory::Event>,
-    session_id: &str,
-    turn_id: &str,
+    context: (&str, &str),
+    actor_id: &str,
     edge_ref: &memory::EdgeRef,
 ) {
+    let (session_id, turn_id) = context;
     events.push(memory::Event::injected(
-        memory::Actor::new("user", "local"),
+        memory::Actor::new("user", actor_id),
         edge_ref.clone(),
         memory::EventContext::new(session_id, turn_id),
     ));

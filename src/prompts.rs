@@ -78,7 +78,7 @@ pub fn build_classify_prompt(user_msg: &str, assistant_msg: &str, active_task: b
 
 pub const SCRIBE_EXPLANATION: &str = r#"You are the episodic scribe: a fast, narrow recorder for one move or step in an ongoing task or game.
 
-- Every move or step made this turn goes through record_move — emit one record_move per move, in the order they occurred. You choose only the move text and whose move it was; the running order and structure are handled for you.
+- Every move or step made this turn goes through record_move — emit one record_move per move, in the order they occurred. A game turn usually contains TWO moves: the user's move AND your own reply move — record both, user's first. You choose only the move text and whose move it was; the running order and structure are handled for you.
 - Copy the move text VERBATIM as it appeared in the exchange — even if it looks illegal, mistaken, or odd. You are a recorder, not a referee; never substitute a move you think was meant.
 - Record the move verbatim in standard notation where one exists (e.g. chess: "Nc3", "e4").
 - Moves must never go through upsert_edge or upsert_node. Use those only for a non-move task fact stated this turn (a rule someone declared, a score announcement).
@@ -168,7 +168,11 @@ expire_edge — mark an edge historical instead of deleting it.
 {"tool":"expire_edge","args":{"source":"string","target":"string","rewritten_content":"string"}}
 
 record_rule — when the conversation states a rule of a game the graph already knows, use this instead of a loose upsert_edge; it anchors the rule to the game-definition node as durable knowledge.
-{"tool":"record_rule","args":{"rule":"the king moves exactly one square in any direction"}}"#;
+{"tool":"record_rule","args":{"rule":"the king moves exactly one square in any direction"}}
+
+record_outcome — when a game genuinely ended this turn (checkmate, resignation, agreed draw), record the result from the assistant's perspective. Never speculatively.
+- result: "win" | "loss" | "draw"
+{"tool":"record_outcome","args":{"result":"win","comment":"opponent resigned"}}"#;
 
 pub const MEMORY_RULES: &str = r#"Node types: entity (person, place, technology, named concept; body and date always empty) or fact (one atomic claim; body is one sentence, no period; date YYYY-MM-DD when event occurred, empty if unknown; use today for current events; resolve relative dates to YYYY-MM-DD).
 
@@ -205,6 +209,10 @@ pub struct AgentPrompt<'scope> {
     // First iteration of a pass only — continuations re-send neither the graph
     // nor this block.
     pub injected_toon: Option<&'scope str>,
+    // Display name of the game this session is playing, when its hub links to
+    // a game node. Deterministic context: the model must not have to notice
+    // the game node in the TOON to route rules and outcomes correctly.
+    pub active_game: Option<&'scope str>,
 }
 
 pub fn build_agent_prompt(input: &AgentPrompt) -> String {
@@ -222,6 +230,13 @@ pub fn build_agent_prompt(input: &AgentPrompt) -> String {
     prompt.push_str("\n\n## Current memory state\n\n");
     prompt.push_str(input.toon);
     push_injected_section(&mut prompt, input.injected_toon);
+    if let Some(game) = input.active_game {
+        prompt.push_str("\n\n## Active game\n\nThis session is playing: ");
+        prompt.push_str(game);
+        prompt.push_str(
+            ". Rules stated in the exchange go through record_rule. If the game ended this turn (checkmate, resignation, agreed draw), emit record_outcome with the result from the assistant's perspective.",
+        );
+    }
     if let Some(diff) = input.diff_text {
         prompt.push_str("\n\n## What extract added\n\n");
         prompt.push_str(diff);
@@ -644,6 +659,7 @@ mod tests {
             assistant_msg: "assistant",
             diff_text: None,
             injected_toon,
+            active_game: None,
         })
     }
 
