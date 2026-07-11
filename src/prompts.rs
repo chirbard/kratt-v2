@@ -61,7 +61,7 @@ When unsure, answer CHAT."#;
 // verbose prose must still reach the scribe — a misrouted move is a hole in
 // the chain. The bias is prompt-level: the model still decides, so post-game
 // chat in the same session is not forced into the episodic path.
-const ACTIVE_TASK_HINT: &str = "\n\nThis session has an ongoing task with moves already recorded. If this turn contains a move or continues that task — even wrapped in discussion — answer TASK.";
+const ACTIVE_TASK_HINT: &str = "\n\nThis session has an ongoing task with moves already recorded. If this turn contains a new move — even wrapped in discussion — answer TASK. Discussion ABOUT the task with no new move in it (rules, legality, corrections, questions) is knowledge, not a move: answer CHAT.";
 
 pub fn build_classify_prompt(user_msg: &str, assistant_msg: &str, active_task: bool) -> String {
     let mut prompt = String::new();
