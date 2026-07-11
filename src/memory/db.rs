@@ -864,7 +864,10 @@ pub fn load_session_outcome(
     runtime().block_on(async {
         let mut rows = conn
             .query(
-                "SELECT weight, payload FROM events WHERE session_id = ?1 AND event_type = 'outcome' ORDER BY id DESC LIMIT 1",
+                // lower(): the session id arrives via the task hub id, which
+                // normalize_id lowercased — the events table has the original
+                // casing ("...T12-58-17" vs hub-derived "...t12-58-17").
+                "SELECT weight, payload FROM events WHERE lower(session_id) = lower(?1) AND event_type = 'outcome' ORDER BY id DESC LIMIT 1",
                 params![session_id],
             )
             .await?;
