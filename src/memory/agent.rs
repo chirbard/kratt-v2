@@ -131,6 +131,23 @@ pub(crate) enum ToolCall {
         move_text: String,
         actor: String,
     },
+    // Scribe-only: define (once) the game/task being set up. Upserts the durable
+    // game-definition node and links this session's hub to it.
+    DefineTask {
+        name: String,
+        description: String,
+    },
+    // Scribe or heavy: anchor a stated rule of the current game as durable
+    // knowledge on the game-definition node. Dream denies it.
+    RecordRule {
+        rule: String,
+    },
+    // Scribe-only: the game ended — score the session from the assistant's
+    // perspective (win/loss/draw). Denied on every non-scribe apply path.
+    RecordOutcome {
+        result: String,
+        comment: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +198,9 @@ pub(crate) fn describe_tool_call(call: &ToolCall) -> String {
         ToolCall::PromoteEdge { source, target } => format!("promote_edge {source} → {target}"),
         ToolCall::GistEdge { source, target, .. } => format!("gist_edge {source} → {target}"),
         ToolCall::RecordMove { move_text, actor } => format!("record_move {move_text} ({actor})"),
+        ToolCall::DefineTask { name, .. } => format!("define_task {name}"),
+        ToolCall::RecordRule { rule } => format!("record_rule {rule}"),
+        ToolCall::RecordOutcome { result, .. } => format!("record_outcome {result}"),
     }
 }
 
@@ -679,6 +699,9 @@ fn parse_single_tool(obj: &serde_json::Value) -> Option<ToolCall> {
         "promote_edge" => parse_promote_edge(args),
         "gist_edge" => parse_gist_edge(args),
         "record_move" => parse_record_move(args),
+        "define_task" => parse_define_task(args),
+        "record_rule" => parse_record_rule(args),
+        "record_outcome" => parse_record_outcome(args),
         _ => None,
     }
 }
@@ -897,6 +920,40 @@ fn parse_record_move(args: &serde_json::Value) -> Option<ToolCall> {
     })
 }
 
+// The game name is required — without it there is no node to define. The
+// description (rules + presentation instructions) may be empty on a re-mention.
+fn parse_define_task(args: &serde_json::Value) -> Option<ToolCall> {
+    let name = json_str(args, "name");
+    if name.is_empty() {
+        return None;
+    }
+    Some(ToolCall::DefineTask {
+        name,
+        description: json_str(args, "description"),
+    })
+}
+
+fn parse_record_rule(args: &serde_json::Value) -> Option<ToolCall> {
+    let rule = json_str(args, "rule");
+    if rule.is_empty() {
+        return None;
+    }
+    Some(ToolCall::RecordRule { rule })
+}
+
+// result must be one of the three discrete verdicts — an unrecognized value is
+// a malformed call, not a partial score, so the whole call is rejected.
+fn parse_record_outcome(args: &serde_json::Value) -> Option<ToolCall> {
+    let result = json_str(args, "result");
+    if !matches!(result.as_str(), "win" | "loss" | "draw") {
+        return None;
+    }
+    Some(ToolCall::RecordOutcome {
+        result,
+        comment: json_str(args, "comment"),
+    })
+}
+
 // Accepts both "a → b" and "a->b" spellings and normalizes both endpoints.
 fn parse_support_ref(text: &str) -> Option<(String, String)> {
     let (raw_source, raw_target) = split_support_ref(text)?;
@@ -1048,6 +1105,12 @@ pub(crate) fn apply_tool_call<'scope>(
             Ok("gist_edge denied: gist_edge is a dreaming tool".to_string()),
         ToolCall::RecordMove { move_text, actor } =>
             apply_record_move_call(conn, options, events, RecordMoveCall { move_text, actor }),
+        ToolCall::DefineTask { name, description } =>
+            apply_define_task_call(conn, options, events, DefineTaskCall { name, description }),
+        ToolCall::RecordRule { rule } =>
+            apply_record_rule_call(conn, options, events, rule),
+        ToolCall::RecordOutcome { result, comment } =>
+            apply_record_outcome_call(conn, options, RecordOutcomeCall { result, comment }),
     }
 }
 
@@ -1114,6 +1177,151 @@ fn normalize_move_actor(raw: &str) -> String {
             );
             "user".to_string()
         }
+    }
+}
+
+struct DefineTaskCall {
+    name: String,
+    description: String,
+}
+
+// define_task is a scribe tool: setup turns are task turns. It upserts the
+// durable game-definition node (shared across games) and links this session's
+// hub to it with a per-session episodic edge. Re-defining keeps the longer
+// body so a terse re-mention never loses detail.
+fn apply_define_task_call<'scope>(
+    conn: &Connection,
+    options: &ApplyToolOptions<'scope>,
+    events: &mut Vec<Event>,
+    call: DefineTaskCall,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    if options.actor.actor_id != "scribe" {
+        return Ok("define_task denied: define_task is a scribe tool".to_string());
+    }
+    let game_id = normalize_id(&format!("game-{}", call.name));
+    let name = super::task_chain::game_display_name(&game_id);
+    let existing = db::load_node(conn, &game_id)?;
+    let body = longer_body(existing.as_ref(), &call.description);
+    apply_upsert_node(
+        conn,
+        game_id.clone(),
+        "game".to_string(),
+        body,
+        crate::prompts::today_iso(),
+    )?;
+    let session_id = options.context.session_id.clone();
+    let hub_id = normalize_id(&format!("task-{session_id}"));
+    db::ensure_task_hub(conn, &hub_id)?;
+    let edge = Edge {
+        source: hub_id,
+        target: game_id,
+        content: format!("this session plays {name}"),
+        stability: 0.3,
+        confidence: 1.0,
+        importance: 1.0,
+        subject: false,
+        date: crate::prompts::today_iso(),
+        occurred_at: None,
+        expired_at: None,
+        memory_type: "episodic".to_string(),
+        origin_session: session_id,
+    };
+    apply_upsert_edge(conn, edge, options, events)?;
+    Ok(format!("define_task: {name}"))
+}
+
+// Keep the longer of the stored and incoming descriptions — cheap idempotence
+// so a repeated terse mention never overwrites a rich definition.
+fn longer_body(existing: Option<&Node>, description: &str) -> String {
+    match existing {
+        Some(node) if node.body.chars().count() >= description.chars().count() => node.body.clone(),
+        _ => description.to_string(),
+    }
+}
+
+// record_rule is scribe-or-heavy: a rules turn classifies as chat by design, so
+// extract must be able to anchor rules too. Writes a durable (0.9/0.9) semantic
+// fact anchored to the game node. No game defined yet → deny.
+fn apply_record_rule_call<'scope>(
+    conn: &Connection,
+    options: &ApplyToolOptions<'scope>,
+    events: &mut Vec<Event>,
+    rule: String,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    if !rule_seat_allowed(&options.actor.actor_id) {
+        return Ok("record_rule denied: record_rule is a scribe or heavy tool".to_string());
+    }
+    let session_id = options.context.session_id.clone();
+    let hub_id = normalize_id(&format!("task-{session_id}"));
+    let Some((game_id, _)) = db::load_session_game(conn, &hub_id)? else {
+        return Ok("record_rule denied: define_task first".to_string());
+    };
+    let rule_id = normalize_id(&rule);
+    apply_upsert_node(conn, rule_id.clone(), "fact".to_string(), rule.clone(), String::new())?;
+    let edge = Edge {
+        source: game_id,
+        target: rule_id,
+        content: rule.clone(),
+        stability: 0.9,
+        confidence: 0.9,
+        importance: 1.0,
+        subject: false,
+        date: crate::prompts::today_iso(),
+        occurred_at: None,
+        expired_at: None,
+        memory_type: "semantic".to_string(),
+        origin_session: String::new(),
+    };
+    apply_upsert_edge(conn, edge, options, events)?;
+    Ok(format!("record_rule: {rule}"))
+}
+
+// scribe records moves and rules; the heavy pass (extract/consolidate) may
+// anchor rules stated in chat. Ingest and dream may not.
+fn rule_seat_allowed(actor_id: &str) -> bool {
+    matches!(actor_id, "scribe" | "extract" | "consolidate")
+}
+
+struct RecordOutcomeCall {
+    result: String,
+    comment: String,
+}
+
+// record_outcome is a scribe tool: the game ended this turn. Scores the session
+// from the assistant's perspective and runs reinforcement inside the scribe
+// pass's open transaction (see record_outcome_in_tx for why not the public path).
+fn apply_record_outcome_call<'scope>(
+    conn: &Connection,
+    options: &ApplyToolOptions<'scope>,
+    call: RecordOutcomeCall,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    if options.actor.actor_id != "scribe" {
+        return Ok("record_outcome denied: record_outcome is a scribe tool".to_string());
+    }
+    let session_id = options.context.session_id.clone();
+    let hub_id = normalize_id(&format!("task-{session_id}"));
+    let game = match db::load_session_game(conn, &hub_id)? {
+        Some((game_id, _)) => super::task_chain::game_display_name(&game_id),
+        None => String::new(),
+    };
+    let score = outcome_score(&call.result);
+    let payload = serde_json::json!({
+        "kind": "game",
+        "game": game,
+        "comment": call.comment,
+    })
+    .to_string();
+    let summary = super::reinforce::record_outcome_in_tx(conn, &session_id, score, &payload)?;
+    runlog::log("scribe", &summary);
+    Ok(format!("record_outcome: {} ({game})", call.result))
+}
+
+// From the assistant's (learner's) perspective: win +1, draw 0, loss -1.
+fn outcome_score(result: &str) -> f64 {
+    match result {
+        "win" => 1.0,
+        "loss" => -1.0,
+        _ => 0.0,
     }
 }
 
@@ -1683,6 +1891,184 @@ mod tests {
                 assert!(description.contains("denied"), "{phase}: {description}");
             }
             assert!(chain(&conn).is_empty(), "denied calls write nothing");
+        }
+    }
+
+    mod game {
+        use super::super::{ApplyToolOptions, ToolCall, apply_tool_call, parse_tool_calls};
+        use crate::memory::db;
+        use crate::memory::ledger::{Actor, Event, EventContext};
+        use turso::Builder;
+
+        const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
+        const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', PRIMARY KEY (source, target))";
+        const EVENTS_DDL: &str = "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL, actor_id TEXT NOT NULL, event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')";
+
+        async fn harness() -> turso::Connection {
+            let Ok(database) = Builder::new_local(":memory:").build().await else {
+                unreachable!("in-memory database builds")
+            };
+            let Ok(conn) = database.connect() else {
+                unreachable!("in-memory database connects")
+            };
+            let _ = conn.execute(NODES_DDL, ()).await;
+            let _ = conn.execute(EDGES_DDL, ()).await;
+            let _ = conn.execute(EVENTS_DDL, ()).await;
+            conn
+        }
+
+        fn options_for_phase(phase: &'static str) -> ApplyToolOptions<'static> {
+            ApplyToolOptions {
+                actor: Actor::new("system", phase),
+                context: EventContext::new("game-1", "game-1:user:ts"),
+                source_message_id: "game-1:user:ts",
+                event_payload: "",
+                confidence_cap: None,
+                default_memory_type: "episodic",
+            }
+        }
+
+        fn apply<'opt>(
+            conn: &turso::Connection,
+            options: &ApplyToolOptions<'opt>,
+            call: ToolCall,
+        ) -> String {
+            let mut events: Vec<Event> = Vec::new();
+            let Ok(description) = apply_tool_call(call, conn, options, &mut events) else {
+                unreachable!("apply succeeds")
+            };
+            description
+        }
+
+        fn define(name: &str, description: &str) -> ToolCall {
+            ToolCall::DefineTask {
+                name: name.to_string(),
+                description: description.to_string(),
+            }
+        }
+
+        fn edge(conn: &turso::Connection, source: &str, target: &str) -> crate::memory::graph::Edge {
+            let Ok(Some(edge)) = db::load_edge(conn, source, target) else {
+                unreachable!("edge {source} → {target} exists")
+            };
+            edge
+        }
+
+        #[test]
+        fn define_task_creates_game_node_and_session_hub_link() {
+            let conn = db::block_on(harness());
+            let options = options_for_phase("scribe");
+            let description = apply(&conn, &options, define("Chess", "user White, replies move only"));
+            assert!(description.contains("chess"), "{description}");
+            let Ok(Some(node)) = db::load_node(&conn, "game-chess") else {
+                unreachable!("game node exists")
+            };
+            assert_eq!(node.node_type, "game");
+            assert_eq!(node.body, "user White, replies move only");
+            let link = edge(&conn, "task-game-1", "game-chess");
+            assert_eq!(link.content, "this session plays chess");
+            assert_eq!(link.memory_type, "episodic");
+            assert_eq!(link.origin_session, "game-1");
+        }
+
+        #[test]
+        fn redefining_with_a_shorter_description_keeps_the_longer_body() {
+            let conn = db::block_on(harness());
+            let options = options_for_phase("scribe");
+            apply(&conn, &options, define("chess", "the long, detailed rules of the game"));
+            apply(&conn, &options, define("chess", "chess"));
+            let Ok(Some(node)) = db::load_node(&conn, "game-chess") else {
+                unreachable!("game node exists")
+            };
+            assert_eq!(node.body, "the long, detailed rules of the game");
+        }
+
+        #[test]
+        fn define_task_is_scribe_only() {
+            let conn = db::block_on(harness());
+            for phase in ["extract", "consolidate", "consolidation"] {
+                let options = options_for_phase(phase);
+                let description = apply(&conn, &options, define("chess", "rules"));
+                assert!(description.contains("denied"), "{phase}: {description}");
+            }
+            let Ok(missing) = db::load_node(&conn, "game-chess") else {
+                unreachable!("load_node succeeds")
+            };
+            assert!(missing.is_none());
+        }
+
+        fn rule(text: &str) -> ToolCall {
+            ToolCall::RecordRule {
+                rule: text.to_string(),
+            }
+        }
+
+        #[test]
+        fn record_rule_writes_a_durable_semantic_fact_anchored_to_the_game() {
+            let conn = db::block_on(harness());
+            let options = options_for_phase("scribe");
+            apply(&conn, &options, define("chess", "rules"));
+            let description = apply(&conn, &options, rule("the king moves one square"));
+            assert!(description.contains("record_rule"), "{description}");
+            let rule_edge = edge(&conn, "game-chess", "the-king-moves-one-square");
+            assert!((rule_edge.confidence - 0.9).abs() < 1e-9);
+            assert!((rule_edge.stability - 0.9).abs() < 1e-9);
+            assert_eq!(rule_edge.memory_type, "semantic");
+        }
+
+        #[test]
+        fn record_rule_is_denied_without_a_defined_game() {
+            let conn = db::block_on(harness());
+            let options = options_for_phase("scribe");
+            let description = apply(&conn, &options, rule("some rule"));
+            assert!(description.contains("define_task first"), "{description}");
+        }
+
+        #[test]
+        fn record_rule_is_allowed_from_scribe_and_heavy_but_denied_from_dream() {
+            let conn = db::block_on(harness());
+            apply(&conn, &options_for_phase("scribe"), define("chess", "rules"));
+            for phase in ["scribe", "extract", "consolidate"] {
+                let description = apply(&conn, &options_for_phase(phase), rule("shared rule"));
+                assert!(description.contains("record_rule"), "{phase}: {description}");
+            }
+            let denied = apply(&conn, &options_for_phase("consolidation"), rule("shared rule"));
+            assert!(denied.contains("denied"), "{denied}");
+        }
+
+        fn outcome(result: &str) -> ToolCall {
+            ToolCall::RecordOutcome {
+                result: result.to_string(),
+                comment: "the game ended".to_string(),
+            }
+        }
+
+        #[test]
+        fn record_outcome_records_the_game_result_and_is_scribe_only() {
+            let conn = db::block_on(harness());
+            apply(&conn, &options_for_phase("scribe"), define("chess", "rules"));
+            let description = apply(&conn, &options_for_phase("scribe"), outcome("loss"));
+            assert!(description.contains("loss") && description.contains("chess"), "{description}");
+            let denied = apply(&conn, &options_for_phase("extract"), outcome("win"));
+            assert!(denied.contains("denied"), "{denied}");
+        }
+
+        #[test]
+        fn invalid_outcome_result_is_parse_rejected() {
+            assert!(
+                parse_tool_calls(r#"{"tool":"record_outcome","args":{"result":"forfeit"}}"#)
+                    .is_empty()
+            );
+            let calls = parse_tool_calls(r#"{"tool":"record_outcome","args":{"result":"draw"}}"#);
+            assert_eq!(calls.len(), 1);
+            assert!(matches!(calls[0], ToolCall::RecordOutcome { .. }));
+        }
+
+        #[test]
+        fn outcome_score_maps_the_three_verdicts() {
+            assert!((super::super::outcome_score("win") - 1.0).abs() < 1e-9);
+            assert!((super::super::outcome_score("draw")).abs() < 1e-9);
+            assert!((super::super::outcome_score("loss") + 1.0).abs() < 1e-9);
         }
     }
 }

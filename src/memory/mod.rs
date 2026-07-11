@@ -31,4 +31,4 @@ pub use ledger::{
 #[allow(unused_imports)]
 pub use reinforce::{record_move_outcome, record_outcome};
 pub use routing::Routing;
-pub use task_chain::{TaskChain, load_task_chain};
+pub use task_chain::{GameKnowledge, TaskChain, load_game_knowledge, load_task_chain};

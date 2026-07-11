@@ -462,6 +462,18 @@ fn apply_dream_call<'scope, 'policy>(
             "record_move denied: record_move is a scribe tool".to_string(),
             false,
         )),
+        ToolCall::DefineTask { .. } => Ok((
+            "define_task denied: define_task is a scribe tool".to_string(),
+            false,
+        )),
+        ToolCall::RecordRule { .. } => Ok((
+            "record_rule denied: record_rule is not a dreaming tool".to_string(),
+            false,
+        )),
+        ToolCall::RecordOutcome { .. } => Ok((
+            "record_outcome denied: record_outcome is a scribe tool".to_string(),
+            false,
+        )),
     }
 }
 

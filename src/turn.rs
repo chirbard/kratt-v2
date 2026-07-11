@@ -136,52 +136,73 @@ pub(crate) fn build_memory_block(
         routed_payload(&selection.routing.expert, selection.routing.expert_score),
     ));
     for edge in &edges {
-        events.push(memory::Event::injected(
-            memory::Actor::new("user", "local"),
-            memory::EdgeRef::new(&edge.source, &edge.target),
-            memory::EventContext::new(session_id, turn_id),
-        ));
+        push_injected(&mut events, session_id, turn_id, &memory::EdgeRef::new(&edge.source, &edge.target));
     }
     // The current game's move chain: complete and ordered, outside TOP_K. Its
     // edges get `injected` events too, so attribution and the spacing-effect
     // clock refresh apply exactly like any other injection.
     let chain = memory::load_task_chain(session_id);
     for edge_ref in &chain.refs {
-        events.push(memory::Event::injected(
-            memory::Actor::new("user", "local"),
-            edge_ref.clone(),
-            memory::EventContext::new(session_id, turn_id),
-        ));
+        push_injected(&mut events, session_id, turn_id, edge_ref);
+    }
+    // The game's rules and derived strategies: deterministic, outside TOP_K.
+    // Their `injected` events drive the same attribution + spacing refresh — a
+    // strategy used in a win must be attributable.
+    let knowledge = memory::load_game_knowledge(session_id);
+    for edge_ref in &knowledge.refs {
+        push_injected(&mut events, session_id, turn_id, edge_ref);
     }
     // Best-effort bookkeeping: a failed ledger write must never abort the turn.
     if let Err(err) = memory::record_events(&events) {
         runlog::log("ledger", &format!("write failed: {err}"));
     }
-    let block = assemble_memory_block(&edges, &chain);
+    let block = assemble_memory_block(&edges, &knowledge, &chain);
     MemoryBuild {
         block,
         debug_log: routing_debug_line(&selection.routing),
-        injected_edges: edges.len() + chain.refs.len(),
+        injected_edges: edges.len() + chain.refs.len() + knowledge.refs.len(),
         elapsed_ms: started.elapsed().as_millis(),
     }
 }
 
-// Belief section first (semantic-ranked TOON), then the ordered task chain as
-// its own block. Either half may be empty; an empty chain adds nothing.
-fn assemble_memory_block(edges: &[memory::SemanticEdge], chain: &memory::TaskChain) -> String {
+fn push_injected(
+    events: &mut Vec<memory::Event>,
+    session_id: &str,
+    turn_id: &str,
+    edge_ref: &memory::EdgeRef,
+) {
+    events.push(memory::Event::injected(
+        memory::Actor::new("user", "local"),
+        edge_ref.clone(),
+        memory::EventContext::new(session_id, turn_id),
+    ));
+}
+
+// Belief section first (semantic-ranked TOON), then the game block (rules +
+// strategies), then the ordered task chain. Any section may be empty.
+fn assemble_memory_block(
+    edges: &[memory::SemanticEdge],
+    knowledge: &memory::GameKnowledge,
+    chain: &memory::TaskChain,
+) -> String {
     let mut block = if edges.is_empty() {
         String::new()
     } else {
         memory::edges_to_toon(edges)
     };
-    if chain.block.is_empty() {
-        return block;
+    append_section(&mut block, &knowledge.block);
+    append_section(&mut block, &chain.block);
+    block
+}
+
+fn append_section(block: &mut String, section: &str) {
+    if section.is_empty() {
+        return;
     }
     if !block.is_empty() {
         block.push_str("\n\n");
     }
-    block.push_str(&chain.block);
-    block
+    block.push_str(section);
 }
 
 fn routed_payload(expert: &Option<String>, score: f64) -> String {
@@ -490,4 +511,43 @@ fn parse_string_field(root: &Value, key: &str) -> Option<String> {
     let value = root.get(key)?;
     let text = value.as_str()?;
     Some(text.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::assemble_memory_block;
+    use crate::memory::{GameKnowledge, TaskChain};
+
+    fn knowledge(block: &str) -> GameKnowledge {
+        GameKnowledge {
+            block: block.to_string(),
+            refs: Vec::new(),
+        }
+    }
+
+    fn chain(block: &str) -> TaskChain {
+        TaskChain {
+            block: block.to_string(),
+            refs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn game_block_and_chain_block_coexist_when_both_present() {
+        let block = assemble_memory_block(
+            &[],
+            &knowledge("## Game: chess\nthe rules\n"),
+            &chain("## Current task (in order)\nply 1 (assistant): e4\n"),
+        );
+        assert_eq!(
+            block,
+            "## Game: chess\nthe rules\n\n\n## Current task (in order)\nply 1 (assistant): e4\n"
+        );
+    }
+
+    #[test]
+    fn no_game_link_adds_no_game_block() {
+        let block = assemble_memory_block(&[], &knowledge(""), &chain("## Current task (in order)\n"));
+        assert_eq!(block, "## Current task (in order)\n");
+    }
 }

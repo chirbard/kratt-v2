@@ -83,6 +83,9 @@ pub const SCRIBE_EXPLANATION: &str = r#"You are the episodic scribe: a fast, nar
 - Record the move verbatim in standard notation where one exists (e.g. chess: "Nc3", "e4").
 - Moves must never go through upsert_edge or upsert_node. Use those only for a non-move task fact stated this turn (a rule someone declared, a score announcement).
 - Do not summarize strategy, draw lessons, or restructure existing memory — that is dreaming's job later, not yours.
+- On a setup turn ("we're going to play X, here are the arrangements"), emit define_task FIRST — put the rules of play AND any presentation instructions ("reply with the move only") into its description — then record_move for any opening move played in the same turn.
+- When the exchange states or corrects a rule of the game, use record_rule (not upsert_edge).
+- When the game genuinely ended this turn (checkmate, resignation, or an agreed draw stated in the exchange), emit record_outcome with the result from your own (assistant) perspective. Never speculatively — no outcome while play continues.
 - You were not given the graph; do not reference or assume other memory.
 - Every upsert_edge call must set memory_type="episodic" — this is lived experience scoped to this session, not durable knowledge.
 - No respond call; always set date=today on every upsert_edge."#;
@@ -93,6 +96,19 @@ record_move — record ONE move or step made this turn (the primary tool). Emit 
 - move: the move text copied verbatim from the exchange, even if it looks illegal or mistaken ("Nc3", "e4")
 - actor: "assistant" for your own move, "user" for the opponent's move
 {"tool":"record_move","args":{"move":"Nc3","actor":"assistant"}}
+
+define_task — define the game/task being set up (once, on the setup turn). Structure is derived for you; you supply only:
+- name: the game/task name ("chess")
+- description: the rules of play AND any presentation instructions ("replies should be the move only")
+{"tool":"define_task","args":{"name":"chess","description":"two-player board game, standard rules; user plays White, assistant Black; replies should be the move only"}}
+
+record_rule — record ONE stated rule of the current game as durable knowledge (define_task must have run first).
+{"tool":"record_rule","args":{"rule":"the king moves exactly one square in any direction"}}
+
+record_outcome — record the game's end result, from your (the assistant's) perspective. Only when the game genuinely ended this turn.
+- result: "win" | "loss" | "draw"
+- comment: brief reason (optional)
+{"tool":"record_outcome","args":{"result":"loss","comment":"resigned after losing the queen"}}
 
 upsert_node — create or update a node (non-move task facts only).
 - type "entity": body="" date="" always
@@ -149,7 +165,10 @@ delete_edge — remove a directed edge.
 
 expire_edge — mark an edge historical instead of deleting it.
 - Use expiry for superseded-but-true-then beliefs; use delete only for absorbed scaffolding.
-{"tool":"expire_edge","args":{"source":"string","target":"string","rewritten_content":"string"}}"#;
+{"tool":"expire_edge","args":{"source":"string","target":"string","rewritten_content":"string"}}
+
+record_rule — when the conversation states a rule of a game the graph already knows, use this instead of a loose upsert_edge; it anchors the rule to the game-definition node as durable knowledge.
+{"tool":"record_rule","args":{"rule":"the king moves exactly one square in any direction"}}"#;
 
 pub const MEMORY_RULES: &str = r#"Node types: entity (person, place, technology, named concept; body and date always empty) or fact (one atomic claim; body is one sentence, no period; date YYYY-MM-DD when event occurred, empty if unknown; use today for current events; resolve relative dates to YYYY-MM-DD).
 
@@ -355,6 +374,7 @@ Rules:
 - Synthesis proposals identify higher-order facts. When you accept a synthesis proposal, forward its upsert_node AND its upsert_edge calls together — a synthesis edge without its node is invalid. Never create edges pointing at nodes that do not exist and are not being created in this same response. Keep synthesis nodes as type="synthesis" and preserve their support-based confidence.
 - Prefer expire_edge when a belief was once true but is now superseded. Use delete_edge only for absorbed scaffolding; keep deletions conservative.
 - gist_edge is the default episodic→semantic path. The graph may contain episodic edges (lived experience from an exploration or task session). When several of them — same task hub, same session, or the same recurring pattern — point at one regularity, write that regularity as a NEW semantic edge and cite the episodes in supported_by. Phrase content as the *lesson* ("across three games, early queen sorties were punished by tempo loss"), never as any single episode. Requires at least two supporting episodic edges; each ref is written "source → target". {"tool":"gist_edge","args":{"source":"string","target":"string","content":"string","confidence":0.6,"supported_by":["game3-hub → move-qh5","game4-hub → move-qf3"]}}
+- Strategy from play: when the graph holds a game-definition node (node_type="game") with played move chains linked to it, derive or refine transferable strategy beliefs anchored to that game node. Use gist_edge with the supporting plies in supported_by where the lesson is induced from played moves ("develop knights before bishops", "an early queen sortie gets punished"); a plain upsert_edge onto the game node is allowed only for a lesson implied by the rules alone (e.g. before any game has been lost). Phrase strategies as portable lessons, never as one game's narration.
 - promote_edge is the special case: exactly one episodic edge is itself already the general lesson (it was reinforced, or a synthesis proposal built on it, and its content contains no episode-specific detail). If the content names a specific game, session, or move number, it is NOT promotable — gist it or leave it. Promote the generalization ("castling late repeatedly loses"), never the specific instance ("opponent played e4 in game 3"). {"tool":"promote_edge","args":{"source":"string","target":"string"}}
 
 Respond with raw JSON tool calls only. Use the standard format. These will be applied immediately."#;
