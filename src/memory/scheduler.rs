@@ -293,6 +293,52 @@ async fn count_acquisition_debt(conn: &Connection) -> usize {
     }
 }
 
+// The nightly-dream guarantee's input: has anything been experienced since
+// the last dream? True when the newest non-dream event is newer than the
+// newest dream event (or no dream has ever run but events exist).
+pub fn has_unconsolidated_experience() -> bool {
+    let Ok(conn) = db::open_connection() else {
+        return false;
+    };
+    db::block_on(async {
+        let newest_experience = get_newest_experience_event_ts(&conn).await;
+        let Some(experience_ts) = newest_experience else {
+            return false;
+        };
+        match get_newest_dream_event_ts(&conn).await {
+            Some(dream_ts) => experience_ts > dream_ts,
+            None => true,
+        }
+    })
+}
+
+/// Newest event timestamp outside dream sessions — lived experience.
+async fn get_newest_experience_event_ts(conn: &Connection) -> Option<String> {
+    let mut rows = match conn
+        .query(
+            "SELECT MAX(ev.ts) FROM events ev
+             LEFT JOIN sessions s ON s.id = ev.session_id
+             WHERE s.session_type IS NULL OR s.session_type != 'dream'",
+            (),
+        )
+        .await
+    {
+        Ok(rows) => rows,
+        Err(_) => return None,
+    };
+    let Ok(Some(row)) = rows.next().await else {
+        return None;
+    };
+    match row.get_value(0) {
+        Ok(turso::Value::Null) => None,
+        Ok(value) => {
+            let text = db::text(value);
+            if text.is_empty() { None } else { Some(text) }
+        }
+        Err(_) => None,
+    }
+}
+
 /// Get the newest event timestamp from any dream session
 async fn get_newest_dream_event_ts(conn: &Connection) -> Option<String> {
     let mut rows = match conn

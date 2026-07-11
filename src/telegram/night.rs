@@ -76,6 +76,14 @@ struct NightGate {
     last_action: Option<Instant>,
     count: usize,
     night_day: Option<String>,
+    // Invalidation flag instead of periodic re-evaluation: the daemon is the
+    // only writer, so scheduler inputs can only change when it handles a turn,
+    // runs an action itself, or the day rolls over — all of which set this.
+    // A Rest with a clean flag would be provably identical, so it is skipped.
+    // If a second write path is ever added, its author must set the flag (or
+    // revert to periodic checks) — correctness depends on single-writer.
+    dirty: bool,
+    dreamed_tonight: bool,
 }
 
 impl NightGate {
@@ -87,18 +95,23 @@ impl NightGate {
             last_action: None,
             count: 0,
             night_day: None,
+            dirty: true,
+            dreamed_tonight: false,
         }
     }
 
-    // May a scheduler action dispatch right now? Re-entering the window on a
-    // new day resets the per-night action count.
-    fn should_dispatch(&mut self, hour: u32, today: &str, now: Instant) -> bool {
+    // May a scheduler evaluation run right now? Re-entering the window on a
+    // new day resets the per-night action count and the nightly-dream flag,
+    // and marks state dirty (the day-derived inputs just changed).
+    fn should_evaluate(&mut self, hour: u32, today: &str, now: Instant) -> bool {
         let inside = self.window.contains(hour);
         if inside && self.night_day.as_deref() != Some(today) {
             self.night_day = Some(today.to_string());
             self.count = 0;
+            self.dreamed_tonight = false;
+            self.dirty = true;
         }
-        inside && self.cooldown_elapsed(now) && self.count < self.max_actions
+        inside && self.dirty && self.cooldown_elapsed(now) && self.count < self.max_actions
     }
 
     fn cooldown_elapsed(&self, now: Instant) -> bool {
@@ -118,6 +131,12 @@ impl NightGate {
     // the daemon does not re-decide it every idle tick, but not the cap.
     fn record_skipped(&mut self, now: Instant) {
         self.last_action = Some(now);
+    }
+
+    // Rest with unchanged inputs would repeat forever — stop evaluating until
+    // something actually changes (turn handled, action ran, day rolled over).
+    fn record_rest(&mut self) {
+        self.dirty = false;
     }
 }
 
@@ -154,10 +173,39 @@ impl NightCycle {
         let hour = timeutil::current_hour();
         let today = timeutil::today_iso();
         let now = Instant::now();
-        if !self.gate.should_dispatch(hour, &today, now) {
+        if !self.gate.should_evaluate(hour, &today, now) {
+            return;
+        }
+        if self.try_guaranteed_dream(now) {
             return;
         }
         self.run_scheduler_cycle(now);
+    }
+
+    // A turn was handled (or state otherwise changed): scheduler inputs may
+    // differ now, so the next idle poll inside the window re-evaluates.
+    pub fn mark_dirty(&mut self) {
+        self.gate.dirty = true;
+    }
+
+    // The nightly-dream guarantee: a brain dreams every night that anything
+    // happened, regardless of debt thresholds. Once per night, if any
+    // experience postdates the last dream, dream — bypassing decide().
+    fn try_guaranteed_dream(&mut self, now: Instant) -> bool {
+        if self.gate.dreamed_tonight {
+            return false;
+        }
+        if !scheduler::has_unconsolidated_experience() {
+            return false;
+        }
+        runlog::log(
+            "tg",
+            "night action: dream (nightly guarantee: unconsolidated experience)",
+        );
+        self.run_dream();
+        self.gate.dreamed_tonight = true;
+        self.gate.record_action(now);
+        true
     }
 
     fn run_scheduler_cycle(&mut self, now: Instant) {
@@ -175,6 +223,7 @@ impl NightCycle {
             SchedulerAction::Dream { reason } => {
                 runlog::log("tg", &format!("night action: dream ({reason})"));
                 self.run_dream();
+                self.gate.dreamed_tonight = true;
                 self.gate.record_action(now);
             }
             SchedulerAction::Explore { reason } => {
@@ -191,6 +240,7 @@ impl NightCycle {
             }
             SchedulerAction::Rest { reason } => {
                 runlog::log("tg", &format!("night rest: {reason}"));
+                self.gate.record_rest();
             }
         }
     }
@@ -265,26 +315,26 @@ mod tests {
     #[test]
     fn dispatches_inside_window_when_cooldown_elapsed_and_under_cap() {
         let mut gate = gate("3-6");
-        assert!(gate.should_dispatch(4, "2026-07-10", Instant::now()));
+        assert!(gate.should_evaluate(4, "2026-07-10", Instant::now()));
     }
 
     #[test]
     fn never_dispatches_outside_window() {
         let mut gate = gate("3-6");
-        assert!(!gate.should_dispatch(2, "2026-07-10", Instant::now()));
-        assert!(!gate.should_dispatch(6, "2026-07-10", Instant::now()));
+        assert!(!gate.should_evaluate(2, "2026-07-10", Instant::now()));
+        assert!(!gate.should_evaluate(6, "2026-07-10", Instant::now()));
     }
 
     #[test]
     fn does_not_dispatch_before_cooldown_elapses() {
         let mut gate = gate("3-6");
         let base = Instant::now();
-        assert!(gate.should_dispatch(4, "2026-07-10", base));
+        assert!(gate.should_evaluate(4, "2026-07-10", base));
         gate.record_action(base);
         let soon = base + Duration::from_secs(60);
-        assert!(!gate.should_dispatch(4, "2026-07-10", soon));
+        assert!(!gate.should_evaluate(4, "2026-07-10", soon));
         let later = base + Duration::from_secs(1200);
-        assert!(gate.should_dispatch(4, "2026-07-10", later));
+        assert!(gate.should_evaluate(4, "2026-07-10", later));
     }
 
     #[test]
@@ -292,11 +342,11 @@ mod tests {
         let mut gate = gate("3-6");
         let mut now = Instant::now();
         for _ in 0..3 {
-            assert!(gate.should_dispatch(4, "2026-07-10", now));
+            assert!(gate.should_evaluate(4, "2026-07-10", now));
             gate.record_action(now);
             now += Duration::from_secs(1200);
         }
-        assert!(!gate.should_dispatch(4, "2026-07-10", now));
+        assert!(!gate.should_evaluate(4, "2026-07-10", now));
     }
 
     #[test]
@@ -304,23 +354,63 @@ mod tests {
         let mut gate = gate("3-6");
         let mut now = Instant::now();
         for _ in 0..3 {
-            assert!(gate.should_dispatch(4, "2026-07-10", now));
+            assert!(gate.should_evaluate(4, "2026-07-10", now));
             gate.record_action(now);
             now += Duration::from_secs(1200);
         }
-        assert!(!gate.should_dispatch(4, "2026-07-10", now));
+        assert!(!gate.should_evaluate(4, "2026-07-10", now));
         // Re-entering the window on a new day clears the counter.
-        assert!(gate.should_dispatch(4, "2026-07-11", now));
+        assert!(gate.should_evaluate(4, "2026-07-11", now));
+    }
+
+    #[test]
+    fn rest_clears_dirty_and_evaluation_stops_until_marked_dirty() {
+        let mut gate = gate("3-6");
+        let base = Instant::now();
+        assert!(gate.should_evaluate(4, "2026-07-10", base));
+        gate.record_rest();
+        // Same night, cooldown irrelevant: inputs unchanged, never re-evaluate.
+        let later = base + Duration::from_secs(3600);
+        assert!(!gate.should_evaluate(4, "2026-07-10", later));
+        // A state change (turn handled) re-enables evaluation.
+        gate.dirty = true;
+        assert!(gate.should_evaluate(4, "2026-07-10", later));
+    }
+
+    #[test]
+    fn a_new_day_sets_dirty_and_resets_the_nightly_dream_flag() {
+        let mut gate = gate("3-6");
+        let base = Instant::now();
+        // Establish the night first — entering the window on a new day is
+        // itself a dirtying event, so the rest must come after.
+        assert!(gate.should_evaluate(4, "2026-07-10", base));
+        gate.dreamed_tonight = true;
+        gate.record_rest();
+        assert!(!gate.should_evaluate(4, "2026-07-10", base));
+        // Window re-entry on the next day: dirty again, dream flag cleared.
+        assert!(gate.should_evaluate(4, "2026-07-11", base));
+        assert!(!gate.dreamed_tonight);
+    }
+
+    #[test]
+    fn actions_leave_dirty_set_so_the_follow_up_evaluation_happens() {
+        let mut gate = gate("3-6");
+        let base = Instant::now();
+        assert!(gate.should_evaluate(4, "2026-07-10", base));
+        gate.record_action(base);
+        // Cooldown gates the timing, but the state is still dirty.
+        let later = base + Duration::from_secs(1200);
+        assert!(gate.should_evaluate(4, "2026-07-10", later));
     }
 
     #[test]
     fn skipped_action_consumes_cooldown_but_not_cap() {
         let mut gate = gate("3-6");
         let base = Instant::now();
-        assert!(gate.should_dispatch(4, "2026-07-10", base));
+        assert!(gate.should_evaluate(4, "2026-07-10", base));
         gate.record_skipped(base);
         assert_eq!(gate.count, 0, "cap not consumed");
         let soon = base + Duration::from_secs(60);
-        assert!(!gate.should_dispatch(4, "2026-07-10", soon), "cooldown consumed");
+        assert!(!gate.should_evaluate(4, "2026-07-10", soon), "cooldown consumed");
     }
 }

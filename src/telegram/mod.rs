@@ -145,9 +145,12 @@ impl Gateway {
     ) {
         while !shutdown.load(Ordering::Relaxed) {
             // The idle path (no updates) is where the night cycle runs: a poll
-            // that returned messages spent this cycle answering them.
+            // that returned messages spent this cycle answering them — and
+            // changed state, so the night cycle must re-evaluate next chance.
             if self.poll_once(transport, handler, shutdown) {
                 night.maybe_run(shutdown);
+            } else {
+                night.mark_dirty();
             }
         }
     }
