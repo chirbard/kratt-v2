@@ -88,6 +88,7 @@ fn run_stream_worker(job: StreamJob) {
         session_path: &job.session_path,
         turn_id: &job.turn_id,
         style_hint: None,
+        prior_session_path: None,
     };
     let (mut messages, tools, memory_build) = match turn::prepare_stream_context(&ctx) {
         Ok(result) => result,

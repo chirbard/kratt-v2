@@ -35,6 +35,11 @@ pub(crate) struct TurnContext<'ctx> {
     // Front-end formatting constraints appended to the system prompt (e.g.
     // Telegram: no tables, phone-width answers). None for the TUI.
     pub style_hint: Option<&'ctx str>,
+    // Yesterday's session file, when the front-end shows one continuous
+    // conversation across the session boundary (Telegram): a fresh day
+    // session tops up its recent context from this tail, so the model wakes
+    // up seeing the same last messages the user's screen shows.
+    pub prior_session_path: Option<&'ctx Path>,
 }
 
 pub(crate) struct TurnClients<'cl> {
@@ -47,7 +52,7 @@ pub(crate) struct TurnClients<'cl> {
 pub(crate) fn prepare_stream_context(
     ctx: &TurnContext,
 ) -> Result<(Vec<Value>, Value, MemoryBuild), Box<dyn Error + Send + Sync>> {
-    let recent_entries = session::load_recent_entries(ctx.session_path, RECENT_TURNS);
+    let recent_entries = load_recent_with_prior(ctx);
     let session_id = session::session_id_from_path(ctx.session_path);
     let memory = build_memory_block(ctx.embed, ctx.prompt, &session_id, ctx.turn_id);
     let mut system = prompts::build_chat_system_prompt(&memory.block, &recent_entries);
@@ -73,9 +78,10 @@ pub(crate) fn prepare_stream_context(
 pub(crate) fn run_turn_collecting(
     clients: &TurnClients,
     prompt: &str,
-    session_path: &Path,
+    paths: (&Path, Option<&Path>),
     turn_id: &str,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let (session_path, prior_session_path) = paths;
     let ctx = TurnContext {
         embed: clients.embed,
         search: clients.search,
@@ -83,6 +89,7 @@ pub(crate) fn run_turn_collecting(
         session_path,
         turn_id,
         style_hint: clients.style_hint,
+        prior_session_path,
     };
     let (mut messages, tools, memory_build) = prepare_stream_context(&ctx)?;
     log_memory_context(&memory_build);
@@ -119,6 +126,29 @@ pub(crate) fn log_memory_context(memory_build: &MemoryBuild) {
         "chat",
         &format!("memory context built in {}ms", memory_build.elapsed_ms),
     );
+}
+
+// Today's recent turns, topped up from yesterday's session when today is
+// still fresh — the Telegram page shows one continuous conversation, so the
+// model's context should too. The elapsed-time note in the system prompt
+// tells it how long ago those messages were.
+fn load_recent_with_prior(ctx: &TurnContext) -> Vec<session::RecentEntry> {
+    let recent = session::load_recent_entries(ctx.session_path, RECENT_TURNS);
+    let Some(prior) = ctx.prior_session_path else {
+        return recent;
+    };
+    let mut pairs = 0usize;
+    for entry in &recent {
+        if entry.role == "user" {
+            pairs += 1;
+        }
+    }
+    if pairs >= RECENT_TURNS {
+        return recent;
+    }
+    let mut merged = session::load_recent_entries(prior, RECENT_TURNS - pairs);
+    merged.extend(recent);
+    merged
 }
 
 pub(crate) fn build_memory_block(

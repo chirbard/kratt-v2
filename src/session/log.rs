@@ -94,7 +94,7 @@ pub fn load_recent_entries(path: &Path, turn_count: usize) -> Vec<RecentEntry> {
 
 fn select_recent_turns(entries: Vec<RecentEntry>, turn_count: usize) -> Vec<RecentEntry> {
     if entries.len() < 2 {
-        return Vec::new();
+        return lone_assistant_tail(&entries, entries.len());
     }
     let mut tail_end = entries.len();
     while tail_end > 0 && !is_assistant_entry(&entries[tail_end - 1]) {
@@ -117,9 +117,28 @@ fn select_recent_turns(entries: Vec<RecentEntry>, turn_count: usize) -> Vec<Rece
         scan_end -= 2;
     }
     if pair_count == 0 {
-        return Vec::new();
+        return lone_assistant_tail(&entries, tail_end);
+    }
+    // A LONE assistant entry directly before the oldest pair is kept: system
+    // messages the daemon sends on its own (the morning report) have no user
+    // side, and the model should still see what it told the user. Lone means
+    // not itself the tail of an earlier pair.
+    if start_index > 0
+        && is_assistant_entry(&entries[start_index - 1])
+        && (start_index < 2 || !is_user_entry(&entries[start_index - 2]))
+    {
+        start_index -= 1;
     }
     entries[start_index..tail_end].to_vec()
+}
+
+// No user/assistant pair at the tail — but a trailing assistant-only entry
+// (a just-sent morning report) is still context worth carrying.
+fn lone_assistant_tail(entries: &[RecentEntry], tail_end: usize) -> Vec<RecentEntry> {
+    if tail_end > 0 && is_assistant_entry(&entries[tail_end - 1]) {
+        return entries[tail_end - 1..tail_end].to_vec();
+    }
+    Vec::new()
 }
 
 fn is_user_entry(entry: &RecentEntry) -> bool {
@@ -138,5 +157,51 @@ pub fn session_id_from_path(path: &Path) -> String {
     match path.file_stem() {
         Some(stem) => stem.to_string_lossy().into_owned(),
         None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RecentEntry, select_recent_turns};
+
+    fn entry(role: &str, content: &str) -> RecentEntry {
+        RecentEntry {
+            role: role.to_string(),
+            content: content.to_string(),
+            timestamp: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_lone_assistant_before_the_oldest_pair_is_kept() {
+        let entries = vec![
+            entry("assistant", "morning report"),
+            entry("user", "1"),
+            entry("assistant", "scored yesterday +0.5 — thanks"),
+        ];
+        let recent = select_recent_turns(entries, 2);
+        assert_eq!(recent.len(), 3);
+        assert_eq!(recent[0].content, "morning report");
+    }
+
+    #[test]
+    fn a_trailing_report_with_no_pairs_is_still_context() {
+        let entries = vec![entry("assistant", "morning report")];
+        let recent = select_recent_turns(entries, 2);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].content, "morning report");
+    }
+
+    #[test]
+    fn plain_pairs_are_unchanged() {
+        let entries = vec![
+            entry("user", "hi"),
+            entry("assistant", "hello"),
+            entry("user", "how"),
+            entry("assistant", "fine"),
+        ];
+        let recent = select_recent_turns(entries, 1);
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].content, "how");
     }
 }

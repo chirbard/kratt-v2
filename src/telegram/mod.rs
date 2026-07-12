@@ -342,6 +342,7 @@ impl TurnHandler for LiveTurnHandler {
     // before the caller polls again. Serializes all DB writes like the TUI.
     fn handle(&mut self, text: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
         let session_path = self.session_path();
+        let prior_path = prior_session_path();
         let turn_id = session::append_entry(&session_path, "user", text);
         let clients = turn::TurnClients {
             llm: &*self.chat_llm,
@@ -349,7 +350,12 @@ impl TurnHandler for LiveTurnHandler {
             search: self.search.as_deref(),
             style_hint: Some(TELEGRAM_STYLE_HINT),
         };
-        let answer = turn::run_turn_collecting(&clients, text, &session_path, &turn_id)?;
+        let answer = turn::run_turn_collecting(
+            &clients,
+            text,
+            (&session_path, prior_path.as_deref()),
+            &turn_id,
+        )?;
         session::append_entry(&session_path, "assistant", &answer);
         run_memory_to_completion(self.seats.clone(), text, &answer, &turn_id);
         Ok(answer)
@@ -398,6 +404,14 @@ impl DaySession {
         self.session_id = format!("tg-{today}");
         (self.session_id.clone(), true)
     }
+}
+
+// Yesterday's day-session file, if any — the Telegram page shows one
+// continuous conversation across midnight, so a fresh morning session tops up
+// its recent context from this tail (see turn::load_recent_with_prior).
+fn prior_session_path() -> Option<PathBuf> {
+    let path = session_path_for_id(&format!("tg-{}", timeutil::yesterday_iso()));
+    if path.exists() { Some(path) } else { None }
 }
 
 fn session_path_for_id(session_id: &str) -> PathBuf {
