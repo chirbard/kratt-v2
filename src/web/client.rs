@@ -3,6 +3,7 @@ use std::error::Error;
 use super::SearchClient;
 
 const TAVILY_URL: &str = "https://api.tavily.com/search";
+const TAVILY_EXTRACT_URL: &str = "https://api.tavily.com/extract";
 
 pub(super) struct TavilyClient {
     api_key: String,
@@ -32,6 +33,39 @@ impl SearchClient for TavilyClient {
             Some(parts.join("\n\n"))
         }
     }
+
+    fn extract_url(&self, url: &str) -> Result<String, String> {
+        match tavily_extract(&self.api_key, url) {
+            Ok(text) => Ok(text),
+            Err(err) => Err(err.to_string()),
+        }
+    }
+}
+
+fn tavily_extract(api_key: &str, url: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let body = serde_json::json!({"api_key": api_key, "urls": [url]});
+    let response = reqwest::blocking::Client::new()
+        .post(TAVILY_EXTRACT_URL)
+        .json(&body)
+        .send()?;
+    if !response.status().is_success() {
+        return Err(format!("HTTP {}: {}", response.status(), response.text().unwrap_or_default()).into());
+    }
+    let value = response.json::<serde_json::Value>()?;
+    let content = match value.get("results") {
+        Some(results) => match results.as_array() {
+            Some(results) => match results.first() {
+                Some(result) => get_str_field(result, "raw_content"),
+                None => "",
+            },
+            None => "",
+        },
+        None => "",
+    };
+    if content.is_empty() {
+        return Err("Tavily extract returned no text".into());
+    }
+    Ok(content.to_string())
 }
 
 fn format_search_section(query: &str, value: &serde_json::Value) -> String {

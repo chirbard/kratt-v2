@@ -615,6 +615,9 @@ fn run_scheduler(app: &mut App) {
             start_exploration(app);
             app.scheduler_consecutive_actions += 1;
         }
+        scheduler::SchedulerAction::InboxStudy { reason } => {
+            crate::runlog::log("sched", &format!("inbox study is daemon-only: {reason}"));
+        }
         scheduler::SchedulerAction::Ingest { path, reason } => {
             crate::runlog::log(
                 "sched",

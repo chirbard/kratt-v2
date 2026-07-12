@@ -173,6 +173,10 @@ pub(crate) enum ToolCall {
         resolution: String,
         note: String,
     },
+    InboxAdd {
+        source: String,
+        instruction: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,6 +240,7 @@ pub(crate) fn describe_tool_call(call: &ToolCall) -> String {
         } => {
             format!("close_loop {loop_id} ({resolution})")
         }
+        ToolCall::InboxAdd { source, .. } => format!("inbox_add {source}"),
     }
 }
 
@@ -768,6 +773,7 @@ fn parse_single_tool(obj: &serde_json::Value) -> Option<ToolCall> {
         "record_outcome" => parse_record_outcome(args),
         "open_loop" => parse_open_loop(args),
         "close_loop" => parse_close_loop(args),
+        "inbox_add" => parse_inbox_add(args),
         _ => None,
     }
 }
@@ -793,6 +799,7 @@ pub(crate) fn parse_tool_call_request(call: &ToolCallRequest) -> Option<ToolCall
         "delete_edge" => parse_delete_edge(&args),
         "expire_edge" => parse_expire_edge(&args),
         "promote_edge" => parse_promote_edge(&args),
+        "inbox_add" => parse_inbox_add(&args),
         _ => None,
     }
 }
@@ -1033,6 +1040,13 @@ fn parse_open_loop(args: &serde_json::Value) -> Option<ToolCall> {
     })
 }
 
+fn parse_inbox_add(args: &serde_json::Value) -> Option<ToolCall> {
+    Some(ToolCall::InboxAdd {
+        source: json_str(args, "source"),
+        instruction: json_str(args, "instruction"),
+    })
+}
+
 fn parse_close_loop(args: &serde_json::Value) -> Option<ToolCall> {
     let loop_id = json_str(args, "loop");
     let resolution = json_str(args, "resolution");
@@ -1210,7 +1224,27 @@ pub(crate) fn apply_tool_call<'scope>(
             apply_open_loop_call(conn, options, events, OpenLoopCall { intention, anchor, due }),
         ToolCall::CloseLoop { loop_id, resolution, note } =>
             apply_close_loop_call(conn, options, events, CloseLoopCall { loop_id, resolution, note }),
+        ToolCall::InboxAdd { source, instruction } =>
+            apply_inbox_add_call(conn, options, &source, &instruction),
     }
+}
+
+fn apply_inbox_add_call<'scope>(
+    conn: &Connection,
+    options: &ApplyToolOptions<'scope>,
+    source: &str,
+    instruction: &str,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    if !matches!(options.actor.actor_id.as_str(), "scribe" | "extract" | "consolidate") {
+        return Ok("inbox_add denied: inbox_add is a chat memory tool".to_string());
+    }
+    let is_url = source.starts_with("http://") || source.starts_with("https://");
+    if source.is_empty() || (!is_url && !std::path::Path::new(source).exists()) {
+        return Ok("inbox_add denied: source is neither a URL nor an existing file".to_string());
+    }
+    let item_id = db::insert_inbox_item(conn, source, instruction)?;
+    crate::runlog::log("inbox", &format!("queued: {source}"));
+    Ok(format!("inbox_add: queued item {item_id}"))
 }
 
 struct RecordMoveCall {
@@ -1453,7 +1487,8 @@ pub(super) fn tool_call_touches_loop(
         | ToolCall::RecordRule { .. }
         | ToolCall::RecordOutcome { .. }
         | ToolCall::OpenLoop { .. }
-        | ToolCall::CloseLoop { .. } => Ok(false),
+        | ToolCall::CloseLoop { .. }
+        | ToolCall::InboxAdd { .. } => Ok(false),
     }
 }
 
@@ -2529,6 +2564,139 @@ mod tests {
             assert!((super::super::outcome_score("win") - 1.0).abs() < 1e-9);
             assert!((super::super::outcome_score("draw")).abs() < 1e-9);
             assert!((super::super::outcome_score("loss") + 1.0).abs() < 1e-9);
+        }
+    }
+
+    mod inbox {
+        use super::super::{ApplyToolOptions, ToolCall, apply_tool_call};
+        use crate::memory::db;
+        use crate::memory::ledger::{Actor, Event, EventContext};
+        use turso::Builder;
+
+        const INBOX_DDL: &str = "CREATE TABLE inbox (id INTEGER PRIMARY KEY AUTOINCREMENT, accepted_at TEXT NOT NULL, source TEXT NOT NULL, instruction TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'queued', resolved_at TEXT NOT NULL DEFAULT '', result TEXT NOT NULL DEFAULT '')";
+
+        async fn harness() -> turso::Connection {
+            let Ok(database) = Builder::new_local(":memory:").build().await else {
+                unreachable!("in-memory database builds")
+            };
+            let Ok(conn) = database.connect() else {
+                unreachable!("in-memory database connects")
+            };
+            let _ = conn.execute(INBOX_DDL, ()).await;
+            conn
+        }
+
+        fn options(phase: &'static str) -> ApplyToolOptions<'static> {
+            ApplyToolOptions {
+                actor: Actor::new("system", phase),
+                context: EventContext::new("chat-1", "chat-1:user:ts"),
+                source_message_id: "chat-1:user:ts",
+                event_payload: "",
+                confidence_cap: None,
+                default_memory_type: "episodic",
+            }
+        }
+
+        fn add(conn: &turso::Connection, phase: &'static str, source: &str) -> String {
+            let call = ToolCall::InboxAdd {
+                source: source.to_string(),
+                instruction: "focus on X".to_string(),
+            };
+            let mut events: Vec<Event> = Vec::new();
+            let Ok(description) = apply_tool_call(call, conn, &options(phase), &mut events) else {
+                unreachable!("apply succeeds")
+            };
+            description
+        }
+
+        #[test]
+        fn inbox_add_queues_urls_from_scribe_and_heavy_seats() {
+            let conn = db::block_on(harness());
+            assert!(add(&conn, "scribe", "https://example.com/a").contains("queued"));
+            assert!(add(&conn, "extract", "http://example.com/b").contains("queued"));
+            let count = db::block_on(db::count_queued_inbox(&conn));
+            assert_eq!(count, 2);
+        }
+
+        #[test]
+        fn inbox_add_denied_from_dream_and_ingest_seats() {
+            let conn = db::block_on(harness());
+            for phase in ["consolidation", "ingest"] {
+                let result = add(&conn, phase, "https://example.com/a");
+                assert!(result.contains("denied"), "{phase}: {result}");
+            }
+            assert_eq!(db::block_on(db::count_queued_inbox(&conn)), 0);
+        }
+
+        #[test]
+        fn inbox_add_rejects_a_source_that_is_neither_url_nor_file() {
+            let conn = db::block_on(harness());
+            let result = add(&conn, "extract", "definitely/not/a/real/path.txt");
+            assert!(result.contains("denied"), "{result}");
+            let empty = add(&conn, "extract", "");
+            assert!(empty.contains("denied"), "{empty}");
+            assert_eq!(db::block_on(db::count_queued_inbox(&conn)), 0);
+        }
+
+        #[test]
+        fn queue_is_fifo_and_resolution_updates_status() {
+            let conn = db::block_on(harness());
+            let Ok(first) = db::insert_inbox_item(&conn, "https://a", "") else {
+                unreachable!("insert succeeds")
+            };
+            let Ok(_second) = db::insert_inbox_item(&conn, "https://b", "") else {
+                unreachable!("insert succeeds")
+            };
+            let Ok(Some(oldest)) = db::oldest_queued_inbox(&conn) else {
+                unreachable!("oldest exists")
+            };
+            assert_eq!(oldest.item_id, first);
+            assert_eq!(oldest.source, "https://a");
+            let Ok(()) = db::resolve_inbox_item(&conn, first, "done", "ingest-1") else {
+                unreachable!("resolve succeeds")
+            };
+            let Ok(Some(next)) = db::oldest_queued_inbox(&conn) else {
+                unreachable!("next exists")
+            };
+            assert_eq!(next.source, "https://b");
+            assert_eq!(db::block_on(db::count_queued_inbox(&conn)), 1);
+        }
+
+        #[test]
+        fn outcomes_cover_window_resolutions_and_all_queued_items() {
+            let conn = db::block_on(harness());
+            let Ok(done_id) = db::insert_inbox_item(&conn, "https://done", "") else {
+                unreachable!("insert succeeds")
+            };
+            let Ok(failed_id) = db::insert_inbox_item(&conn, "https://failed", "") else {
+                unreachable!("insert succeeds")
+            };
+            let Ok(old_id) = db::insert_inbox_item(&conn, "https://old", "") else {
+                unreachable!("insert succeeds")
+            };
+            let Ok(_queued) = db::insert_inbox_item(&conn, "https://queued", "") else {
+                unreachable!("insert succeeds")
+            };
+            let Ok(()) = db::resolve_inbox_item(&conn, done_id, "done", "ingest-9") else {
+                unreachable!("resolve succeeds")
+            };
+            let Ok(()) = db::resolve_inbox_item(&conn, failed_id, "failed", "HTTP 404") else {
+                unreachable!("resolve succeeds")
+            };
+            // Resolved long before the window: must not re-report.
+            let _ = db::block_on(conn.execute(
+                "UPDATE inbox SET status = 'done', resolved_at = '2020-01-01T00:00:00', result = 'x' WHERE id = ?1",
+                turso::params![old_id],
+            ));
+            let Ok(outcomes) = db::block_on(db::load_inbox_outcomes(&conn, "2026-01-01", "2099-01-01")) else {
+                unreachable!("outcomes load")
+            };
+            assert!(outcomes.contains(&"https://done: done".to_string()), "{outcomes:?}");
+            assert!(outcomes.contains(&"https://failed: failed (HTTP 404)".to_string()), "{outcomes:?}");
+            assert!(outcomes.contains(&"https://queued: queued".to_string()), "{outcomes:?}");
+            for line in &outcomes {
+                assert!(!line.starts_with("https://old"), "{outcomes:?}");
+            }
         }
     }
 

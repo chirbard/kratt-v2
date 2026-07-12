@@ -241,6 +241,7 @@ fn render_digest(digest: &DayDigest) -> String {
     lines.push(format!("Overnight dream events: {}", digest.dream_events));
     push_ref_line(&mut lines, "Gists consolidated", &digest.gists);
     push_ref_line(&mut lines, "Due loops", &digest.due_loops);
+    push_ref_line(&mut lines, "Inbox", &digest.inbox_outcomes);
     let mut index = 0usize;
     while index < digest.turn_groups.len() {
         lines.push(format!(

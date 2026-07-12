@@ -7,7 +7,8 @@ pub const CHAT_SYSTEM_PROMPT: &str = r#"You are a direct, honest assistant with 
 - When <web_context> or <memory> contradicts something the user stated: respond with one short correction and one yes/no question only — no code, no examples, no elaboration; wait for confirmation before doing any work
 - Use <memory> to recall what you know about the user
 - Use <recent_context> for short-term continuity
-- Never output graph data, JSON, edge lists, or memory update descriptions"#;
+- Never output graph data, JSON, edge lists, or memory update descriptions
+- When asked to study a link or file later, confirm it is queued and say plainly that you have not read it yet; never summarize unread material"#;
 
 pub const EXTRACT_EXPLANATION: &str = r#"You are the extraction agent for a memory graph. Extract the surprise: what this conversation adds to, contradicts, or refines in what memory already knows.
 
@@ -122,6 +123,9 @@ open_loop — remember one concrete intended future action or expected event ("r
 - ONE loop per intention — never open a second loop restating an existing one
 {"tool":"open_loop","args":{"intention":"ask the user whether the systemd unit file arrived","anchor":"systemd-unit-file","due":"2026-07-15"}}
 
+inbox_add — queue material the user asks to study later. Copy the URL or file path verbatim; instruction is their stated focus, empty if none. ONE item per source; do not re-queue a source already accepted this exchange.
+{"tool":"inbox_add","args":{"source":"https://example.com/paper.html","instruction":"focus on the eviction policy"}}
+
 close_loop — close a live loop only when this exchange confirms it: done, deliberately abandoned, or the expected event confirmed missing. Never from silence or a passed deadline alone.
 {"tool":"close_loop","args":{"loop":"kebab-loop-id","resolution":"done | abandoned | absence","note":"brief evidence"}}
 
@@ -187,6 +191,9 @@ open_loop — remember one concrete intended future action or expected event unt
 - anchor: existing topic node whose appearance should surface the loop; emit upsert_node first if needed
 - due: optional YYYY-MM-DD deadline or expected-by date; empty for contextual-only loops
 {"tool":"open_loop","args":{"intention":"ask Markus whether the systemd unit survived the reboot","anchor":"home-server","due":"2026-07-15"}}
+
+inbox_add — queue material the user asks to study later. Copy the URL or file path verbatim; instruction is their stated focus, empty if none. ONE item per source; do not re-queue a source already accepted this exchange.
+{"tool":"inbox_add","args":{"source":"https://example.com/paper.html","instruction":"focus on the eviction policy"}}
 
 close_loop — close a live loop only when the exchange confirms its resolution.
 - resolution: "done" | "abandoned" | "absence"
@@ -638,8 +645,9 @@ pub const DAILY_REPORT: &str = r#"You are a learning agent writing a short morni
 Write a first-person report, at most 200 words, plain text (no markdown headers, no lists of raw ids):
 1. The day as at most THREE threads, one or two sentences each, drawn from the Thread lines (each is one conversation turn's new edges). Name the thread's subject in plain words and what came of it. Ignore minor one-off topics entirely — do not hop.
 2. One sentence on the night: what the dream consolidated, gists first if any.
-3. Mention Due loops in one sentence when present. If a past-due loop is an expected event, ask whether it happened: "X was expected by YYYY-MM-DD; did it happen?" Never treat the deadline alone as evidence of absence.
-4. One honest self-assessment sentence: whether this looks like a good day of learning and WHY — so the reader can agree or correct.
+3. Report each Inbox outcome in one sentence: what you studied and the single most interesting thing it added, or that it failed and why. Never pretend a failed or queued item was studied.
+4. Mention Due loops in one sentence when present. If a past-due loop is an expected event, ask whether it happened: "X was expected by YYYY-MM-DD; did it happen?" Never treat the deadline alone as evidence of absence.
+5. One honest self-assessment sentence: whether this looks like a good day of learning and WHY — so the reader can agree or correct.
 
 Ground every sentence in the digest — invent nothing beyond it, and do not flatter. If the digest is thin, say so plainly and keep it short."#;
 

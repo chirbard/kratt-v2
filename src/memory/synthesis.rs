@@ -629,7 +629,15 @@ fn normalize_call(call: &ToolCall, confidence: f64) -> ToolCall {
             resolution: resolution.clone(),
             note: note.clone(),
         },
+        ToolCall::InboxAdd { .. } => normalize_inbox_add(call),
     }
+}
+
+fn normalize_inbox_add(call: &ToolCall) -> ToolCall {
+    let ToolCall::InboxAdd { source, instruction } = call else {
+        unreachable!("normalize_inbox_add called with non-inbox call");
+    };
+    ToolCall::InboxAdd { source: source.clone(), instruction: instruction.clone() }
 }
 
 // Synthesis never emits record_move (it is a scribe-only tool), but the match
@@ -779,7 +787,8 @@ fn apply_policy_overrides(cluster: &Cluster, calls: &[ToolCall], policy: &mut Sy
             | ToolCall::RecordRule { .. }
             | ToolCall::RecordOutcome { .. }
             | ToolCall::OpenLoop { .. }
-            | ToolCall::CloseLoop { .. } => {}
+            | ToolCall::CloseLoop { .. }
+            | ToolCall::InboxAdd { .. } => {}
         }
         idx += 1;
     }
@@ -834,6 +843,9 @@ fn tool_call_json(call: &ToolCall) -> serde_json::Value {
         | ToolCall::RecordRule { .. }
         | ToolCall::RecordOutcome { .. } => task_tool_json(call),
         ToolCall::OpenLoop { .. } | ToolCall::CloseLoop { .. } => loop_tool_json(call),
+        ToolCall::InboxAdd { source, instruction } => {
+            json!({"tool":"inbox_add","args":{"source":source,"instruction":instruction}})
+        }
     }
 }
 

@@ -658,6 +658,10 @@ fn apply_dream_call<'scope, 'policy>(
             "close_loop denied: close_loop is a heavy tool".to_string(),
             false,
         )),
+        ToolCall::InboxAdd { .. } => Ok((
+            "inbox_add denied: inbox_add is a chat memory tool".to_string(),
+            false,
+        )),
     }
 }
 
