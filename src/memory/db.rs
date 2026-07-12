@@ -1076,7 +1076,9 @@ pub fn load_unembedded_edges() -> Vec<(String, String, String)> {
 async fn load_unembedded_edges_async(conn: &Connection) -> Vec<(String, String, String)> {
     let Ok(mut rows) = conn
         .query(
-            "SELECT e.source, e.target, e.content FROM edges e LEFT JOIN nodes n ON n.id = e.source WHERE e.expired_at IS NULL AND e.embedding IS NULL AND (n.node_type IS NULL OR n.node_type != 'loop')",
+            // Loop edges ARE embedded (the similarity trigger below needs
+            // them); they stay excluded from ranked retrieval only.
+            "SELECT e.source, e.target, e.content FROM edges e WHERE e.expired_at IS NULL AND e.embedding IS NULL",
             (),
         )
         .await
@@ -1136,6 +1138,34 @@ async fn query_edges_by_vector_async(
         Ok(rows) => Ok(rows),
         Err(_) => query_edges_scan(conn, json_str, limit_value).await,
     }
+}
+
+// Live loops nearest to the query embedding — the similarity trigger for the
+// Open loops block. Loops are excluded from ranked TOP_K, so without this a
+// loop whose fresh anchor has no other edges could never surface contextually.
+pub fn load_loops_by_similarity(
+    conn: &Connection,
+    query_vec: &[f64],
+    max_distance: f64,
+    cap: usize,
+) -> Result<Vec<OpenLoop>, Box<dyn Error + Send + Sync>> {
+    runtime().block_on(load_loops_by_similarity_async(conn, query_vec, max_distance, cap))
+}
+
+async fn load_loops_by_similarity_async(
+    conn: &Connection,
+    query_vec: &[f64],
+    max_distance: f64,
+    cap: usize,
+) -> Result<Vec<OpenLoop>, Box<dyn Error + Send + Sync>> {
+    let json_str = vector32_json(query_vec)?;
+    let query = format!(
+        "{OPEN_LOOP_SELECT} WHERE n.node_type = 'loop' AND e.memory_type = 'semantic' AND e.content LIKE 'open loop:%' AND e.expired_at IS NULL AND e.embedding IS NOT NULL AND vector_distance_cos(e.embedding, vector32(?1)) <= ?2 ORDER BY vector_distance_cos(e.embedding, vector32(?1)) ASC LIMIT ?3"
+    );
+    let rows = conn
+        .query(&query, params![json_str, max_distance, cap as i64])
+        .await?;
+    collect_open_loops(rows).await
 }
 
 async fn query_edges_ann(
@@ -2222,11 +2252,10 @@ mod tests {
                 )
                 .await;
         });
+        // Loop edges ARE embedded (the similarity trigger needs them)…
         let pending = block_on(load_unembedded_edges_async(&conn));
-        assert_eq!(
-            pending,
-            vec![("ordinary".into(), "topic".into(), "ordinary belief".into())]
-        );
+        assert_eq!(pending.len(), 2);
+        // …but stay excluded from ranked retrieval.
         let semantic = block_on(load_all_edges_semantic_async(&conn));
         assert_eq!(semantic.len(), 1);
         assert_eq!(semantic[0].0, "ordinary");

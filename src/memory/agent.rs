@@ -1687,8 +1687,11 @@ fn live_loop_anchors(
     Ok(anchors)
 }
 
+// Scribe included deliberately: intention statements ("remind me if I
+// don't…") legitimately classify as task turns — same seat-symmetry lesson as
+// record_outcome. Dream and ingest stay denied: they cannot own intentions.
 fn loop_seat_allowed(actor_id: &str) -> bool {
-    matches!(actor_id, "extract" | "consolidate")
+    matches!(actor_id, "scribe" | "extract" | "consolidate")
 }
 
 struct ExpireEdgeCall {
@@ -2728,10 +2731,13 @@ mod tests {
         }
 
         #[test]
-        fn scribe_dream_and_ingest_seats_cannot_mutate_loops() {
+        // Scribe is allowed: intention statements legitimately classify as
+        // task turns (live evidence 2026-07-12), so loop tools are
+        // seat-symmetric like record_outcome. Dream/ingest stay denied.
+        fn dream_and_ingest_seats_cannot_mutate_loops() {
             let conn = db::block_on(harness());
             write_anchor(&conn, "home-server");
-            for phase in ["scribe", "consolidation", "ingest"] {
+            for phase in ["consolidation", "ingest"] {
                 let opened = apply(&conn, phase, open("check the unit", "home-server", ""));
                 let closed = apply(&conn, phase, close("check-the-unit", "done", "finished"));
                 assert!(opened.contains("denied"), "{phase}: {opened}");
@@ -2741,6 +2747,11 @@ mod tests {
                 unreachable!("node lookup succeeds")
             };
             assert!(node.is_none());
+
+            let opened = apply(&conn, "scribe", open("check the unit", "home-server", ""));
+            assert!(opened.contains("open_loop:"), "{opened}");
+            let closed = apply(&conn, "scribe", close("check-the-unit", "done", "finished"));
+            assert!(closed.contains("close_loop:"), "{closed}");
         }
 
         #[test]
