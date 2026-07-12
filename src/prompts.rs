@@ -38,6 +38,7 @@ The "Beliefs injected into this turn" section, when present, is what memory retr
 ## Prospective memory — open loops
 
 - Use open_loop for a real intended future action or expected event stated by the user or assistant ("remind me", "next time", "I'll send it tomorrow"). Be conservative: ordinary future-tense discussion is not an intention.
+- ONE loop per intention. Before open_loop, check the loops you already opened this response and the Open loops section: never open a second loop that restates an existing one in different words.
 - Choose the topic whose appearance should trigger the intention as anchor. It must already exist, or emit its upsert_node before open_loop. Resolve a relative due date to YYYY-MM-DD; omit due for a purely contextual trigger.
 - Use close_loop only when this exchange confirms the intention was done, deliberately abandoned, or an expected event did not happen. Never infer absence from silence or auto-close merely because a due date passed.
 - No respond call; always set date=today on every upsert_edge.
@@ -115,6 +116,14 @@ record_outcome — record the game's end result, from your (the assistant's) per
 - result: "win" | "loss" | "draw"
 - comment: brief reason (optional)
 {"tool":"record_outcome","args":{"result":"loss","comment":"resigned after losing the queen"}}
+
+open_loop — remember one concrete intended future action or expected event ("remind me", "I'll send it tomorrow"). NOT a move; never wrap an intention in record_move.
+- intention: one sentence; anchor: existing topic node (emit its upsert_node first if needed); due: optional YYYY-MM-DD, empty for contextual-only
+- ONE loop per intention — never open a second loop restating an existing one
+{"tool":"open_loop","args":{"intention":"ask the user whether the systemd unit file arrived","anchor":"systemd-unit-file","due":"2026-07-15"}}
+
+close_loop — close a live loop only when this exchange confirms it: done, deliberately abandoned, or the expected event confirmed missing. Never from silence or a passed deadline alone.
+{"tool":"close_loop","args":{"loop":"kebab-loop-id","resolution":"done | abandoned | absence","note":"brief evidence"}}
 
 upsert_node — create or update a node (non-move task facts only).
 - type "entity": body="" date="" always
@@ -777,14 +786,14 @@ mod tests {
     }
 
     #[test]
-    fn heavy_prompt_documents_loops_but_scribe_prompt_does_not() {
+    fn heavy_and_scribe_prompts_both_document_loops() {
         let heavy = prompt_with(None);
         assert!(heavy.contains("## Prospective memory — open loops"));
         assert!(heavy.contains(r#"{"tool":"open_loop""#));
         assert!(heavy.contains(r#"{"tool":"close_loop""#));
         let scribe = build_scribe_prompt("user", "assistant");
-        assert!(!scribe.contains("open_loop"));
-        assert!(!scribe.contains("close_loop"));
+        assert!(scribe.contains(r#"{"tool":"open_loop""#));
+        assert!(scribe.contains(r#"{"tool":"close_loop""#));
     }
 
     #[test]

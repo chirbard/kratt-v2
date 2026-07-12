@@ -173,7 +173,7 @@ pub(crate) fn build_memory_block(
     let started = Instant::now();
     let selection = memory::select_semantic_edges_routed(embed, query, session_id);
     let edges = selection.edges;
-    let sections = load_memory_sections(&edges, session_id);
+    let sections = load_memory_sections(&edges, session_id, &selection.routing.routing_vector);
     let events = build_memory_events((session_id, turn_id), &selection.routing, &edges, &sections);
     // Best-effort bookkeeping: a failed ledger write must never abort the turn.
     if let Err(err) = memory::record_events(&events) {
@@ -193,11 +193,15 @@ pub(crate) fn build_memory_block(
     }
 }
 
-fn load_memory_sections(edges: &[memory::SemanticEdge], session_id: &str) -> MemorySections {
+fn load_memory_sections(
+    edges: &[memory::SemanticEdge],
+    session_id: &str,
+    query_vec: &[f64],
+) -> MemorySections {
     let anchor_ids = collect_anchor_ids(edges);
     let today = crate::timeutil::today_iso();
     MemorySections {
-        loops: memory::load_open_loops(&anchor_ids, &today),
+        loops: memory::load_open_loops(&anchor_ids, &today, query_vec),
         knowledge: memory::load_game_knowledge(session_id),
         chain: memory::load_task_chain(session_id),
     }
