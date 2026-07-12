@@ -144,6 +144,17 @@ upsert_edge — create or update a directed edge (non-move task facts only; neve
 - memory_type: always "episodic" for scribe writes
 {"tool":"upsert_edge","args":{"source":"string","target":"string","content":"string","stability":0.3,"confidence":1.0,"importance":0.5,"subject":false,"date":"YYYY-MM-DD","memory_type":"episodic"}}"#;
 
+pub const REACTION_TOOL_DEFINITION: &str = r#"record_reaction — emit only when the user's message is an immediate evaluative reaction to your previous answer: praise ("perfect", "wow, exactly right") or rejection ("that was stupid", "no, completely wrong", "useless"). A plain "thanks", politeness, or general mood is NOT a reaction. A correction with content ("no, Fable is from Anthropic") is extraction material, not only a reaction: record the correction as facts; also emit record_reaction only if it clearly evaluates answer quality. Be conservative: false negatives are cheap; false positives poison credit. Never use it for an older answer.
+- reaction: "positive" | "negative"
+- comment: brief quote or paraphrase of the reaction
+{"tool":"record_reaction","args":{"reaction":"negative","comment":"called the answer useless"}}"#;
+
+fn append_tool_definitions(prompt: &mut String, definitions: &str) {
+    prompt.push_str(definitions);
+    prompt.push_str("\n\n");
+    prompt.push_str(REACTION_TOOL_DEFINITION);
+}
+
 pub fn build_scribe_prompt(user_msg: &str, assistant_msg: &str) -> String {
     let mut prompt = String::new();
     prompt.push_str(SCRIBE_EXPLANATION);
@@ -152,7 +163,7 @@ pub fn build_scribe_prompt(user_msg: &str, assistant_msg: &str) -> String {
     prompt.push_str("**\n\n");
     prompt.push_str(JSON_OUTPUT_RULES);
     prompt.push_str("\n\n");
-    prompt.push_str(SCRIBE_TOOL_DEFINITIONS);
+    append_tool_definitions(&mut prompt, SCRIBE_TOOL_DEFINITIONS);
     prompt.push_str("\n\n## Exchange to record\n\nUser: ");
     prompt.push_str(user_msg);
     prompt.push_str("\nAssistant: ");
@@ -257,7 +268,7 @@ pub fn build_agent_prompt(input: &AgentPrompt) -> String {
     prompt.push_str("\n\n");
     prompt.push_str(JSON_OUTPUT_RULES);
     prompt.push_str("\n\n");
-    prompt.push_str(TOOL_DEFINITIONS);
+    append_tool_definitions(&mut prompt, TOOL_DEFINITIONS);
     prompt.push_str("\n\n");
     prompt.push_str(MEMORY_RULES);
     prompt.push_str("\n\n## Current memory state\n\n");
@@ -312,7 +323,7 @@ pub fn build_continue_prompt(
     prompt.push_str("\n\n");
     prompt.push_str(JSON_OUTPUT_RULES);
     prompt.push_str("\n\n");
-    prompt.push_str(TOOL_DEFINITIONS);
+    append_tool_definitions(&mut prompt, TOOL_DEFINITIONS);
     prompt.push_str("\n\n");
     prompt.push_str(MEMORY_RULES);
     prompt.push_str("\n\n## Already applied\n\n");
@@ -445,7 +456,7 @@ pub fn build_scribe_continue_prompt(
     prompt.push_str("**\n\n");
     prompt.push_str(JSON_OUTPUT_RULES);
     prompt.push_str("\n\n");
-    prompt.push_str(SCRIBE_TOOL_DEFINITIONS);
+    append_tool_definitions(&mut prompt, SCRIBE_TOOL_DEFINITIONS);
     prompt.push_str("\n\n## Already recorded\n\n");
     if applied.is_empty() {
         prompt.push_str("(nothing)");
@@ -585,7 +596,7 @@ pub fn build_ingest_extract_prompt(graph_toon: &str, chunk_text: &str) -> String
     prompt.push_str("\n\n");
     prompt.push_str(JSON_OUTPUT_RULES);
     prompt.push_str("\n\n");
-    prompt.push_str(TOOL_DEFINITIONS);
+    append_tool_definitions(&mut prompt, TOOL_DEFINITIONS);
     prompt.push_str("\n\n## Relevant memory subgraph\n\n");
     prompt.push_str(graph_toon);
     prompt.push_str("\n\n## Document chunk to extract\n\n");
@@ -628,7 +639,7 @@ pub fn build_dream_prompt(explanation: &str, toon: &str, context: Option<&str>) 
     prompt.push_str("**\n\n");
     prompt.push_str(JSON_OUTPUT_RULES);
     prompt.push_str("\n\n");
-    prompt.push_str(TOOL_DEFINITIONS);
+    append_tool_definitions(&mut prompt, TOOL_DEFINITIONS);
     prompt.push_str("\n\n");
     prompt.push_str(MEMORY_RULES);
     prompt.push_str("\n\n## Current memory graph\n\n");
@@ -802,6 +813,17 @@ mod tests {
         let scribe = build_scribe_prompt("user", "assistant");
         assert!(scribe.contains(r#"{"tool":"open_loop""#));
         assert!(scribe.contains(r#"{"tool":"close_loop""#));
+    }
+
+    #[test]
+    fn heavy_and_scribe_prompts_share_the_conservative_reaction_tool() {
+        let heavy = prompt_with(None);
+        let scribe = build_scribe_prompt("user", "assistant");
+        for prompt in [heavy, scribe] {
+            assert!(prompt.contains(r#"{"tool":"record_reaction""#));
+            assert!(prompt.contains("A plain \"thanks\""));
+            assert!(prompt.contains("false positives poison credit"));
+        }
     }
 
     #[test]

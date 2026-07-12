@@ -650,6 +650,10 @@ fn apply_dream_call<'scope, 'policy>(
             "record_outcome denied: record_outcome is a scribe tool".to_string(),
             false,
         )),
+        ToolCall::RecordReaction { .. } => Ok((
+            "record_reaction denied: record_reaction is not a dreaming tool".to_string(),
+            false,
+        )),
         ToolCall::OpenLoop { .. } => Ok((
             "open_loop denied: open_loop is a heavy tool".to_string(),
             false,
