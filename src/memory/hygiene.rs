@@ -498,6 +498,26 @@ mod tests {
     }
 
     #[test]
+    fn live_loop_edge_survives_hygiene_pass() {
+        let conn = db::block_on(harness());
+        db::block_on(add_node(&conn, "ask-about-backup", "loop"));
+        db::block_on(add_node(&conn, "backup", "entity"));
+        db::block_on(add_edge(&conn, "ask-about-backup", "backup", None));
+        let _ = db::block_on(conn.execute(
+            "UPDATE edges SET confidence = 0.9, stability = 0.9, importance = 1.0 WHERE source = 'ask-about-backup'",
+            (),
+        ));
+
+        let report = hygiene(&conn);
+        assert_eq!(report.expired_orphan_edges, 0);
+        assert!(db::block_on(expired_at_of(&conn, "ask-about-backup", "backup")).is_none());
+        assert_eq!(
+            db::block_on(edge_weights(&conn, "ask-about-backup", "backup")),
+            (0.9, 0.9, 1.0)
+        );
+    }
+
+    #[test]
     fn out_of_range_weights_are_clamped_into_the_unit_interval() {
         let conn = db::block_on(harness());
         db::block_on(add_node(&conn, "alice", "entity"));

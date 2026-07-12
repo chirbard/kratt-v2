@@ -7,6 +7,7 @@ use tokio::runtime::Runtime;
 use turso::{Builder, Connection, Database, Value, params};
 
 use super::graph::{Edge, Graph, Node, load_from_toon, normalize_id};
+use super::loops::OpenLoop;
 
 use crate::paths;
 
@@ -1075,7 +1076,7 @@ pub fn load_unembedded_edges() -> Vec<(String, String, String)> {
 async fn load_unembedded_edges_async(conn: &Connection) -> Vec<(String, String, String)> {
     let Ok(mut rows) = conn
         .query(
-            "SELECT source, target, content FROM edges WHERE expired_at IS NULL AND embedding IS NULL",
+            "SELECT e.source, e.target, e.content FROM edges e LEFT JOIN nodes n ON n.id = e.source WHERE e.expired_at IS NULL AND e.embedding IS NULL AND (n.node_type IS NULL OR n.node_type != 'loop')",
             (),
         )
         .await
@@ -1144,7 +1145,7 @@ async fn query_edges_ann(
 ) -> Result<Vec<SemanticEdgeRow>, Box<dyn Error + Send + Sync>> {
     execute_semantic_query(
         conn,
-        "SELECT e.source, e.target, e.content, e.stability, e.confidence, e.importance, e.subject, e.date, e.occurred_at, e.expired_at, e.memory_type, e.origin_session, vector_extract(e.embedding) FROM vector_top_k('edges_vec', vector32(?1), ?2) AS vt JOIN edges AS e ON e.rowid = vt.id WHERE e.expired_at IS NULL",
+        "SELECT e.source, e.target, e.content, e.stability, e.confidence, e.importance, e.subject, e.date, e.occurred_at, e.expired_at, e.memory_type, e.origin_session, vector_extract(e.embedding) FROM vector_top_k('edges_vec', vector32(?1), ?2) AS vt JOIN edges AS e ON e.rowid = vt.id LEFT JOIN nodes AS n ON n.id = e.source WHERE e.expired_at IS NULL AND (n.node_type IS NULL OR n.node_type != 'loop')",
         json_str,
         limit,
     )
@@ -1158,7 +1159,7 @@ async fn query_edges_scan(
 ) -> Result<Vec<SemanticEdgeRow>, Box<dyn Error + Send + Sync>> {
     execute_semantic_query(
         conn,
-        "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session, vector_extract(embedding) FROM edges WHERE embedding IS NOT NULL AND expired_at IS NULL ORDER BY vector_distance_cos(embedding, vector32(?1)) LIMIT ?2",
+        "SELECT e.source, e.target, e.content, e.stability, e.confidence, e.importance, e.subject, e.date, e.occurred_at, e.expired_at, e.memory_type, e.origin_session, vector_extract(e.embedding) FROM edges e LEFT JOIN nodes n ON n.id = e.source WHERE e.embedding IS NOT NULL AND e.expired_at IS NULL AND (n.node_type IS NULL OR n.node_type != 'loop') ORDER BY vector_distance_cos(e.embedding, vector32(?1)) LIMIT ?2",
         json_str,
         limit,
     )
@@ -1212,7 +1213,7 @@ pub fn load_all_edges_semantic() -> Vec<SemanticEdgeRow> {
 async fn load_all_edges_semantic_async(conn: &Connection) -> Vec<SemanticEdgeRow> {
     let Ok(mut rows) = conn
         .query(
-            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session, CASE WHEN embedding IS NULL THEN NULL ELSE vector_extract(embedding) END FROM edges WHERE expired_at IS NULL",
+            "SELECT e.source, e.target, e.content, e.stability, e.confidence, e.importance, e.subject, e.date, e.occurred_at, e.expired_at, e.memory_type, e.origin_session, CASE WHEN e.embedding IS NULL THEN NULL ELSE vector_extract(e.embedding) END FROM edges e LEFT JOIN nodes n ON n.id = e.source WHERE e.expired_at IS NULL AND (n.node_type IS NULL OR n.node_type != 'loop')",
             (),
         )
         .await
@@ -1462,6 +1463,82 @@ pub fn load_oldest_open_curiosity_note() -> Option<(String, String, String)> {
             text(row.get_value(2).ok()?),
         ))
     })
+}
+
+const OPEN_LOOP_SELECT: &str = "SELECT e.source, e.target, n.body, n.date FROM nodes n JOIN edges e ON e.source = n.id JOIN nodes anchor ON anchor.id = e.target";
+
+pub fn load_loops_for_anchors(
+    conn: &Connection,
+    anchor_ids: &[String],
+    today: &str,
+    cap: usize,
+) -> Result<Vec<OpenLoop>, Box<dyn Error + Send + Sync>> {
+    runtime().block_on(load_loops_for_anchors_async(conn, anchor_ids, today, cap))
+}
+
+async fn load_loops_for_anchors_async(
+    conn: &Connection,
+    anchor_ids: &[String],
+    today: &str,
+    cap: usize,
+) -> Result<Vec<OpenLoop>, Box<dyn Error + Send + Sync>> {
+    let (query, values) = loop_anchor_query(anchor_ids, today, cap);
+    let rows = conn.query(&query, turso::params_from_iter(values)).await?;
+    collect_open_loops(rows).await
+}
+
+fn loop_anchor_query(anchor_ids: &[String], today: &str, cap: usize) -> (String, Vec<Value>) {
+    let mut values = vec![Value::Text(today.to_string())];
+    let mut placeholders = Vec::new();
+    for anchor_id in anchor_ids {
+        values.push(Value::Text(anchor_id.clone()));
+        placeholders.push(format!("?{}", values.len()));
+    }
+    let anchor_filter = if placeholders.is_empty() {
+        String::new()
+    } else {
+        format!(" OR e.target IN ({})", placeholders.join(", "))
+    };
+    values.push(Value::Integer(cap as i64));
+    let limit_param = values.len();
+    let query = format!(
+        "{OPEN_LOOP_SELECT} WHERE n.node_type = 'loop' AND e.memory_type = 'semantic' AND e.content LIKE 'open loop:%' AND e.expired_at IS NULL AND ((n.date != '' AND n.date <= ?1){anchor_filter}) ORDER BY e.date ASC, e.rowid ASC LIMIT ?{limit_param}"
+    );
+    (query, values)
+}
+
+#[allow(dead_code)]
+pub fn load_due_loops(
+    conn: &Connection,
+    today: &str,
+) -> Result<Vec<OpenLoop>, Box<dyn Error + Send + Sync>> {
+    runtime().block_on(load_due_loops_async(conn, today))
+}
+
+pub(super) async fn load_due_loops_async(
+    conn: &Connection,
+    today: &str,
+) -> Result<Vec<OpenLoop>, Box<dyn Error + Send + Sync>> {
+    let query = format!(
+        "{OPEN_LOOP_SELECT} WHERE n.node_type = 'loop' AND n.date != '' AND n.date <= ?1 AND e.memory_type = 'semantic' AND e.content LIKE 'open loop:%' AND e.expired_at IS NULL ORDER BY n.date ASC, e.rowid ASC"
+    );
+    let rows = conn.query(&query, params![today]).await?;
+    collect_open_loops(rows).await
+}
+
+async fn collect_open_loops(
+    mut rows: turso::Rows,
+) -> Result<Vec<OpenLoop>, Box<dyn Error + Send + Sync>> {
+    let mut loops = Vec::new();
+    while let Some(row) = rows.next().await? {
+        loops.push(OpenLoop {
+            source: normalize_id(&text(row.get_value(0)?)),
+            target: normalize_id(&text(row.get_value(1)?)),
+            intention: text(row.get_value(2)?),
+            due: text(row.get_value(3)?),
+        });
+    }
+    Ok(loops)
 }
 
 pub fn insert_message(session_id: &str, role: &str, content: &str, created_at: &str) -> String {
@@ -1834,10 +1911,13 @@ pub(crate) fn int(val: Value) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{block_on, load_game_edges, load_session_game, load_task_chain};
+    use super::{
+        block_on, load_all_edges_semantic_async, load_due_loops, load_game_edges,
+        load_loops_for_anchors, load_session_game, load_task_chain, load_unembedded_edges_async,
+    };
     use turso::{Builder, Connection, params};
 
-    const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', PRIMARY KEY (source, target))";
+    const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', embedding BLOB, PRIMARY KEY (source, target))";
     const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
 
     async fn harness() -> Connection {
@@ -1868,6 +1948,116 @@ mod tests {
             )
             .await;
         conn
+    }
+
+    async fn loop_harness() -> Connection {
+        let conn = harness().await;
+        let _ = conn.execute(NODES_DDL, ()).await;
+        conn
+    }
+
+    async fn insert_loop(
+        conn: &Connection,
+        loop_id: &str,
+        anchor_id: &str,
+        details: (&str, &str, &str, Option<&str>),
+    ) {
+        let (intention, due, edge_date, expired_at) = details;
+        let _ = conn
+            .execute(
+                "INSERT OR IGNORE INTO nodes (id, node_type) VALUES (?1, 'entity')",
+                params![anchor_id],
+            )
+            .await;
+        let _ = conn
+            .execute(
+                "INSERT INTO nodes (id, node_type, body, date) VALUES (?1, 'loop', ?2, ?3)",
+                params![loop_id, intention, due],
+            )
+            .await;
+        let content = format!("open loop: {intention}");
+        let _ = conn
+            .execute(
+                "INSERT INTO edges (source, target, content, stability, confidence, importance, memory_type, date, expired_at) VALUES (?1, ?2, ?3, 0.9, 0.9, 1.0, 'semantic', ?4, ?5)",
+                params![loop_id, anchor_id, content.as_str(), edge_date, expired_at],
+            )
+            .await;
+    }
+
+    async fn seed_anchor_loop_cases(conn: &Connection) {
+        let cases = [
+            (
+                "loop-context",
+                "home-server",
+                ("ask about the service", "", "2026-07-02", None),
+            ),
+            (
+                "loop-due",
+                "file-transfer",
+                (
+                    "check whether the file arrived",
+                    "2026-07-10",
+                    "2026-07-01",
+                    None,
+                ),
+            ),
+            (
+                "loop-future",
+                "other-topic",
+                ("ask about the future", "2026-07-12", "2026-07-03", None),
+            ),
+            (
+                "loop-closed",
+                "home-server",
+                (
+                    "closed intention",
+                    "",
+                    "2026-06-30",
+                    Some("2026-07-09T12:00:00Z"),
+                ),
+            ),
+        ];
+        for (loop_id, anchor_id, details) in cases {
+            insert_loop(conn, loop_id, anchor_id, details).await;
+        }
+    }
+
+    async fn seed_due_loop_cases(conn: &Connection) {
+        let cases = [
+            (
+                "loop-past",
+                "past-topic",
+                ("past intention", "2026-07-10", "2026-07-01", None),
+            ),
+            (
+                "loop-today",
+                "today-topic",
+                ("today intention", "2026-07-11", "2026-07-02", None),
+            ),
+            (
+                "loop-context",
+                "context-topic",
+                ("context only", "", "2026-07-03", None),
+            ),
+            (
+                "loop-future",
+                "future-topic",
+                ("future intention", "2026-07-12", "2026-07-04", None),
+            ),
+            (
+                "loop-closed",
+                "closed-topic",
+                (
+                    "closed intention",
+                    "2026-07-09",
+                    "2026-07-05",
+                    Some("2026-07-10T00:00:00Z"),
+                ),
+            ),
+        ];
+        for (loop_id, anchor_id, details) in cases {
+            insert_loop(conn, loop_id, anchor_id, details).await;
+        }
     }
 
     async fn insert_game_edge(
@@ -1903,7 +2093,12 @@ mod tests {
         let conn = block_on(game_harness());
         block_on(insert_game_edge(&conn, "rule-low", 0.4, None));
         block_on(insert_game_edge(&conn, "rule-high", 0.9, None));
-        block_on(insert_game_edge(&conn, "rule-gone", 0.95, Some("2026-01-01")));
+        block_on(insert_game_edge(
+            &conn,
+            "rule-gone",
+            0.95,
+            Some("2026-01-01"),
+        ));
         let Ok(edges) = load_game_edges(&conn, "game-chess", 60) else {
             unreachable!("edges load")
         };
@@ -1922,6 +2117,119 @@ mod tests {
         };
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].target, "rule-b");
+    }
+
+    #[test]
+    fn loop_loader_matches_anchors_includes_due_and_excludes_closed() {
+        let conn = block_on(loop_harness());
+        block_on(seed_anchor_loop_cases(&conn));
+
+        let anchors = vec!["home-server".to_string()];
+        let Ok(loops) = load_loops_for_anchors(&conn, &anchors, "2026-07-11", 5) else {
+            unreachable!("loops load")
+        };
+        assert_eq!(loops.len(), 2);
+        assert_eq!(loops[0].source, "loop-due", "oldest loop comes first");
+        assert_eq!(loops[1].source, "loop-context");
+    }
+
+    #[test]
+    fn loop_loader_cap_keeps_oldest_edge_dates_first() {
+        let conn = block_on(loop_harness());
+        block_on(insert_loop(
+            &conn,
+            "loop-third",
+            "topic-third",
+            ("third", "2026-07-08", "2026-07-10", None),
+        ));
+        block_on(insert_loop(
+            &conn,
+            "loop-first",
+            "topic-first",
+            ("first", "2026-07-10", "2026-07-08", None),
+        ));
+        block_on(insert_loop(
+            &conn,
+            "loop-second",
+            "topic-second",
+            ("second", "2026-07-09", "2026-07-09", None),
+        ));
+
+        let Ok(loops) = load_loops_for_anchors(&conn, &[], "2026-07-11", 2) else {
+            unreachable!("loops load")
+        };
+        assert_eq!(loops.len(), 2);
+        assert_eq!(loops[0].source, "loop-first");
+        assert_eq!(loops[1].source, "loop-second");
+    }
+
+    #[test]
+    fn loop_loader_preserves_insertion_order_for_same_day() {
+        let conn = block_on(loop_harness());
+        block_on(insert_loop(
+            &conn,
+            "z-first",
+            "topic-first",
+            ("first", "2026-07-10", "2026-07-10", None),
+        ));
+        block_on(insert_loop(
+            &conn,
+            "a-second",
+            "topic-second",
+            ("second", "2026-07-10", "2026-07-10", None),
+        ));
+        let Ok(loops) = load_loops_for_anchors(&conn, &[], "2026-07-11", 1) else {
+            unreachable!("loops load")
+        };
+        assert_eq!(loops[0].source, "z-first");
+    }
+
+    #[test]
+    fn due_loop_loader_formats_only_live_due_loops() {
+        let conn = block_on(loop_harness());
+        block_on(seed_due_loop_cases(&conn));
+
+        let Ok(loops) = load_due_loops(&conn, "2026-07-11") else {
+            unreachable!("due loops load")
+        };
+        let mut displays = Vec::new();
+        for open_loop in &loops {
+            displays.push(open_loop.display());
+        }
+        assert_eq!(
+            displays,
+            vec![
+                "past intention (due 2026-07-10)",
+                "today intention (due 2026-07-11)"
+            ]
+        );
+    }
+
+    #[test]
+    fn ordinary_retrieval_excludes_loop_anchor_edges() {
+        let conn = block_on(loop_harness());
+        block_on(insert_loop(
+            &conn,
+            "loop-reminder",
+            "topic",
+            ("ask about the service", "", "2026-07-10", None),
+        ));
+        block_on(async {
+            let _ = conn
+                .execute(
+                    "INSERT INTO edges (source, target, content) VALUES ('ordinary', 'topic', 'ordinary belief')",
+                    (),
+                )
+                .await;
+        });
+        let pending = block_on(load_unembedded_edges_async(&conn));
+        assert_eq!(
+            pending,
+            vec![("ordinary".into(), "topic".into(), "ordinary belief".into())]
+        );
+        let semantic = block_on(load_all_edges_semantic_async(&conn));
+        assert_eq!(semantic.len(), 1);
+        assert_eq!(semantic[0].0, "ordinary");
     }
 
     async fn insert_ply(
@@ -1961,7 +2269,13 @@ mod tests {
     fn chain_excludes_expired_plies() {
         let conn = block_on(harness());
         block_on(insert_ply(&conn, "task-game-1", 1, "game-1", None));
-        block_on(insert_ply(&conn, "task-game-1", 2, "game-1", Some("2026-01-01")));
+        block_on(insert_ply(
+            &conn,
+            "task-game-1",
+            2,
+            "game-1",
+            Some("2026-01-01"),
+        ));
 
         let Ok(chain) = load_task_chain(&conn, "game-1", 240) else {
             unreachable!("chain loads")

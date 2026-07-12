@@ -159,6 +159,20 @@ pub(crate) enum ToolCall {
         result: String,
         comment: String,
     },
+    // Heavy-only prospective memory: open an intention against a contextual
+    // anchor. Code derives the loop id and fixed durability fields.
+    OpenLoop {
+        intention: String,
+        anchor: String,
+        due: String,
+    },
+    // Heavy-only lifecycle transition: expire the loop's live anchor edge and
+    // retain the resolution in rewritten_content.
+    CloseLoop {
+        loop_id: String,
+        resolution: String,
+        note: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,7 +213,9 @@ pub(crate) fn classify_reply_label(reply: &str) -> &'static str {
 // the replay report.
 pub(crate) fn describe_tool_call(call: &ToolCall) -> String {
     match call {
-        ToolCall::UpsertNode { name, node_type, .. } => {
+        ToolCall::UpsertNode {
+            name, node_type, ..
+        } => {
             format!("upsert_node {name} ({node_type})")
         }
         ToolCall::UpsertEdge { source, target, .. } => format!("upsert_edge {source} → {target}"),
@@ -212,6 +228,14 @@ pub(crate) fn describe_tool_call(call: &ToolCall) -> String {
         ToolCall::DefineTask { name, .. } => format!("define_task {name}"),
         ToolCall::RecordRule { rule } => format!("record_rule {rule}"),
         ToolCall::RecordOutcome { result, .. } => format!("record_outcome {result}"),
+        ToolCall::OpenLoop { intention, .. } => format!("open_loop {intention}"),
+        ToolCall::CloseLoop {
+            loop_id,
+            resolution,
+            ..
+        } => {
+            format!("close_loop {loop_id} ({resolution})")
+        }
     }
 }
 
@@ -326,7 +350,10 @@ impl<'run> AgentRun<'run> {
         // Before decay, so beliefs used this turn are not aged in the same pass.
         let injected = self.refresh_injected_clock(&conn)?;
         let graph = self.decayed_graph()?;
-        let ctx = PassCtx { llm: &self.seats.heavy, conn: &conn };
+        let ctx = PassCtx {
+            llm: &self.seats.heavy,
+            conn: &conn,
+        };
         let pre_extract_graph = graph.clone();
         let pre_extract_toon = toon::encode(&graph_to_json(&pre_extract_graph), None);
         let injected_toon = injected_toon(&injected);
@@ -342,8 +369,11 @@ impl<'run> AgentRun<'run> {
         });
         self.run_pass(&ctx, &heavy_pass("extract"), extract_prompt)?;
 
-        let consolidate_prompt =
-            self.consolidate_prompt(&pre_extract_graph, &pre_extract_toon, active_game.as_deref());
+        let consolidate_prompt = self.consolidate_prompt(
+            &pre_extract_graph,
+            &pre_extract_toon,
+            active_game.as_deref(),
+        );
         self.run_pass(&ctx, &heavy_pass("consolidate"), consolidate_prompt)?;
 
         let final_graph = db::load_graph();
@@ -455,7 +485,13 @@ impl<'run> AgentRun<'run> {
         );
         // A response may both apply calls and declare the pass finished.
         let done = tool_calls.is_empty() || says_done(&call_text);
-        match apply_tool_calls(self, ctx.conn, pass.phase, tool_calls, pass.default_memory_type) {
+        match apply_tool_calls(
+            self,
+            ctx.conn,
+            pass.phase,
+            tool_calls,
+            pass.default_memory_type,
+        ) {
             Ok(descriptions) => Ok(IterationOutcome { descriptions, done }),
             Err(err) => {
                 self.send_log(pass.phase, format!("error: {err}"));
@@ -730,6 +766,8 @@ fn parse_single_tool(obj: &serde_json::Value) -> Option<ToolCall> {
         "define_task" => parse_define_task(args),
         "record_rule" => parse_record_rule(args),
         "record_outcome" => parse_record_outcome(args),
+        "open_loop" => parse_open_loop(args),
+        "close_loop" => parse_close_loop(args),
         _ => None,
     }
 }
@@ -982,6 +1020,32 @@ fn parse_record_outcome(args: &serde_json::Value) -> Option<ToolCall> {
     })
 }
 
+fn parse_open_loop(args: &serde_json::Value) -> Option<ToolCall> {
+    let intention = json_str(args, "intention");
+    let anchor = json_str(args, "anchor");
+    if intention.is_empty() || anchor.is_empty() {
+        return None;
+    }
+    Some(ToolCall::OpenLoop {
+        intention,
+        anchor,
+        due: json_str(args, "due"),
+    })
+}
+
+fn parse_close_loop(args: &serde_json::Value) -> Option<ToolCall> {
+    let loop_id = json_str(args, "loop");
+    let resolution = json_str(args, "resolution");
+    if loop_id.is_empty() || !matches!(resolution.as_str(), "done" | "abandoned" | "absence") {
+        return None;
+    }
+    Some(ToolCall::CloseLoop {
+        loop_id,
+        resolution,
+        note: json_str(args, "note"),
+    })
+}
+
 // Accepts both "a → b" and "a->b" spellings and normalizes both endpoints.
 fn parse_support_ref(text: &str) -> Option<(String, String)> {
     let (raw_source, raw_target) = split_support_ref(text)?;
@@ -1116,6 +1180,9 @@ pub(crate) fn apply_tool_call<'scope>(
     options: &ApplyToolOptions<'scope>,
     events: &mut Vec<Event>,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
+    if tool_call_touches_loop(conn, &call)? {
+        return Ok("mutation denied: loop lifecycle requires open_loop or close_loop".to_string());
+    }
     match call {
         ToolCall::UpsertNode { name, node_type, body, date } =>
             apply_upsert_node(conn, name, node_type, body, date),
@@ -1139,6 +1206,10 @@ pub(crate) fn apply_tool_call<'scope>(
             apply_record_rule_call(conn, options, events, rule),
         ToolCall::RecordOutcome { result, comment } =>
             apply_record_outcome_call(conn, options, RecordOutcomeCall { result, comment }),
+        ToolCall::OpenLoop { intention, anchor, due } =>
+            apply_open_loop_call(conn, options, events, OpenLoopCall { intention, anchor, due }),
+        ToolCall::CloseLoop { loop_id, resolution, note } =>
+            apply_close_loop_call(conn, options, events, CloseLoopCall { loop_id, resolution, note }),
     }
 }
 
@@ -1188,7 +1259,10 @@ fn apply_record_move_call<'scope>(
         origin_session: session_id,
     };
     apply_upsert_edge(conn, edge, options, events)?;
-    Ok(format!("record_move: ply {ply} ({actor}) {}", call.move_text))
+    Ok(format!(
+        "record_move: ply {ply} ({actor}) {}",
+        call.move_text
+    ))
 }
 
 // A game turn has exactly two sides: user = the opponent's move, assistant =
@@ -1285,7 +1359,13 @@ fn apply_record_rule_call<'scope>(
         return Ok("record_rule denied: define_task first".to_string());
     };
     let rule_id = normalize_id(&rule);
-    apply_upsert_node(conn, rule_id.clone(), "fact".to_string(), rule.clone(), String::new())?;
+    apply_upsert_node(
+        conn,
+        rule_id.clone(),
+        "fact".to_string(),
+        rule.clone(),
+        String::new(),
+    )?;
     let edge = Edge {
         source: game_id,
         target: rule_id,
@@ -1324,9 +1404,7 @@ fn apply_record_outcome_call<'scope>(
     call: RecordOutcomeCall,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
     if !rule_seat_allowed(&options.actor.actor_id) {
-        return Ok(
-            "record_outcome denied: record_outcome is a scribe or heavy tool".to_string(),
-        );
+        return Ok("record_outcome denied: record_outcome is a scribe or heavy tool".to_string());
     }
     let session_id = options.context.session_id.clone();
     let hub_id = normalize_id(&format!("task-{session_id}"));
@@ -1353,6 +1431,264 @@ fn outcome_score(result: &str) -> f64 {
         "loss" => -1.0,
         _ => 0.0,
     }
+}
+
+#[allow(clippy::too_many_lines)]
+pub(super) fn tool_call_touches_loop(
+    conn: &Connection,
+    call: &ToolCall,
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    match call {
+        ToolCall::UpsertNode {
+            name, node_type, ..
+        } => Ok(node_type == "loop" || node_is_loop(conn, name)?),
+        ToolCall::DeleteNode { name } => node_or_neighbor_is_loop(conn, name),
+        ToolCall::UpsertEdge { source, target, .. }
+        | ToolCall::DeleteEdge { source, target }
+        | ToolCall::ExpireEdge { source, target, .. }
+        | ToolCall::PromoteEdge { source, target }
+        | ToolCall::GistEdge { source, target, .. } => edge_touches_loop(conn, source, target),
+        ToolCall::RecordMove { .. }
+        | ToolCall::DefineTask { .. }
+        | ToolCall::RecordRule { .. }
+        | ToolCall::RecordOutcome { .. }
+        | ToolCall::OpenLoop { .. }
+        | ToolCall::CloseLoop { .. } => Ok(false),
+    }
+}
+
+fn edge_touches_loop(
+    conn: &Connection,
+    source: &str,
+    target: &str,
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    Ok(node_is_loop(conn, source)? || node_is_loop(conn, target)?)
+}
+
+fn node_is_loop(conn: &Connection, node_id: &str) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    let normalized = normalize_id(node_id);
+    let Some(node) = db::load_node(conn, &normalized)? else {
+        return Ok(false);
+    };
+    Ok(node.node_type == "loop")
+}
+
+fn node_or_neighbor_is_loop(
+    conn: &Connection,
+    node_id: &str,
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    if node_is_loop(conn, node_id)? {
+        return Ok(true);
+    }
+    let normalized = normalize_id(node_id);
+    let edges = db::load_edges_for_node(conn, &normalized)?;
+    for edge in edges {
+        if edge_touches_loop(conn, &edge.source, &edge.target)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+struct OpenLoopCall {
+    intention: String,
+    anchor: String,
+    due: String,
+}
+
+fn apply_open_loop_call<'scope>(
+    conn: &Connection,
+    options: &ApplyToolOptions<'scope>,
+    events: &mut Vec<Event>,
+    call: OpenLoopCall,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    if !loop_seat_allowed(&options.actor.actor_id) {
+        return Ok("open_loop denied: open_loop is a heavy tool".to_string());
+    }
+    let anchor_id = normalize_id(&call.anchor);
+    let Some(anchor_node) = db::load_node(conn, &anchor_id)? else {
+        return Ok(format!("open_loop denied: anchor {anchor_id} not found"));
+    };
+    if anchor_node.node_type == "loop" {
+        return Ok(format!("open_loop denied: anchor {anchor_id} is a loop"));
+    }
+    let loop_id = normalize_id(&call.intention);
+    if let Some(reason) = open_loop_block_reason(conn, &loop_id, &anchor_id)? {
+        return Ok(format!("open_loop denied: {reason}"));
+    }
+    let due = validated_loop_due(call.due);
+    apply_upsert_node(
+        conn,
+        loop_id.clone(),
+        "loop".to_string(),
+        call.intention.clone(),
+        due,
+    )?;
+    let edge = open_loop_edge(&loop_id, &anchor_id, &call.intention);
+    apply_upsert_edge(conn, edge, options, events)?;
+    Ok(format!("open_loop: {loop_id} → {anchor_id}"))
+}
+
+fn open_loop_block_reason(
+    conn: &Connection,
+    loop_id: &str,
+    anchor_id: &str,
+) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+    if loop_id.is_empty() {
+        return Ok(Some("intention has an empty id".to_string()));
+    }
+    if loop_id == anchor_id {
+        return Ok(Some("loop and anchor resolve to the same id".to_string()));
+    }
+    if let Some(node) = db::load_node(conn, loop_id)?
+        && node.node_type != "loop"
+    {
+        return Ok(Some(format!("id {loop_id} belongs to a non-loop node")));
+    }
+    for edge in live_loop_anchors(conn, loop_id)? {
+        if edge.target != anchor_id {
+            return Ok(Some(format!(
+                "loop {loop_id} already has anchor {}",
+                edge.target
+            )));
+        }
+    }
+    Ok(None)
+}
+
+fn open_loop_edge(loop_id: &str, anchor_id: &str, intention: &str) -> Edge {
+    Edge {
+        source: loop_id.to_string(),
+        target: anchor_id.to_string(),
+        content: format!("open loop: {intention}"),
+        stability: 0.9,
+        confidence: 0.9,
+        importance: 1.0,
+        subject: false,
+        date: crate::prompts::today_iso(),
+        occurred_at: None,
+        expired_at: None,
+        memory_type: "semantic".to_string(),
+        origin_session: String::new(),
+    }
+}
+
+fn validated_loop_due(due: String) -> String {
+    if due.is_empty() || is_iso_date(&due) {
+        return due;
+    }
+    runlog::log(
+        "mem",
+        &format!("open_loop: ignored invalid due date '{due}'"),
+    );
+    String::new()
+}
+
+fn is_iso_date(date: &str) -> bool {
+    let bytes = date.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        if !matches!(idx, 4 | 7) && !bytes[idx].is_ascii_digit() {
+            return false;
+        }
+        idx += 1;
+    }
+    let Ok(year) = date[0..4].parse::<u32>() else {
+        return false;
+    };
+    let Ok(month) = date[5..7].parse::<u32>() else {
+        return false;
+    };
+    let Ok(day) = date[8..10].parse::<u32>() else {
+        return false;
+    };
+    year > 0 && month > 0 && month <= 12 && day > 0 && day <= days_in_month(year, month)
+}
+
+fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        _ => 0,
+    }
+}
+
+fn is_leap_year(year: u32) -> bool {
+    year.is_multiple_of(400) || (year.is_multiple_of(4) && !year.is_multiple_of(100))
+}
+
+struct CloseLoopCall {
+    loop_id: String,
+    resolution: String,
+    note: String,
+}
+
+fn apply_close_loop_call<'scope>(
+    conn: &Connection,
+    options: &ApplyToolOptions<'scope>,
+    events: &mut Vec<Event>,
+    call: CloseLoopCall,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    if !loop_seat_allowed(&options.actor.actor_id) {
+        return Ok("close_loop denied: close_loop is a heavy tool".to_string());
+    }
+    let loop_id = normalize_id(&call.loop_id);
+    let Some(node) = db::load_node(conn, &loop_id)? else {
+        return Ok(format!("close_loop denied: loop {loop_id} not found"));
+    };
+    if node.node_type != "loop" {
+        return Ok(format!("close_loop denied: {loop_id} is not a loop"));
+    }
+    let anchors = live_loop_anchors(conn, &loop_id)?;
+    if anchors.is_empty() {
+        return Ok(format!("close_loop denied: loop {loop_id} is not open"));
+    }
+    let rewritten_content = format!(
+        "{}: {} (closed {})",
+        call.resolution,
+        call.note,
+        crate::prompts::today_iso()
+    );
+    for edge in anchors {
+        apply_expire_edge(
+            conn,
+            ExpireEdgeCall {
+                source: edge.source,
+                target: edge.target,
+                rewritten_content: rewritten_content.clone(),
+            },
+            options,
+            events,
+        )?;
+    }
+    Ok(format!("close_loop: {loop_id} ({})", call.resolution))
+}
+
+fn live_loop_anchors(
+    conn: &Connection,
+    loop_id: &str,
+) -> Result<Vec<Edge>, Box<dyn Error + Send + Sync>> {
+    let edges = db::load_edges_for_node(conn, loop_id)?;
+    let mut anchors = Vec::new();
+    for edge in edges {
+        if edge.source == loop_id
+            && edge.expired_at.is_none()
+            && edge.memory_type == "semantic"
+            && edge.content.starts_with("open loop:")
+        {
+            anchors.push(edge);
+        }
+    }
+    Ok(anchors)
+}
+
+fn loop_seat_allowed(actor_id: &str) -> bool {
+    matches!(actor_id, "extract" | "consolidate")
 }
 
 struct ExpireEdgeCall {
@@ -1690,7 +2026,8 @@ mod tests {
         let pass = super::scribe_pass();
         let result = agent_run.drive_pass(&pass, "first prompt".to_string(), |_index, prompt| {
             iterations += 1;
-            let call_text = stream_collect(Arc::clone(&agent_run.seats.scribe), prompt, drop, drop)?;
+            let call_text =
+                stream_collect(Arc::clone(&agent_run.seats.scribe), prompt, drop, drop)?;
             let tool_calls = parse_tool_calls(&call_text);
             let done = tool_calls.is_empty() || says_done(&call_text);
             let mut descriptions = Vec::new();
@@ -2033,7 +2370,11 @@ mod tests {
             }
         }
 
-        fn edge(conn: &turso::Connection, source: &str, target: &str) -> crate::memory::graph::Edge {
+        fn edge(
+            conn: &turso::Connection,
+            source: &str,
+            target: &str,
+        ) -> crate::memory::graph::Edge {
             let Ok(Some(edge)) = db::load_edge(conn, source, target) else {
                 unreachable!("edge {source} → {target} exists")
             };
@@ -2044,7 +2385,11 @@ mod tests {
         fn define_task_creates_game_node_and_session_hub_link() {
             let conn = db::block_on(harness());
             let options = options_for_phase("scribe");
-            let description = apply(&conn, &options, define("Chess", "user White, replies move only"));
+            let description = apply(
+                &conn,
+                &options,
+                define("Chess", "user White, replies move only"),
+            );
             assert!(description.contains("chess"), "{description}");
             let Ok(Some(node)) = db::load_node(&conn, "game-chess") else {
                 unreachable!("game node exists")
@@ -2061,7 +2406,11 @@ mod tests {
         fn redefining_with_a_shorter_description_keeps_the_longer_body() {
             let conn = db::block_on(harness());
             let options = options_for_phase("scribe");
-            apply(&conn, &options, define("chess", "the long, detailed rules of the game"));
+            apply(
+                &conn,
+                &options,
+                define("chess", "the long, detailed rules of the game"),
+            );
             apply(&conn, &options, define("chess", "chess"));
             let Ok(Some(node)) = db::load_node(&conn, "game-chess") else {
                 unreachable!("game node exists")
@@ -2113,12 +2462,23 @@ mod tests {
         #[test]
         fn record_rule_is_allowed_from_scribe_and_heavy_but_denied_from_dream() {
             let conn = db::block_on(harness());
-            apply(&conn, &options_for_phase("scribe"), define("chess", "rules"));
+            apply(
+                &conn,
+                &options_for_phase("scribe"),
+                define("chess", "rules"),
+            );
             for phase in ["scribe", "extract", "consolidate"] {
                 let description = apply(&conn, &options_for_phase(phase), rule("shared rule"));
-                assert!(description.contains("record_rule"), "{phase}: {description}");
+                assert!(
+                    description.contains("record_rule"),
+                    "{phase}: {description}"
+                );
             }
-            let denied = apply(&conn, &options_for_phase("consolidation"), rule("shared rule"));
+            let denied = apply(
+                &conn,
+                &options_for_phase("consolidation"),
+                rule("shared rule"),
+            );
             assert!(denied.contains("denied"), "{denied}");
         }
 
@@ -2132,9 +2492,16 @@ mod tests {
         #[test]
         fn record_outcome_works_from_scribe_and_heavy_but_not_dream_or_ingest() {
             let conn = db::block_on(harness());
-            apply(&conn, &options_for_phase("scribe"), define("chess", "rules"));
+            apply(
+                &conn,
+                &options_for_phase("scribe"),
+                define("chess", "rules"),
+            );
             let description = apply(&conn, &options_for_phase("scribe"), outcome("loss"));
-            assert!(description.contains("loss") && description.contains("chess"), "{description}");
+            assert!(
+                description.contains("loss") && description.contains("chess"),
+                "{description}"
+            );
             // Game-end turns legitimately classify chat ("I resign — good
             // game" has no new move), so the heavy pass must be able to score.
             let from_extract = apply(&conn, &options_for_phase("extract"), outcome("win"));
@@ -2159,6 +2526,310 @@ mod tests {
             assert!((super::super::outcome_score("win") - 1.0).abs() < 1e-9);
             assert!((super::super::outcome_score("draw")).abs() < 1e-9);
             assert!((super::super::outcome_score("loss") + 1.0).abs() < 1e-9);
+        }
+    }
+
+    mod loops {
+        use super::super::{ApplyToolOptions, ToolCall, apply_tool_call, parse_tool_calls};
+        use crate::memory::db;
+        use crate::memory::graph::{Edge, Node};
+        use crate::memory::ledger::{Actor, Event, EventContext};
+        use turso::Builder;
+
+        const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
+        const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', PRIMARY KEY (source, target))";
+
+        async fn harness() -> turso::Connection {
+            let Ok(database) = Builder::new_local(":memory:").build().await else {
+                unreachable!("in-memory database builds")
+            };
+            let Ok(conn) = database.connect() else {
+                unreachable!("in-memory database connects")
+            };
+            let _ = conn.execute(NODES_DDL, ()).await;
+            let _ = conn.execute(EDGES_DDL, ()).await;
+            conn
+        }
+
+        fn options(phase: &'static str) -> ApplyToolOptions<'static> {
+            ApplyToolOptions {
+                actor: Actor::new("system", phase),
+                context: EventContext::new("chat-1", "chat-1:user:ts"),
+                source_message_id: "chat-1:user:ts",
+                event_payload: "",
+                confidence_cap: None,
+                default_memory_type: "episodic",
+            }
+        }
+
+        fn apply(conn: &turso::Connection, phase: &'static str, call: ToolCall) -> String {
+            let mut events: Vec<Event> = Vec::new();
+            let Ok(description) = apply_tool_call(call, conn, &options(phase), &mut events) else {
+                unreachable!("apply succeeds")
+            };
+            description
+        }
+
+        fn open(intention: &str, anchor: &str, due: &str) -> ToolCall {
+            ToolCall::OpenLoop {
+                intention: intention.to_string(),
+                anchor: anchor.to_string(),
+                due: due.to_string(),
+            }
+        }
+
+        fn close(loop_id: &str, resolution: &str, note: &str) -> ToolCall {
+            ToolCall::CloseLoop {
+                loop_id: loop_id.to_string(),
+                resolution: resolution.to_string(),
+                note: note.to_string(),
+            }
+        }
+
+        fn write_anchor(conn: &turso::Connection, anchor: &str) {
+            let node = Node {
+                node_type: "entity".to_string(),
+                body: String::new(),
+                date: String::new(),
+            };
+            let Ok(()) = db::write_node(conn, anchor, &node) else {
+                unreachable!("anchor writes")
+            };
+        }
+
+        fn edge(conn: &turso::Connection, source: &str, target: &str) -> Edge {
+            let Ok(Some(edge)) = db::load_edge(conn, source, target) else {
+                unreachable!("edge exists")
+            };
+            edge
+        }
+
+        fn write_raw_edge(conn: &turso::Connection, source: &str, target: &str, content: &str) {
+            let raw_edge = Edge {
+                source: source.to_string(),
+                target: target.to_string(),
+                content: content.to_string(),
+                stability: 0.9,
+                confidence: 0.9,
+                importance: 1.0,
+                subject: false,
+                date: crate::prompts::today_iso(),
+                occurred_at: None,
+                expired_at: None,
+                memory_type: "semantic".to_string(),
+                origin_session: String::new(),
+            };
+            let Ok(()) = db::write_edge(conn, &raw_edge, "test") else {
+                unreachable!("raw edge writes")
+            };
+        }
+
+        #[test]
+        fn loop_calls_parse_and_unknown_resolution_is_rejected() {
+            let text = r#"{"tools":[{"tool":"open_loop","args":{"intention":"ask Markus","anchor":"home-server","due":"2026-07-15"}},{"tool":"close_loop","args":{"loop":"ask-markus","resolution":"done","note":"asked"}}]}"#;
+            let calls = parse_tool_calls(text);
+            assert_eq!(calls.len(), 2);
+            assert!(matches!(calls[0], ToolCall::OpenLoop { .. }));
+            assert!(matches!(calls[1], ToolCall::CloseLoop { .. }));
+            let invalid = r#"{"tool":"close_loop","args":{"loop":"ask-markus","resolution":"forfeit","note":"no"}}"#;
+            assert!(parse_tool_calls(invalid).is_empty());
+        }
+
+        #[test]
+        fn open_loop_writes_fixed_semantic_node_and_edge() {
+            let conn = db::block_on(harness());
+            write_anchor(&conn, "home-server");
+            let intention = "ask Markus whether the systemd unit is running";
+            let description = apply(
+                &conn,
+                "extract",
+                open(intention, "home-server", "2026-07-15"),
+            );
+            assert!(description.contains("open_loop"), "{description}");
+            let Ok(Some(node)) =
+                db::load_node(&conn, "ask-markus-whether-the-systemd-unit-is-running")
+            else {
+                unreachable!("loop node exists")
+            };
+            assert_eq!(
+                (
+                    node.node_type.as_str(),
+                    node.body.as_str(),
+                    node.date.as_str()
+                ),
+                ("loop", intention, "2026-07-15")
+            );
+            let edge = edge(
+                &conn,
+                "ask-markus-whether-the-systemd-unit-is-running",
+                "home-server",
+            );
+            assert_eq!(edge.content, format!("open loop: {intention}"));
+            assert!((edge.confidence - 0.9).abs() < 1e-9);
+            assert!((edge.stability - 0.9).abs() < 1e-9);
+            assert_eq!(
+                (edge.importance, edge.memory_type.as_str()),
+                (1.0, "semantic")
+            );
+        }
+
+        #[test]
+        fn invalid_due_date_is_dropped_but_loop_still_opens() {
+            let conn = db::block_on(harness());
+            write_anchor(&conn, "home-server");
+            apply(
+                &conn,
+                "extract",
+                open("check the unit", "home-server", "Friday"),
+            );
+            let Ok(Some(node)) = db::load_node(&conn, "check-the-unit") else {
+                unreachable!("loop node exists")
+            };
+            assert!(node.date.is_empty());
+            let loop_edge = edge(&conn, "check-the-unit", "home-server");
+            assert!(loop_edge.expired_at.is_none());
+            apply(
+                &conn,
+                "extract",
+                open("check the calendar", "home-server", "2026-02-29"),
+            );
+            let Ok(Some(calendar)) = db::load_node(&conn, "check-the-calendar") else {
+                unreachable!("calendar loop exists")
+            };
+            assert!(calendar.date.is_empty(), "non-leap February 29 is invalid");
+        }
+
+        #[test]
+        fn close_loop_expires_anchor_with_code_built_resolution() {
+            let conn = db::block_on(harness());
+            write_anchor(&conn, "home-server");
+            apply(&conn, "extract", open("check the unit", "home-server", ""));
+            let description = apply(
+                &conn,
+                "consolidate",
+                close("check-the-unit", "done", "confirmed running"),
+            );
+            assert!(description.contains("close_loop"), "{description}");
+            let loop_edge = edge(&conn, "check-the-unit", "home-server");
+            let expected = format!(
+                "done: confirmed running (closed {})",
+                crate::prompts::today_iso()
+            );
+            assert_eq!(loop_edge.content, expected);
+            assert!(loop_edge.expired_at.is_some());
+        }
+
+        #[test]
+        fn unknown_loop_returns_a_friendly_denial() {
+            let conn = db::block_on(harness());
+            let description = apply(&conn, "extract", close("missing-loop", "done", "finished"));
+            assert!(description.contains("denied"));
+            assert!(description.contains("not found"));
+        }
+
+        #[test]
+        fn scribe_dream_and_ingest_seats_cannot_mutate_loops() {
+            let conn = db::block_on(harness());
+            write_anchor(&conn, "home-server");
+            for phase in ["scribe", "consolidation", "ingest"] {
+                let opened = apply(&conn, phase, open("check the unit", "home-server", ""));
+                let closed = apply(&conn, phase, close("check-the-unit", "done", "finished"));
+                assert!(opened.contains("denied"), "{phase}: {opened}");
+                assert!(closed.contains("denied"), "{phase}: {closed}");
+            }
+            let Ok(node) = db::load_node(&conn, "check-the-unit") else {
+                unreachable!("node lookup succeeds")
+            };
+            assert!(node.is_none());
+        }
+
+        #[test]
+        fn open_loop_requires_an_existing_anchor() {
+            let conn = db::block_on(harness());
+            let description = apply(&conn, "extract", open("check the unit", "missing", ""));
+            assert!(
+                description.contains("anchor missing not found"),
+                "{description}"
+            );
+            let Ok(node) = db::load_node(&conn, "check-the-unit") else {
+                unreachable!("node lookup succeeds")
+            };
+            assert!(node.is_none());
+        }
+
+        #[test]
+        fn open_loop_denies_node_collisions_and_self_anchors() {
+            let conn = db::block_on(harness());
+            write_anchor(&conn, "home-server");
+            write_anchor(&conn, "check-the-unit");
+            let collision = apply(&conn, "extract", open("check the unit", "home-server", ""));
+            assert!(collision.contains("non-loop node"), "{collision}");
+            let self_anchor = apply(&conn, "extract", open("home server", "home-server", ""));
+            assert!(self_anchor.contains("same id"), "{self_anchor}");
+            let Ok(Some(node)) = db::load_node(&conn, "check-the-unit") else {
+                unreachable!("colliding entity remains")
+            };
+            assert_eq!(node.node_type, "entity");
+        }
+
+        #[test]
+        fn reopening_cannot_add_a_second_live_anchor() {
+            let conn = db::block_on(harness());
+            write_anchor(&conn, "home-server");
+            write_anchor(&conn, "other-topic");
+            apply(&conn, "extract", open("check the unit", "home-server", ""));
+            let denied = apply(&conn, "extract", open("check the unit", "other-topic", ""));
+            assert!(
+                denied.contains("already has anchor home-server"),
+                "{denied}"
+            );
+            let Ok(missing) = db::load_edge(&conn, "check-the-unit", "other-topic") else {
+                unreachable!("edge lookup succeeds")
+            };
+            assert!(missing.is_none());
+        }
+
+        #[test]
+        fn close_loop_expires_only_actual_anchor_edges() {
+            let conn = db::block_on(harness());
+            write_anchor(&conn, "home-server");
+            write_anchor(&conn, "other-topic");
+            apply(&conn, "extract", open("check the unit", "home-server", ""));
+            write_raw_edge(&conn, "check-the-unit", "other-topic", "related fact");
+            apply(
+                &conn,
+                "extract",
+                close("check-the-unit", "done", "finished"),
+            );
+            assert!(
+                edge(&conn, "check-the-unit", "home-server")
+                    .expired_at
+                    .is_some()
+            );
+            assert!(
+                edge(&conn, "check-the-unit", "other-topic")
+                    .expired_at
+                    .is_none()
+            );
+        }
+
+        #[test]
+        fn generic_mutations_cannot_bypass_loop_lifecycle() {
+            let conn = db::block_on(harness());
+            write_anchor(&conn, "home-server");
+            apply(&conn, "extract", open("check the unit", "home-server", ""));
+            let expire = ToolCall::ExpireEdge {
+                source: "check-the-unit".to_string(),
+                target: "home-server".to_string(),
+                rewritten_content: "gone".to_string(),
+            };
+            let denied = apply(&conn, "ingest", expire);
+            assert!(denied.contains("loop lifecycle"), "{denied}");
+            assert!(
+                edge(&conn, "check-the-unit", "home-server")
+                    .expired_at
+                    .is_none()
+            );
         }
     }
 }

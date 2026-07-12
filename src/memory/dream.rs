@@ -128,7 +128,11 @@ fn run_strategy_stage(
         processed += 1;
     }
     if processed > 0 {
-        send_log(sender, "dream", format!("strategy: {total} lessons written"));
+        send_log(
+            sender,
+            "dream",
+            format!("strategy: {total} lessons written"),
+        );
     }
     Ok(total)
 }
@@ -564,6 +568,12 @@ fn apply_dream_call<'scope, 'policy>(
     ctx: &mut DreamCallContext<'scope, 'policy>,
     call: ToolCall,
 ) -> Result<(String, bool), Box<dyn Error + Send + Sync>> {
+    if super::agent::tool_call_touches_loop(ctx.conn, &call)? {
+        return Ok((
+            "dream mutation denied: open loops are heavy-owned".to_string(),
+            false,
+        ));
+    }
     match call {
         ToolCall::UpsertEdge {
             source,
@@ -638,6 +648,14 @@ fn apply_dream_call<'scope, 'policy>(
         )),
         ToolCall::RecordOutcome { .. } => Ok((
             "record_outcome denied: record_outcome is a scribe tool".to_string(),
+            false,
+        )),
+        ToolCall::OpenLoop { .. } => Ok((
+            "open_loop denied: open_loop is a heavy tool".to_string(),
+            false,
+        )),
+        ToolCall::CloseLoop { .. } => Ok((
+            "close_loop denied: close_loop is a heavy tool".to_string(),
             false,
         )),
     }
@@ -1091,6 +1109,7 @@ mod tests {
 
     const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', PRIMARY KEY (source, target))";
     const EVENTS_DDL: &str = "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')";
+    const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
 
     fn harness() -> Connection {
         db::block_on(async {
@@ -1102,6 +1121,7 @@ mod tests {
             };
             let _ = conn.execute(EDGES_DDL, ()).await;
             let _ = conn.execute(EVENTS_DDL, ()).await;
+            let _ = conn.execute(NODES_DDL, ()).await;
             conn
         })
     }
@@ -1152,10 +1172,7 @@ mod tests {
         }
     }
 
-    fn run_gist(
-        conn: &Connection,
-        call: DreamGistCall,
-    ) -> ((String, bool), Vec<Event>) {
+    fn run_gist(conn: &Connection, call: DreamGistCall) -> ((String, bool), Vec<Event>) {
         let policy = empty_policy();
         let mut events: Vec<Event> = Vec::new();
         let mut apply_state = DreamApplyState::new(&policy);
@@ -1232,7 +1249,10 @@ mod tests {
         insert(&conn, "game4-hub", "move-qf3", "episodic");
         let (_, _) = run_gist(
             &conn,
-            gist_call(&[("game3-hub", "move-qh5"), ("game4-hub", "move-qf3")], 0.95),
+            gist_call(
+                &[("game3-hub", "move-qh5"), ("game4-hub", "move-qf3")],
+                0.95,
+            ),
         );
         let written = must_load(&conn, "queen-sorties", "chess-openings");
         assert!((written.confidence - 0.7).abs() < 1e-9);
@@ -1484,9 +1504,24 @@ mod strategy_tests {
     #[test]
     fn context_holds_definition_both_chains_in_order_and_the_outcome() {
         let conn = harness();
-        write_node(&conn, "game-chess", "game", "user plays White, reply move only");
-        play_game(&conn, "s1", "game-chess", &[("assistant", "e4"), ("user", "e5")]);
-        play_game(&conn, "s2", "game-chess", &[("assistant", "d4"), ("user", "d5")]);
+        write_node(
+            &conn,
+            "game-chess",
+            "game",
+            "user plays White, reply move only",
+        );
+        play_game(
+            &conn,
+            "s1",
+            "game-chess",
+            &[("assistant", "e4"), ("user", "e5")],
+        );
+        play_game(
+            &conn,
+            "s2",
+            "game-chess",
+            &[("assistant", "d4"), ("user", "d5")],
+        );
         record_outcome(&conn, "s1", -1.0, "resigned");
         let node = game_node("user plays White, reply move only");
         let ctx = assemble(&conn, "game-chess", &node);
@@ -1502,7 +1537,10 @@ mod strategy_tests {
                 "resigned",
             ],
         );
-        assert!(index_of(&ctx.text, "e4") < index_of(&ctx.text, "e5"), "ply order");
+        assert!(
+            index_of(&ctx.text, "e4") < index_of(&ctx.text, "e5"),
+            "ply order"
+        );
         assert_eq!((ctx.chains, ctx.outcomes), (2, 1));
     }
 
@@ -1533,7 +1571,11 @@ mod strategy_tests {
         };
         drop(receiver);
         assert_eq!(total, 0);
-        assert_eq!(llm.calls.load(Ordering::SeqCst), 0, "no game reached the LLM");
+        assert_eq!(
+            llm.calls.load(Ordering::SeqCst),
+            0,
+            "no game reached the LLM"
+        );
     }
 
     #[test]
@@ -1544,10 +1586,22 @@ mod strategy_tests {
         write_node(&conn, "task-live", "task", "");
         write_node(&conn, "task-dead", "task", "");
         write_node(&conn, "task-other", "task", "");
-        write_edge(&conn, &link_edge("task-live", "game-chess", "episodic", false));
-        write_edge(&conn, &link_edge("task-dead", "game-chess", "episodic", true));
-        write_edge(&conn, &link_edge("task-other", "game-go", "episodic", false));
-        assert_eq!(load_hubs(&conn, "game-chess"), vec!["task-live".to_string()]);
+        write_edge(
+            &conn,
+            &link_edge("task-live", "game-chess", "episodic", false),
+        );
+        write_edge(
+            &conn,
+            &link_edge("task-dead", "game-chess", "episodic", true),
+        );
+        write_edge(
+            &conn,
+            &link_edge("task-other", "game-go", "episodic", false),
+        );
+        assert_eq!(
+            load_hubs(&conn, "game-chess"),
+            vec!["task-live".to_string()]
+        );
     }
 
     // Drives the strategy response through the dream apply path one call at a
@@ -1578,7 +1632,12 @@ mod strategy_tests {
         let conn = harness();
         write_node(&conn, "game-chess", "game", "rules");
         // Two episodic plies for a gist to cite.
-        play_game(&conn, "s1", "game-chess", &[("assistant", "Qh5"), ("user", "Nc6")]);
+        play_game(
+            &conn,
+            "s1",
+            "game-chess",
+            &[("assistant", "Qh5"), ("user", "Nc6")],
+        );
         // A pre-existing strategy the pass expires on contradicting evidence.
         let mut stale = link_edge("game-chess", "castle-early", "semantic", false);
         stale.content = "castle early".to_string();
@@ -1600,14 +1659,60 @@ mod strategy_tests {
         assert_dream_edges_written(&conn);
     }
 
+    #[test]
+    fn dream_path_denies_open_and_close_loop() {
+        let conn = harness();
+        let response = r#"{"tools":[
+            {"tool":"open_loop","args":{"intention":"ask later","anchor":"topic","due":""}},
+            {"tool":"close_loop","args":{"loop":"ask-later","resolution":"done","note":"asked"}}
+        ]}"#;
+        let outcomes = apply_all(&conn, response);
+        assert_eq!(outcomes.len(), 2);
+        assert!(!outcomes[0].1 && outcomes[0].0.contains("open_loop denied"));
+        assert!(!outcomes[1].1 && outcomes[1].0.contains("close_loop denied"));
+    }
+
+    #[test]
+    fn dream_generic_mutations_cannot_rewrite_or_remove_loops() {
+        let conn = harness();
+        write_node(&conn, "loop-reminder", "loop", "ask about the service");
+        write_node(&conn, "topic", "entity", "");
+        let mut anchor = link_edge("loop-reminder", "topic", "semantic", false);
+        anchor.content = "open loop: ask about the service".to_string();
+        write_edge(&conn, &anchor);
+        let response = r#"{"tools":[
+            {"tool":"upsert_node","args":{"name":"loop-reminder","type":"fact","body":"rewritten","date":""}},
+            {"tool":"upsert_edge","args":{"source":"loop-reminder","target":"topic","content":"rewritten","stability":0.2,"confidence":0.2,"importance":0.2,"subject":false,"date":"2026-07-12"}},
+            {"tool":"expire_edge","args":{"source":"loop-reminder","target":"topic","rewritten_content":"closed"}},
+            {"tool":"delete_node","args":{"name":"topic"}}
+        ]}"#;
+        let outcomes = apply_all(&conn, response);
+        assert_eq!(outcomes.len(), 4);
+        for (description, changed) in outcomes {
+            assert!(!changed && description.contains("open loops are heavy-owned"));
+        }
+        let stored = must_edge(&conn, "loop-reminder", "topic");
+        assert_eq!(stored.content, "open loop: ask about the service");
+        assert!(stored.expired_at.is_none());
+        let Ok(Some(node)) = db::load_node(&conn, "loop-reminder") else {
+            unreachable!("loop node remains")
+        };
+        assert_eq!(node.node_type, "loop");
+    }
+
     fn assert_dream_edges_written(conn: &Connection) {
-        assert_eq!(must_edge(conn, "game-chess", "queen-sorties").memory_type, "semantic");
+        assert_eq!(
+            must_edge(conn, "game-chess", "queen-sorties").memory_type,
+            "semantic"
+        );
         assert_eq!(
             must_edge(conn, "game-chess", "develop-knights").content,
             "develop knights before bishops"
         );
         assert!(
-            must_edge(conn, "game-chess", "castle-early").expired_at.is_some(),
+            must_edge(conn, "game-chess", "castle-early")
+                .expired_at
+                .is_some(),
             "stale strategy expired"
         );
         // The denied record_move created no ply on the game hub.

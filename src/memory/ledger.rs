@@ -348,6 +348,8 @@ pub struct DayDigest {
     pub updated: usize,
     pub pruned: usize,
     pub dream_events: usize,
+    // Live intentions whose due date has arrived; rendered for the report.
+    pub due_loops: Vec<String>,
     // gist edge refs ("source → target") — the night's crown output.
     pub gists: Vec<String>,
     // Up to 5 most-injected edges: what memory was actually used for.
@@ -367,6 +369,7 @@ impl DayDigest {
             && self.updated == 0
             && self.pruned == 0
             && self.dream_events == 0
+            && self.due_loops.is_empty()
             && self.top_injected.is_empty()
     }
 }
@@ -387,7 +390,8 @@ pub fn day_digest(day: &str, night: &NightWindow) -> DayDigest {
         Ok(conn) => conn,
         Err(_) => return DayDigest::default(),
     };
-    db::block_on(day_digest_async(&conn, day, night)).unwrap_or_default()
+    let today = crate::timeutil::today_iso();
+    db::block_on(day_digest_async(&conn, day, night, &today)).unwrap_or_default()
 }
 
 // The id of the most recently registered dream session, if any — the verdict
@@ -401,10 +405,15 @@ async fn day_digest_async(
     conn: &Connection,
     day: &str,
     night: &NightWindow,
+    today: &str,
 ) -> Result<DayDigest, Box<dyn Error + Send + Sync>> {
     let mut digest = day_slice_digest(conn, day).await?;
     digest.dream_events = count_night_dream_events(conn, night).await?;
     digest.gists = load_night_gists(conn, night).await?;
+    let loop_items = db::load_due_loops_async(conn, today).await?;
+    for loop_item in loop_items {
+        digest.due_loops.push(loop_item.display());
+    }
     Ok(digest)
 }
 
@@ -465,9 +474,7 @@ async fn count_night_dream_events(
     count_from(&mut rows).await
 }
 
-async fn count_from(
-    rows: &mut turso::Rows,
-) -> Result<usize, Box<dyn Error + Send + Sync>> {
+async fn count_from(rows: &mut turso::Rows) -> Result<usize, Box<dyn Error + Send + Sync>> {
     if let Some(row) = rows.next().await? {
         return Ok(db::real(row.get_value(0)?) as usize);
     }
@@ -1237,6 +1244,7 @@ mod tests {
 
     const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', PRIMARY KEY (source, target))";
     const EVENTS_DDL: &str = "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')";
+    const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
 
     // Fresh in-memory graph: three edges, one of them already expired.
     async fn harness() -> Connection {
@@ -1383,7 +1391,36 @@ mod tests {
         };
         let _ = conn.execute(EVENTS_DDL, ()).await;
         let _ = conn.execute(SESSIONS_DDL, ()).await;
+        let _ = conn.execute(EDGES_DDL, ()).await;
+        let _ = conn.execute(NODES_DDL, ()).await;
         conn
+    }
+
+    async fn insert_digest_loop(
+        conn: &Connection,
+        loop_id: &str,
+        body: &str,
+        due: &str,
+        expired_at: Option<&str>,
+    ) {
+        let _ = conn
+            .execute(
+                "INSERT OR IGNORE INTO nodes (id, node_type) VALUES ('topic', 'entity')",
+                (),
+            )
+            .await;
+        let _ = conn
+            .execute(
+                "INSERT INTO nodes (id, node_type, body, date) VALUES (?1, 'loop', ?2, ?3)",
+                params![loop_id, body, due],
+            )
+            .await;
+        let _ = conn
+            .execute(
+                "INSERT INTO edges (source, target, content, stability, confidence, importance, expired_at) VALUES (?1, 'topic', ?2, 0.9, 0.9, 1.0, ?3)",
+                params![loop_id, format!("open loop: {body}"), expired_at],
+            )
+            .await;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1430,7 +1467,7 @@ mod tests {
         day: &str,
         night: &super::NightWindow,
     ) -> super::DayDigest {
-        let Ok(digest) = db::block_on(super::day_digest_async(conn, day, night)) else {
+        let Ok(digest) = db::block_on(super::day_digest_async(conn, day, night, TODAY)) else {
             unreachable!("digest query runs")
         };
         digest
@@ -1439,10 +1476,37 @@ mod tests {
     #[test]
     fn digest_counts_only_yesterdays_slice() {
         let conn = db::block_on(digest_harness());
-        db::block_on(insert_event(&conn, YESTERDAY, "tg-2026-07-10", "turn-a", "created", "a", "b", ""));
-        db::block_on(insert_event(&conn, YESTERDAY, "tg-2026-07-10", "turn-b", "updated", "c", "d", ""));
+        db::block_on(insert_event(
+            &conn,
+            YESTERDAY,
+            "tg-2026-07-10",
+            "turn-a",
+            "created",
+            "a",
+            "b",
+            "",
+        ));
+        db::block_on(insert_event(
+            &conn,
+            YESTERDAY,
+            "tg-2026-07-10",
+            "turn-b",
+            "updated",
+            "c",
+            "d",
+            "",
+        ));
         // Today's events must not leak into yesterday's digest.
-        db::block_on(insert_event(&conn, TODAY, "tg-2026-07-11", "turn-c", "created", "e", "f", ""));
+        db::block_on(insert_event(
+            &conn,
+            TODAY,
+            "tg-2026-07-11",
+            "turn-c",
+            "created",
+            "e",
+            "f",
+            "",
+        ));
 
         let digest = digest(&conn, YESTERDAY);
         assert_eq!(digest.turns, 2);
@@ -1454,9 +1518,27 @@ mod tests {
     #[test]
     fn digest_counts_dream_events_and_surfaces_gists() {
         let conn = db::block_on(digest_harness());
-        db::block_on(insert_event(&conn, YESTERDAY, "dream-100", "", "created", "x", "y", ""));
+        db::block_on(insert_event(
+            &conn,
+            YESTERDAY,
+            "dream-100",
+            "",
+            "created",
+            "x",
+            "y",
+            "",
+        ));
         let gist_payload = serde_json::json!({"gist_of": ["g3 → m5"]}).to_string();
-        db::block_on(insert_event(&conn, YESTERDAY, "dream-100", "", "updated", "lesson", "topic", &gist_payload));
+        db::block_on(insert_event(
+            &conn,
+            YESTERDAY,
+            "dream-100",
+            "",
+            "updated",
+            "lesson",
+            "topic",
+            &gist_payload,
+        ));
 
         let digest = digest(&conn, YESTERDAY);
         assert_eq!(digest.dream_events, 2);
@@ -1470,7 +1552,16 @@ mod tests {
     #[test]
     fn night_window_catches_the_post_midnight_dream() {
         let conn = db::block_on(digest_harness());
-        db::block_on(insert_event(&conn, TODAY, "dream-200", "", "created", "x", "y", ""));
+        db::block_on(insert_event(
+            &conn,
+            TODAY,
+            "dream-200",
+            "",
+            "created",
+            "x",
+            "y",
+            "",
+        ));
         let night = super::NightWindow {
             from: format!("{YESTERDAY}T07"),
             until: format!("{TODAY}T07"),
@@ -1482,9 +1573,15 @@ mod tests {
     #[test]
     fn digest_groups_created_edges_by_turn() {
         let conn = db::block_on(digest_harness());
-        db::block_on(insert_event(&conn, YESTERDAY, "tg-x", "turn-a", "created", "a", "b", ""));
-        db::block_on(insert_event(&conn, YESTERDAY, "tg-x", "turn-a", "created", "c", "d", ""));
-        db::block_on(insert_event(&conn, YESTERDAY, "tg-x", "turn-b", "created", "e", "f", ""));
+        db::block_on(insert_event(
+            &conn, YESTERDAY, "tg-x", "turn-a", "created", "a", "b", "",
+        ));
+        db::block_on(insert_event(
+            &conn, YESTERDAY, "tg-x", "turn-a", "created", "c", "d", "",
+        ));
+        db::block_on(insert_event(
+            &conn, YESTERDAY, "tg-x", "turn-b", "created", "e", "f", "",
+        ));
         let digest = digest(&conn, YESTERDAY);
         assert_eq!(digest.turn_groups.len(), 2);
         assert_eq!(digest.turn_groups[0], "a → b; c → d");
@@ -1494,13 +1591,59 @@ mod tests {
     fn digest_ranks_injected_edges_by_frequency() {
         let conn = db::block_on(digest_harness());
         for _ in 0..3 {
-            db::block_on(insert_event(&conn, YESTERDAY, "tg-2026-07-10", "turn-a", "injected", "hot", "node", ""));
+            db::block_on(insert_event(
+                &conn,
+                YESTERDAY,
+                "tg-2026-07-10",
+                "turn-a",
+                "injected",
+                "hot",
+                "node",
+                "",
+            ));
         }
-        db::block_on(insert_event(&conn, YESTERDAY, "tg-2026-07-10", "turn-a", "injected", "cold", "node", ""));
+        db::block_on(insert_event(
+            &conn,
+            YESTERDAY,
+            "tg-2026-07-10",
+            "turn-a",
+            "injected",
+            "cold",
+            "node",
+            "",
+        ));
 
         let digest = digest(&conn, YESTERDAY);
         assert_eq!(digest.top_injected.first(), Some(&"hot → node".to_string()));
         assert_eq!(digest.top_injected.len(), 2);
+    }
+
+    fn insert_digest_loop_cases(conn: &Connection) {
+        let cases = [
+            ("past", "ask about the file", YESTERDAY, None),
+            ("today", "check the service", TODAY, None),
+            ("future", "review the logs", "2026-07-12", None),
+            ("context", "mention the reboot", "", None),
+            ("closed", "confirm the backup", YESTERDAY, Some(TODAY)),
+        ];
+        for (loop_id, body, due, expired_at) in cases {
+            db::block_on(insert_digest_loop(conn, loop_id, body, due, expired_at));
+        }
+    }
+
+    #[test]
+    fn digest_surfaces_only_due_live_loops() {
+        let conn = db::block_on(digest_harness());
+        insert_digest_loop_cases(&conn);
+
+        let digest = digest(&conn, YESTERDAY);
+        assert_eq!(
+            digest.due_loops,
+            vec![
+                "ask about the file (due 2026-07-10)".to_string(),
+                "check the service (due 2026-07-11)".to_string(),
+            ]
+        );
     }
 
     fn newest_dream(conn: &Connection) -> Option<String> {
@@ -1514,8 +1657,16 @@ mod tests {
     fn newest_dream_session_is_the_most_recent() {
         let conn = db::block_on(digest_harness());
         assert!(newest_dream(&conn).is_none());
-        db::block_on(insert_dream_session(&conn, "dream-100", "2026-07-10T04:00:00"));
-        db::block_on(insert_dream_session(&conn, "dream-200", "2026-07-11T04:00:00"));
+        db::block_on(insert_dream_session(
+            &conn,
+            "dream-100",
+            "2026-07-10T04:00:00",
+        ));
+        db::block_on(insert_dream_session(
+            &conn,
+            "dream-200",
+            "2026-07-11T04:00:00",
+        ));
         assert_eq!(newest_dream(&conn), Some("dream-200".to_string()));
     }
 }

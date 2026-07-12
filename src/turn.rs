@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::path::Path;
 use std::sync::mpsc::{Sender, channel};
@@ -24,6 +25,18 @@ pub(crate) struct MemoryBuild {
     pub debug_log: String,
     pub injected_edges: usize,
     pub elapsed_ms: u128,
+}
+
+struct MemorySections {
+    loops: memory::OpenLoops,
+    knowledge: memory::GameKnowledge,
+    chain: memory::TaskChain,
+}
+
+impl MemorySections {
+    fn injected_edges(&self) -> usize {
+        self.loops.refs.len() + self.knowledge.refs.len() + self.chain.refs.len()
+    }
 }
 
 pub(crate) struct TurnContext<'ctx> {
@@ -160,41 +173,81 @@ pub(crate) fn build_memory_block(
     let started = Instant::now();
     let selection = memory::select_semantic_edges_routed(embed, query, session_id);
     let edges = selection.edges;
-    let mut events = Vec::new();
-    events.push(memory::Event::routed(
-        memory::EventContext::new(session_id, turn_id),
-        routed_payload(&selection.routing.expert, selection.routing.expert_score),
-    ));
-    for edge in &edges {
-        let edge_ref = memory::EdgeRef::new(&edge.source, &edge.target);
-        push_injected(&mut events, (session_id, turn_id), "local", &edge_ref);
-    }
-    // The current game's move chain: complete and ordered, outside TOP_K. Its
-    // edges get `injected` events too, so attribution and the spacing-effect
-    // clock refresh apply exactly like any other injection. Actor id "game"
-    // (vs "local" for ranked beliefs) marks them as part of the game's play —
-    // the Phase 23 outcome slice reinforces game-tagged injections only,
-    // otherwise a win would credit all 60 ranked beliefs of every turn.
-    let chain = memory::load_task_chain(session_id);
-    for edge_ref in &chain.refs {
-        push_injected(&mut events, (session_id, turn_id), "game", edge_ref);
-    }
-    // The game's rules and derived strategies: deterministic, outside TOP_K.
-    // A strategy used in a win must be attributable — same "game" tag.
-    let knowledge = memory::load_game_knowledge(session_id);
-    for edge_ref in &knowledge.refs {
-        push_injected(&mut events, (session_id, turn_id), "game", edge_ref);
-    }
+    let sections = load_memory_sections(&edges, session_id);
+    let events = build_memory_events((session_id, turn_id), &selection.routing, &edges, &sections);
     // Best-effort bookkeeping: a failed ledger write must never abort the turn.
     if let Err(err) = memory::record_events(&events) {
         runlog::log("ledger", &format!("write failed: {err}"));
     }
-    let block = assemble_memory_block(&edges, &knowledge, &chain);
+    let block = assemble_memory_block(
+        &edges,
+        &sections.loops,
+        &sections.knowledge,
+        &sections.chain,
+    );
     MemoryBuild {
         block,
         debug_log: routing_debug_line(&selection.routing),
-        injected_edges: edges.len() + chain.refs.len() + knowledge.refs.len(),
+        injected_edges: edges.len() + sections.injected_edges(),
         elapsed_ms: started.elapsed().as_millis(),
+    }
+}
+
+fn load_memory_sections(edges: &[memory::SemanticEdge], session_id: &str) -> MemorySections {
+    let anchor_ids = collect_anchor_ids(edges);
+    let today = crate::timeutil::today_iso();
+    MemorySections {
+        loops: memory::load_open_loops(&anchor_ids, &today),
+        knowledge: memory::load_game_knowledge(session_id),
+        chain: memory::load_task_chain(session_id),
+    }
+}
+
+fn collect_anchor_ids(edges: &[memory::SemanticEdge]) -> Vec<String> {
+    let mut ids = BTreeSet::new();
+    for edge in edges {
+        ids.insert(edge.source.clone());
+        ids.insert(edge.target.clone());
+    }
+    ids.into_iter().collect()
+}
+
+fn build_memory_events(
+    context: (&str, &str),
+    routing: &memory::Routing,
+    edges: &[memory::SemanticEdge],
+    sections: &MemorySections,
+) -> Vec<memory::Event> {
+    let mut events = vec![memory::Event::routed(
+        memory::EventContext::new(context.0, context.1),
+        routed_payload(&routing.expert, routing.expert_score),
+    )];
+    push_ranked_injected(&mut events, context, edges);
+    push_injected_refs(&mut events, context, "local", &sections.loops.refs);
+    push_injected_refs(&mut events, context, "game", &sections.chain.refs);
+    push_injected_refs(&mut events, context, "game", &sections.knowledge.refs);
+    events
+}
+
+fn push_ranked_injected(
+    events: &mut Vec<memory::Event>,
+    context: (&str, &str),
+    edges: &[memory::SemanticEdge],
+) {
+    for edge in edges {
+        let edge_ref = memory::EdgeRef::new(&edge.source, &edge.target);
+        push_injected(events, context, "local", &edge_ref);
+    }
+}
+
+fn push_injected_refs(
+    events: &mut Vec<memory::Event>,
+    context: (&str, &str),
+    actor_id: &str,
+    refs: &[memory::EdgeRef],
+) {
+    for edge_ref in refs {
+        push_injected(events, context, actor_id, edge_ref);
     }
 }
 
@@ -212,10 +265,11 @@ fn push_injected(
     ));
 }
 
-// Belief section first (semantic-ranked TOON), then the game block (rules +
-// strategies), then the ordered task chain. Any section may be empty.
+// Beliefs first, then deterministic open loops, game knowledge, and task chain.
+// Any section may be empty.
 fn assemble_memory_block(
     edges: &[memory::SemanticEdge],
+    loops: &memory::OpenLoops,
     knowledge: &memory::GameKnowledge,
     chain: &memory::TaskChain,
 ) -> String {
@@ -224,6 +278,7 @@ fn assemble_memory_block(
     } else {
         memory::edges_to_toon(edges)
     };
+    append_section(&mut block, &loops.block);
     append_section(&mut block, &knowledge.block);
     append_section(&mut block, &chain.block);
     block
@@ -549,8 +604,15 @@ fn parse_string_field(root: &Value, key: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::assemble_memory_block;
-    use crate::memory::{GameKnowledge, TaskChain};
+    use super::{MemorySections, assemble_memory_block, build_memory_events, collect_anchor_ids};
+    use crate::memory::{EdgeRef, GameKnowledge, OpenLoops, Routing, SemanticEdge, TaskChain};
+
+    fn loops(block: &str) -> OpenLoops {
+        OpenLoops {
+            block: block.to_string(),
+            refs: Vec::new(),
+        }
+    }
 
     fn knowledge(block: &str) -> GameKnowledge {
         GameKnowledge {
@@ -570,6 +632,7 @@ mod tests {
     fn game_block_and_chain_block_coexist_when_both_present() {
         let block = assemble_memory_block(
             &[],
+            &loops(""),
             &knowledge("## Game: chess\nthe rules\n"),
             &chain("## Current task (in order)\nply 1 (assistant): e4\n"),
         );
@@ -581,7 +644,80 @@ mod tests {
 
     #[test]
     fn no_game_link_adds_no_game_block() {
-        let block = assemble_memory_block(&[], &knowledge(""), &chain("## Current task (in order)\n"));
+        let block = assemble_memory_block(
+            &[],
+            &loops(""),
+            &knowledge(""),
+            &chain("## Current task (in order)\n"),
+        );
         assert_eq!(block, "## Current task (in order)\n");
+    }
+
+    #[test]
+    fn open_loop_block_is_present_only_when_non_empty() {
+        let present = assemble_memory_block(
+            &[],
+            &loops("## Open loops\n- ask about the server\n"),
+            &knowledge(""),
+            &chain(""),
+        );
+        let absent = assemble_memory_block(&[], &loops(""), &knowledge(""), &chain(""));
+        assert_eq!(present, "## Open loops\n- ask about the server\n");
+        assert!(absent.is_empty());
+    }
+
+    fn semantic_edge(source: &str, target: &str) -> SemanticEdge {
+        SemanticEdge {
+            source: source.to_string(),
+            target: target.to_string(),
+            content: String::new(),
+            confidence: 1.0,
+            stability: 1.0,
+            importance: 1.0,
+            subject: false,
+            date: String::new(),
+            occurred_at: None,
+            expired_at: None,
+            memory_type: "semantic".to_string(),
+            origin_session: String::new(),
+            embedding: None,
+        }
+    }
+
+    #[test]
+    fn loop_anchors_include_both_ranked_edge_endpoints_once() {
+        let edges = vec![
+            semantic_edge("home-server", "systemd"),
+            semantic_edge("systemd", "reboot"),
+        ];
+        assert_eq!(
+            collect_anchor_ids(&edges),
+            vec!["home-server", "reboot", "systemd"]
+        );
+    }
+
+    #[test]
+    fn surfaced_loop_edges_record_local_injections() {
+        let loop_ref = EdgeRef::new("loop-reminder", "home-server");
+        let sections = MemorySections {
+            loops: OpenLoops {
+                block: "## Open loops\n- ask later\n".to_string(),
+                refs: vec![loop_ref],
+            },
+            knowledge: knowledge(""),
+            chain: chain(""),
+        };
+        let routing = Routing {
+            routing_vector: Vec::new(),
+            expert: None,
+            expert_score: 0.0,
+            expert_with_direction: false,
+        };
+        let events = build_memory_events(("session", "turn"), &routing, &[], &sections);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].event_type, "injected");
+        assert_eq!(events[1].actor_id, "local");
+        assert_eq!(events[1].source, "loop-reminder");
+        assert_eq!(events[1].target, "home-server");
     }
 }

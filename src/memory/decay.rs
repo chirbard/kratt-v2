@@ -7,11 +7,21 @@ pub fn apply_decay_if_needed(graph: &mut Graph) -> bool {
     if db::load_last_decay() == today {
         return false;
     }
-    for edge in &mut graph.edges {
-        decay_edge(edge, &today);
-    }
+    decay_graph(graph, &today);
     db::save_last_decay(&today);
     true
+}
+
+fn decay_graph(graph: &mut Graph, today: &str) {
+    let nodes = &graph.nodes;
+    for edge in &mut graph.edges {
+        if edge.expired_at.is_none()
+            && matches!(nodes.get(&edge.source), Some(node) if node.node_type == "loop")
+        {
+            continue;
+        }
+        decay_edge(edge, today);
+    }
 }
 
 // Episodic edges are memory of lived experience, not durable belief — they
@@ -68,8 +78,8 @@ fn date_to_days(date: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::graph::Edge;
-    use super::decay_edge;
+    use super::super::graph::{Edge, Graph, Node};
+    use super::{decay_edge, decay_graph};
 
     fn test_edge(memory_type: &str, date: &str) -> Edge {
         Edge {
@@ -104,5 +114,30 @@ mod tests {
         let mut episodic = test_edge("episodic", "2026-01-01");
         decay_edge(&mut episodic, "2026-07-01");
         assert!(episodic.confidence >= 0.05);
+    }
+
+    #[test]
+    fn live_loop_anchor_keeps_fixed_confidence() {
+        let mut graph = Graph::new();
+        graph.nodes.insert(
+            "loop-reminder".to_string(),
+            Node {
+                node_type: "loop".to_string(),
+                body: "ask later".to_string(),
+                date: String::new(),
+            },
+        );
+        let mut loop_edge = test_edge("semantic", "2026-01-01");
+        loop_edge.source = "loop-reminder".to_string();
+        loop_edge.confidence = 0.9;
+        loop_edge.stability = 0.9;
+        graph.edges.push(loop_edge.clone());
+        graph.edges.push(test_edge("semantic", "2026-01-01"));
+        loop_edge.expired_at = Some("2026-01-02".to_string());
+        graph.edges.push(loop_edge);
+        decay_graph(&mut graph, "2026-07-12");
+        assert!((graph.edges[0].confidence - 0.9).abs() < 1e-9);
+        assert!(graph.edges[1].confidence < 1.0);
+        assert!(graph.edges[2].confidence < 0.9);
     }
 }
