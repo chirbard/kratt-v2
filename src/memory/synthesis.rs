@@ -611,6 +611,7 @@ fn normalize_call(call: &ToolCall, confidence: f64) -> ToolCall {
             result: result.clone(),
             comment: comment.clone(),
         },
+        ToolCall::RecordReaction { .. } => normalize_reaction(call),
         ToolCall::OpenLoop {
             intention,
             anchor,
@@ -633,11 +634,28 @@ fn normalize_call(call: &ToolCall, confidence: f64) -> ToolCall {
     }
 }
 
+fn normalize_reaction(call: &ToolCall) -> ToolCall {
+    let ToolCall::RecordReaction { reaction, comment } = call else {
+        unreachable!("normalize_reaction called with non-reaction call");
+    };
+    ToolCall::RecordReaction {
+        reaction: reaction.clone(),
+        comment: comment.clone(),
+    }
+}
+
 fn normalize_inbox_add(call: &ToolCall) -> ToolCall {
-    let ToolCall::InboxAdd { source, instruction } = call else {
+    let ToolCall::InboxAdd {
+        source,
+        instruction,
+    } = call
+    else {
         unreachable!("normalize_inbox_add called with non-inbox call");
     };
-    ToolCall::InboxAdd { source: source.clone(), instruction: instruction.clone() }
+    ToolCall::InboxAdd {
+        source: source.clone(),
+        instruction: instruction.clone(),
+    }
 }
 
 // Synthesis never emits record_move (it is a scribe-only tool), but the match
@@ -786,6 +804,7 @@ fn apply_policy_overrides(cluster: &Cluster, calls: &[ToolCall], policy: &mut Sy
             | ToolCall::DefineTask { .. }
             | ToolCall::RecordRule { .. }
             | ToolCall::RecordOutcome { .. }
+            | ToolCall::RecordReaction { .. }
             | ToolCall::OpenLoop { .. }
             | ToolCall::CloseLoop { .. }
             | ToolCall::InboxAdd { .. } => {}
@@ -841,9 +860,13 @@ fn tool_call_json(call: &ToolCall) -> serde_json::Value {
         ToolCall::RecordMove { .. }
         | ToolCall::DefineTask { .. }
         | ToolCall::RecordRule { .. }
-        | ToolCall::RecordOutcome { .. } => task_tool_json(call),
+        | ToolCall::RecordOutcome { .. }
+        | ToolCall::RecordReaction { .. } => task_tool_json(call),
         ToolCall::OpenLoop { .. } | ToolCall::CloseLoop { .. } => loop_tool_json(call),
-        ToolCall::InboxAdd { source, instruction } => {
+        ToolCall::InboxAdd {
+            source,
+            instruction,
+        } => {
             json!({"tool":"inbox_add","args":{"source":source,"instruction":instruction}})
         }
     }
@@ -860,6 +883,9 @@ fn task_tool_json(call: &ToolCall) -> serde_json::Value {
         ToolCall::RecordRule { rule } => json!({"tool":"record_rule","args":{"rule":rule}}),
         ToolCall::RecordOutcome { result, comment } => {
             json!({"tool":"record_outcome","args":{"result":result,"comment":comment}})
+        }
+        ToolCall::RecordReaction { reaction, comment } => {
+            json!({"tool":"record_reaction","args":{"reaction":reaction,"comment":comment}})
         }
         _ => unreachable!("task_tool_json called with a non-task tool"),
     }

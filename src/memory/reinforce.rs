@@ -55,7 +55,29 @@ pub(super) fn record_outcome_in_tx(
     outcome_score: f64,
     payload: &str,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
-    run_reinforcement(conn, session_id, "", outcome_score.clamp(-1.0, 1.0), payload)
+    run_reinforcement(
+        conn,
+        session_id,
+        "",
+        outcome_score.clamp(-1.0, 1.0),
+        payload,
+    )
+}
+
+pub(super) fn record_turn_outcome_in_tx(
+    conn: &Connection,
+    session_id: &str,
+    turn_id: &str,
+    outcome_score: f64,
+    payload: &str,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    run_reinforcement(
+        conn,
+        session_id,
+        turn_id,
+        outcome_score.clamp(-1.0, 1.0),
+        payload,
+    )
 }
 
 fn apply_outcome(
@@ -279,9 +301,10 @@ fn load_session_slice(
     db::block_on(load_session_slice_async(conn, session_id, turn_id))
 }
 
-// The slice an outcome reinforces: exploration retrievals/marks, plus
-// game-tagged injections (chain + game knowledge) — NOT the 60 ranked beliefs
-// of every chat turn, which would drown credit assignment in noise.
+// Session-scoped outcomes reinforce exploration retrievals/marks plus
+// game-tagged injections, excluding every chat turn's ranked local beliefs.
+// Turn-scoped outcomes are bounded to one turn, so they include every injected
+// edge (local and game alike) plus that turn's retrievals/marks.
 async fn load_session_slice_async(
     conn: &Connection,
     session_id: &str,
@@ -295,7 +318,7 @@ async fn load_session_slice_async(
         .await?
     } else {
         conn.query(
-            "SELECT source, target, weight FROM events WHERE session_id = ?1 AND turn_id = ?2 AND (event_type IN ('retrieved','marked') OR (event_type = 'injected' AND actor_id = 'game')) ORDER BY id",
+            "SELECT source, target, weight FROM events WHERE session_id = ?1 AND turn_id = ?2 AND event_type IN ('retrieved','marked','injected') ORDER BY id",
             params![session_id, turn_id],
         )
         .await?
@@ -338,11 +361,16 @@ mod tests {
 
     const EVENTS_DDL: &str = "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')";
 
-    async fn insert_event(conn: &turso::Connection, event_type: &str, actor_id: &str) {
+    async fn insert_event(
+        conn: &turso::Connection,
+        turn_id: &str,
+        event_type: &str,
+        actor_id: &str,
+    ) {
         let _ = conn
             .execute(
-                "INSERT INTO events (session_id, actor_id, event_type, source, target) VALUES ('s1', ?1, ?2, 'a', 'b')",
-                turso::params![actor_id, event_type],
+                "INSERT INTO events (session_id, turn_id, actor_id, event_type, source, target) VALUES ('s1', ?1, ?2, ?3, 'a', 'b')",
+                turso::params![turn_id, actor_id, event_type],
             )
             .await;
     }
@@ -359,15 +387,24 @@ mod tests {
                 unreachable!("in-memory database connects")
             };
             let _ = conn.execute(EVENTS_DDL, ()).await;
-            insert_event(&conn, "injected", "game").await;
-            insert_event(&conn, "injected", "local").await;
-            insert_event(&conn, "retrieved", "explorer").await;
-            let Ok(slice) = super::load_session_slice_async(&conn, "s1", "").await else {
+            insert_event(&conn, "turn-1", "injected", "game").await;
+            insert_event(&conn, "turn-1", "injected", "local").await;
+            insert_event(&conn, "turn-1", "retrieved", "explorer").await;
+            let Ok(session_slice) = super::load_session_slice_async(&conn, "s1", "").await else {
                 unreachable!("slice loads")
             };
-            slice
+            let Ok(turn_slice) = super::load_session_slice_async(&conn, "s1", "turn-1").await
+            else {
+                unreachable!("turn slice loads")
+            };
+            (session_slice, turn_slice)
         });
-        assert_eq!(slice.len(), 2, "game injection + retrieval, not the ranked one");
+        assert_eq!(slice.0.len(), 2, "session excludes the ranked injection");
+        assert_eq!(
+            slice.1.len(),
+            3,
+            "turn includes local injection and retrieval"
+        );
     }
 
     #[test]

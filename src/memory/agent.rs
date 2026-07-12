@@ -16,6 +16,9 @@ use super::embed::SemanticEdge;
 use super::graph::{Edge, Node, graph_to_json, normalize_id};
 use super::ledger::{self, Actor, EdgeRef, Event, EventContext};
 
+const POSITIVE_REACTION_SCORE: f64 = 0.5; // replay-tunable.
+const NEGATIVE_REACTION_SCORE: f64 = -0.5; // replay-tunable.
+
 pub enum MemoryEvent {
     Log { phase: &'static str, text: String },
     Append { phase: &'static str, text: String },
@@ -159,6 +162,10 @@ pub(crate) enum ToolCall {
         result: String,
         comment: String,
     },
+    RecordReaction {
+        reaction: String,
+        comment: String,
+    },
     // Heavy-only prospective memory: open an intention against a contextual
     // anchor. Code derives the loop id and fixed durability fields.
     OpenLoop {
@@ -232,6 +239,7 @@ pub(crate) fn describe_tool_call(call: &ToolCall) -> String {
         ToolCall::DefineTask { name, .. } => format!("define_task {name}"),
         ToolCall::RecordRule { rule } => format!("record_rule {rule}"),
         ToolCall::RecordOutcome { result, .. } => format!("record_outcome {result}"),
+        ToolCall::RecordReaction { reaction, .. } => format!("record_reaction {reaction}"),
         ToolCall::OpenLoop { intention, .. } => format!("open_loop {intention}"),
         ToolCall::CloseLoop {
             loop_id,
@@ -771,6 +779,7 @@ fn parse_single_tool(obj: &serde_json::Value) -> Option<ToolCall> {
         "define_task" => parse_define_task(args),
         "record_rule" => parse_record_rule(args),
         "record_outcome" => parse_record_outcome(args),
+        "record_reaction" => parse_record_reaction(args),
         "open_loop" => parse_open_loop(args),
         "close_loop" => parse_close_loop(args),
         "inbox_add" => parse_inbox_add(args),
@@ -800,6 +809,7 @@ pub(crate) fn parse_tool_call_request(call: &ToolCallRequest) -> Option<ToolCall
         "expire_edge" => parse_expire_edge(&args),
         "promote_edge" => parse_promote_edge(&args),
         "inbox_add" => parse_inbox_add(&args),
+        "record_reaction" => parse_record_reaction(&args),
         _ => None,
     }
 }
@@ -1027,6 +1037,17 @@ fn parse_record_outcome(args: &serde_json::Value) -> Option<ToolCall> {
     })
 }
 
+fn parse_record_reaction(args: &serde_json::Value) -> Option<ToolCall> {
+    let reaction = json_str(args, "reaction");
+    if !matches!(reaction.as_str(), "positive" | "negative") {
+        return None;
+    }
+    Some(ToolCall::RecordReaction {
+        reaction,
+        comment: json_str(args, "comment"),
+    })
+}
+
 fn parse_open_loop(args: &serde_json::Value) -> Option<ToolCall> {
     let intention = json_str(args, "intention");
     let anchor = json_str(args, "anchor");
@@ -1220,6 +1241,8 @@ pub(crate) fn apply_tool_call<'scope>(
             apply_record_rule_call(conn, options, events, rule),
         ToolCall::RecordOutcome { result, comment } =>
             apply_record_outcome_call(conn, options, RecordOutcomeCall { result, comment }),
+        ToolCall::RecordReaction { reaction, comment } =>
+            apply_record_reaction_call(conn, options, &reaction, &comment),
         ToolCall::OpenLoop { intention, anchor, due } =>
             apply_open_loop_call(conn, options, events, OpenLoopCall { intention, anchor, due }),
         ToolCall::CloseLoop { loop_id, resolution, note } =>
@@ -1235,7 +1258,10 @@ fn apply_inbox_add_call<'scope>(
     source: &str,
     instruction: &str,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
-    if !matches!(options.actor.actor_id.as_str(), "scribe" | "extract" | "consolidate") {
+    if !matches!(
+        options.actor.actor_id.as_str(),
+        "scribe" | "extract" | "consolidate"
+    ) {
         return Ok("inbox_add denied: inbox_add is a chat memory tool".to_string());
     }
     let is_url = source.starts_with("http://") || source.starts_with("https://");
@@ -1467,6 +1493,60 @@ fn outcome_score(result: &str) -> f64 {
     }
 }
 
+fn apply_record_reaction_call<'scope>(
+    conn: &Connection,
+    options: &ApplyToolOptions<'scope>,
+    reaction: &str,
+    comment: &str,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    if !rule_seat_allowed(&options.actor.actor_id) {
+        return Ok("record_reaction denied: record_reaction is a scribe or heavy tool".to_string());
+    }
+    let session_id = &options.context.session_id;
+    let turn_id = &options.context.turn_id;
+    let Some(target_turn) = previous_turn(conn, session_id, turn_id)? else {
+        return Ok("record_reaction denied: no previous turn in this session".to_string());
+    };
+    let score = reaction_score(reaction);
+    let payload =
+        serde_json::json!({"kind":"reaction","reaction":reaction,"comment":comment}).to_string();
+    let summary = super::reinforce::record_turn_outcome_in_tx(
+        conn,
+        session_id,
+        &target_turn,
+        score,
+        &payload,
+    )?;
+    runlog::log("reaction", &summary);
+    Ok(format!("record_reaction: {reaction} ({target_turn})"))
+}
+
+fn previous_turn(
+    conn: &Connection,
+    session_id: &str,
+    current_turn: &str,
+) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+    db::block_on(async {
+        let mut rows = conn
+            .query(
+                "SELECT turn_id FROM events WHERE session_id = ?1 AND turn_id != '' AND turn_id != ?2 ORDER BY id DESC LIMIT 1",
+                turso::params![session_id, current_turn],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        Ok(Some(db::text(row.get_value(0)?)))
+    })
+}
+
+fn reaction_score(reaction: &str) -> f64 {
+    match reaction {
+        "positive" => POSITIVE_REACTION_SCORE,
+        _ => NEGATIVE_REACTION_SCORE,
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub(super) fn tool_call_touches_loop(
     conn: &Connection,
@@ -1486,6 +1566,7 @@ pub(super) fn tool_call_touches_loop(
         | ToolCall::DefineTask { .. }
         | ToolCall::RecordRule { .. }
         | ToolCall::RecordOutcome { .. }
+        | ToolCall::RecordReaction { .. }
         | ToolCall::OpenLoop { .. }
         | ToolCall::CloseLoop { .. }
         | ToolCall::InboxAdd { .. } => Ok(false),
@@ -2260,10 +2341,10 @@ mod tests {
             call: ToolCall,
         ) -> String {
             let mut events: Vec<Event> = Vec::new();
-            let Ok(description) = apply_tool_call(call, conn, options, &mut events) else {
-                unreachable!("apply succeeds")
-            };
-            description
+            match apply_tool_call(call, conn, options, &mut events) {
+                Ok(description) => description,
+                Err(err) => panic!("apply succeeds: {err}"),
+            }
         }
 
         fn chain(conn: &turso::Connection) -> Vec<crate::memory::graph::Edge> {
@@ -2362,8 +2443,11 @@ mod tests {
         use turso::Builder;
 
         const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
-        const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', PRIMARY KEY (source, target))";
+        const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', embedding BLOB, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', PRIMARY KEY (source, target))";
         const EVENTS_DDL: &str = "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL, actor_id TEXT NOT NULL, event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')";
+        const VIEWS_DDL: &str = "CREATE TABLE edge_actor_views (actor_type TEXT NOT NULL, actor_id TEXT NOT NULL, source TEXT NOT NULL, target TEXT NOT NULL, views REAL NOT NULL DEFAULT 0, last_visited_at TEXT NOT NULL, PRIMARY KEY (actor_type, actor_id, source, target))";
+        const POSITIONS_DDL: &str = "CREATE TABLE actor_positions (actor_type TEXT NOT NULL, actor_id TEXT NOT NULL, sum_vector BLOB, total_weight REAL NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY (actor_type, actor_id))";
+        const POSITION_HISTORY_DDL: &str = "CREATE TABLE actor_position_history (actor_type TEXT NOT NULL, actor_id TEXT NOT NULL, embedding BLOB, recorded_at TEXT NOT NULL)";
 
         async fn harness() -> turso::Connection {
             let Ok(database) = Builder::new_local(":memory:").build().await else {
@@ -2375,6 +2459,9 @@ mod tests {
             let _ = conn.execute(NODES_DDL, ()).await;
             let _ = conn.execute(EDGES_DDL, ()).await;
             let _ = conn.execute(EVENTS_DDL, ()).await;
+            let _ = conn.execute(VIEWS_DDL, ()).await;
+            let _ = conn.execute(POSITIONS_DDL, ()).await;
+            let _ = conn.execute(POSITION_HISTORY_DDL, ()).await;
             conn
         }
 
@@ -2395,10 +2482,10 @@ mod tests {
             call: ToolCall,
         ) -> String {
             let mut events: Vec<Event> = Vec::new();
-            let Ok(description) = apply_tool_call(call, conn, options, &mut events) else {
-                unreachable!("apply succeeds")
-            };
-            description
+            match apply_tool_call(call, conn, options, &mut events) {
+                Ok(description) => description,
+                Err(err) => panic!("apply succeeds: {err}"),
+            }
         }
 
         fn define(name: &str, description: &str) -> ToolCall {
@@ -2525,6 +2612,116 @@ mod tests {
                 result: result.to_string(),
                 comment: "the game ended".to_string(),
             }
+        }
+
+        fn reaction(value: &str) -> ToolCall {
+            ToolCall::RecordReaction {
+                reaction: value.to_string(),
+                comment: "evaluated the previous answer".to_string(),
+            }
+        }
+
+        async fn seed_reaction_edge(conn: &turso::Connection) {
+            let _ = conn
+                .execute("INSERT INTO nodes (id) VALUES ('a'), ('b')", ())
+                .await;
+            let _ = conn
+                .execute(
+                    "INSERT INTO edges (source, target, confidence) VALUES ('a', 'b', 0.5)",
+                    (),
+                )
+                .await;
+            let _ = conn.execute("INSERT INTO events (ts, session_id, turn_id, actor_type, actor_id, event_type, source, target) VALUES ('', 'game-1', 'turn-old', 'system', 'local', 'injected', 'a', 'b'), ('', 'game-1', 'turn-latest', 'system', 'local', 'injected', 'a', 'b')", ()).await;
+        }
+
+        fn outcome_turns(conn: &turso::Connection) -> Vec<String> {
+            db::block_on(async {
+                let Ok(mut rows) = conn
+                    .query(
+                        "SELECT turn_id FROM events WHERE event_type = 'outcome' ORDER BY id",
+                        (),
+                    )
+                    .await
+                else {
+                    unreachable!("outcomes query")
+                };
+                let mut turns = Vec::new();
+                while let Ok(Some(row)) = rows.next().await {
+                    let Ok(value) = row.get_value(0) else {
+                        unreachable!("turn value")
+                    };
+                    turns.push(db::text(value));
+                }
+                turns
+            })
+        }
+
+        #[test]
+        fn reaction_parse_accepts_binary_values_only() {
+            for value in ["positive", "negative"] {
+                let input = format!(
+                    r#"{{"tool":"record_reaction","args":{{"reaction":"{value}","comment":"clear evaluation"}}}}"#
+                );
+                assert!(matches!(
+                    parse_tool_calls(&input)[0],
+                    ToolCall::RecordReaction { .. }
+                ));
+            }
+            assert!(
+                parse_tool_calls(r#"{"tool":"record_reaction","args":{"reaction":"meh"}}"#)
+                    .is_empty()
+            );
+        }
+
+        #[test]
+        fn reaction_targets_latest_prior_turn_and_is_seat_symmetric() {
+            let conn = db::block_on(harness());
+            db::block_on(seed_reaction_edge(&conn));
+            for phase in ["scribe", "extract"] {
+                let description = apply(&conn, &options_for_phase(phase), reaction("positive"));
+                assert!(
+                    description.contains("turn-latest"),
+                    "{phase}: {description}"
+                );
+            }
+            for phase in ["consolidation", "ingest"] {
+                let description = apply(&conn, &options_for_phase(phase), reaction("positive"));
+                assert!(description.contains("denied"), "{phase}: {description}");
+            }
+            assert_eq!(outcome_turns(&conn), vec!["turn-latest"]);
+        }
+
+        #[test]
+        fn reaction_denies_without_prior_turn() {
+            let conn = db::block_on(harness());
+            let description = apply(&conn, &options_for_phase("scribe"), reaction("negative"));
+            assert_eq!(
+                description,
+                "record_reaction denied: no previous turn in this session"
+            );
+            assert!(outcome_turns(&conn).is_empty());
+        }
+
+        #[test]
+        fn reaction_score_moves_confidence_and_session_outcome_coexists() {
+            let positive_conn = db::block_on(harness());
+            db::block_on(seed_reaction_edge(&positive_conn));
+            let positive_before = edge(&positive_conn, "a", "b").confidence;
+            apply(
+                &positive_conn,
+                &options_for_phase("scribe"),
+                reaction("positive"),
+            );
+            assert!(edge(&positive_conn, "a", "b").confidence > positive_before);
+
+            let conn = db::block_on(harness());
+            db::block_on(seed_reaction_edge(&conn));
+            let before = edge(&conn, "a", "b").confidence;
+            apply(&conn, &options_for_phase("scribe"), reaction("negative"));
+            assert!(edge(&conn, "a", "b").confidence < before);
+            apply(&conn, &options_for_phase("scribe"), reaction("negative"));
+            apply(&conn, &options_for_phase("scribe"), outcome("draw"));
+            assert_eq!(outcome_turns(&conn), vec!["turn-latest", ""]);
         }
 
         #[test]
@@ -2663,6 +2860,7 @@ mod tests {
         }
 
         #[test]
+        #[allow(clippy::too_many_lines)]
         fn outcomes_cover_window_resolutions_and_all_queued_items() {
             let conn = db::block_on(harness());
             let Ok(done_id) = db::insert_inbox_item(&conn, "https://done", "") else {
@@ -2688,12 +2886,23 @@ mod tests {
                 "UPDATE inbox SET status = 'done', resolved_at = '2020-01-01T00:00:00', result = 'x' WHERE id = ?1",
                 turso::params![old_id],
             ));
-            let Ok(outcomes) = db::block_on(db::load_inbox_outcomes(&conn, "2026-01-01", "2099-01-01")) else {
+            let Ok(outcomes) =
+                db::block_on(db::load_inbox_outcomes(&conn, "2026-01-01", "2099-01-01"))
+            else {
                 unreachable!("outcomes load")
             };
-            assert!(outcomes.contains(&"https://done: done".to_string()), "{outcomes:?}");
-            assert!(outcomes.contains(&"https://failed: failed (HTTP 404)".to_string()), "{outcomes:?}");
-            assert!(outcomes.contains(&"https://queued: queued".to_string()), "{outcomes:?}");
+            assert!(
+                outcomes.contains(&"https://done: done".to_string()),
+                "{outcomes:?}"
+            );
+            assert!(
+                outcomes.contains(&"https://failed: failed (HTTP 404)".to_string()),
+                "{outcomes:?}"
+            );
+            assert!(
+                outcomes.contains(&"https://queued: queued".to_string()),
+                "{outcomes:?}"
+            );
             for line in &outcomes {
                 assert!(!line.starts_with("https://old"), "{outcomes:?}");
             }
