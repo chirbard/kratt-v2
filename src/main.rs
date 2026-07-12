@@ -29,11 +29,24 @@ const DEFAULT_CHAT_MODEL: &str = "deepseek/deepseek-v4-flash";
 const DEFAULT_MEMORY_MODEL: &str = "openai/gpt-oss-20b:nitro";
 const DEFAULT_EMBED_MODEL: &str = "perplexity/pplx-embed-v1-0.6b";
 
+// Panics land in the runlog before the default hook prints them — under a
+// daemon (systemd, detached terminal) the runlog is the only place they are
+// seen at all. Observed live: turso pager panics inside tokio tasks survived
+// the process but aborted DB operations invisibly (backlog: turso pager panic).
+fn install_panic_runlog() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        runlog::log("panic", &info.to_string());
+        default_hook(info);
+    }));
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // All data paths (kratt-data/, logs, .env) are relative — pin the working
     // directory to the crate root so `cargo run` from a subdirectory doesn't
     // scatter kratt-data/ copies around the repo.
     std::env::set_current_dir(env!("CARGO_MANIFEST_DIR"))?;
+    install_panic_runlog();
     dotenvy::dotenv()?;
     let api_key = std::env::var("OPENROUTER_API_KEY")?;
     let tavily_key = std::env::var("TAVILY_API_KEY").unwrap_or_default();
