@@ -11,6 +11,7 @@ use crate::api::LlmClient;
 use crate::memory::{self, DayDigest};
 use crate::prompts;
 use crate::runlog;
+use crate::session;
 use crate::timeutil;
 
 use super::bot::BotTransport;
@@ -104,6 +105,10 @@ impl ReportCycle {
         }
         let message = self.compose_message(&digest);
         super::send_answer(transport, self.chat_id, &message);
+        // Into today's session file too: the user sees the report on the same
+        // Telegram page as the chat, so the model must see it in its recent
+        // context as well — otherwise it has no idea what it reported.
+        session::append_entry(&session_path_for_today(&today), "assistant", &message);
         runlog::log("tg", "daily report sent");
         self.awaiting_verdict = Some(yesterday);
     }
@@ -132,6 +137,10 @@ impl ReportCycle {
         record_day_verdict(&yesterday, score);
         let confirmation = format!("scored yesterday {score:+.1} — thanks");
         super::send_answer(transport, self.chat_id, &confirmation);
+        // The verdict exchange belongs to the visible conversation too.
+        let session = session_path_for_today(&timeutil::today_iso());
+        session::append_entry(&session, "user", text);
+        session::append_entry(&session, "assistant", &confirmation);
         runlog::log("tg", &format!("daily verdict recorded: {score:+.1}"));
         true
     }
@@ -214,6 +223,10 @@ fn parse_verdict(text: &str) -> Option<i64> {
 
 // The deterministic half of the report: a compact text rendering of the digest
 // that both feeds the phrasing call and stands alone as the fallback body.
+fn session_path_for_today(today: &str) -> std::path::PathBuf {
+    super::session_path_for_id(&format!("tg-{today}"))
+}
+
 fn render_digest(digest: &DayDigest) -> String {
     let mut lines = Vec::new();
     lines.push(format!("Day: {}", digest.day));
