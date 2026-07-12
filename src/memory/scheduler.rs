@@ -21,6 +21,7 @@ const DRIFT_WARN_DISTANCE: f64 = 0.10;
 pub enum SchedulerAction {
     Dream { reason: String },
     Explore { reason: String },
+    InboxStudy { reason: String },
     Ingest { path: PathBuf, reason: String },
     Rest { reason: String },
 }
@@ -29,6 +30,7 @@ pub enum SchedulerAction {
 #[derive(Debug, Clone, Default)]
 pub struct SchedulerInputs {
     pub acquisition_debt: usize,
+    pub queued_inbox: usize,
     pub re_read_candidates: Vec<(String, usize, String)>, // (path, note_count, source_node_id)
     pub open_curiosity_notes_count: usize,
     pub coldest_edge_age_days: Option<i64>,
@@ -46,6 +48,7 @@ pub fn gather_inputs() -> SchedulerInputs {
 
 async fn gather_inputs_async(conn: &Connection) -> SchedulerInputs {
     let acquisition_debt = count_acquisition_debt(conn).await;
+    let queued_inbox = db::count_queued_inbox(conn).await;
     let re_read_candidates = find_re_read_candidates(conn).await;
     let open_curiosity_notes_count = count_open_curiosity_notes(conn).await;
     let coldest_edge_age_days = find_coldest_edge_age_days(conn).await;
@@ -53,6 +56,7 @@ async fn gather_inputs_async(conn: &Connection) -> SchedulerInputs {
 
     SchedulerInputs {
         acquisition_debt,
+        queued_inbox,
         re_read_candidates,
         open_curiosity_notes_count,
         coldest_edge_age_days,
@@ -64,6 +68,11 @@ async fn gather_inputs_async(conn: &Connection) -> SchedulerInputs {
 pub fn decide(inputs: &SchedulerInputs) -> SchedulerAction {
     if let Some(action) = check_consolidation_debt(inputs) {
         return action;
+    }
+    if inputs.queued_inbox > 0 {
+        return SchedulerAction::InboxStudy {
+            reason: format!("{} inbox items queued", inputs.queued_inbox),
+        };
     }
     if let Some(action) = check_re_read_candidates(inputs) {
         return action;
@@ -236,6 +245,9 @@ pub fn log_scheduler_decision(action: &SchedulerAction) {
         }
         SchedulerAction::Explore { reason } => {
             crate::runlog::log("sched", &format!("explore: {}", reason));
+        }
+        SchedulerAction::InboxStudy { reason } => {
+            crate::runlog::log("sched", &format!("inbox study: {reason}"));
         }
         SchedulerAction::Ingest { path, reason } => {
             crate::runlog::log(
@@ -527,6 +539,7 @@ mod tests {
     fn test_decide_dream_when_debt_high() {
         let inputs = SchedulerInputs {
             acquisition_debt: 60,
+            queued_inbox: 0,
             re_read_candidates: vec![],
             open_curiosity_notes_count: 0,
             coldest_edge_age_days: Some(20),
@@ -550,6 +563,7 @@ mod tests {
 
         let inputs = SchedulerInputs {
             acquisition_debt: 10,
+            queued_inbox: 0,
             re_read_candidates: vec![(
                 temp_path.to_string_lossy().into_owned(),
                 3,
@@ -577,6 +591,7 @@ mod tests {
     fn test_decide_explore_when_open_notes_exist() {
         let inputs = SchedulerInputs {
             acquisition_debt: 10,
+            queued_inbox: 0,
             re_read_candidates: vec![("path/to/file.md".to_string(), 2, "node1".to_string())],
             open_curiosity_notes_count: 5,
             coldest_edge_age_days: Some(5),
@@ -595,6 +610,7 @@ mod tests {
     fn test_decide_explore_when_cold_region() {
         let inputs = SchedulerInputs {
             acquisition_debt: 10,
+            queued_inbox: 0,
             re_read_candidates: vec![],
             open_curiosity_notes_count: 0,
             coldest_edge_age_days: Some(15), // > COLD_REGION_DAYS (14)
@@ -614,6 +630,7 @@ mod tests {
     fn test_decide_rest_when_no_visit_data() {
         let inputs = SchedulerInputs {
             acquisition_debt: 10,
+            queued_inbox: 0,
             re_read_candidates: vec![],
             open_curiosity_notes_count: 0,
             coldest_edge_age_days: None, // no edge_actor_views rows yet
@@ -630,6 +647,7 @@ mod tests {
     fn test_decide_rest_when_nothing_to_do() {
         let inputs = SchedulerInputs {
             acquisition_debt: 10,
+            queued_inbox: 0,
             re_read_candidates: vec![],
             open_curiosity_notes_count: 0,
             coldest_edge_age_days: Some(5),
@@ -650,6 +668,7 @@ mod tests {
         // Dream should win over ingest when debt is high
         let inputs = SchedulerInputs {
             acquisition_debt: 60, // >= 50
+            queued_inbox: 0,
             re_read_candidates: vec![("path/to/file.md".to_string(), 5, "node1".to_string())],
             open_curiosity_notes_count: 0,
             coldest_edge_age_days: Some(5),
@@ -663,10 +682,34 @@ mod tests {
     }
 
     #[test]
+    fn inbox_study_precedes_re_read() {
+        let inputs = SchedulerInputs {
+            queued_inbox: 2,
+            re_read_candidates: vec![("missing".to_string(), 9, "node".to_string())],
+            ..SchedulerInputs::default()
+        };
+        assert_eq!(
+            decide(&inputs),
+            SchedulerAction::InboxStudy { reason: "2 inbox items queued".to_string() }
+        );
+    }
+
+    #[test]
+    fn consolidation_debt_precedes_inbox() {
+        let inputs = SchedulerInputs {
+            acquisition_debt: ACQUISITION_DEBT_THRESHOLD,
+            queued_inbox: 1,
+            ..SchedulerInputs::default()
+        };
+        assert!(matches!(decide(&inputs), SchedulerAction::Dream { .. }));
+    }
+
+    #[test]
     fn test_rule_priority_ingest_over_explore() {
         // Ingest should win over explore when notes are above threshold
         let inputs = SchedulerInputs {
             acquisition_debt: 10,
+            queued_inbox: 0,
             re_read_candidates: vec![("path/to/file.md".to_string(), 3, "node1".to_string())],
             open_curiosity_notes_count: 5,
             coldest_edge_age_days: Some(5),

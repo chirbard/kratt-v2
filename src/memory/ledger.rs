@@ -350,6 +350,7 @@ pub struct DayDigest {
     pub dream_events: usize,
     // Live intentions whose due date has arrived; rendered for the report.
     pub due_loops: Vec<String>,
+    pub inbox_outcomes: Vec<String>,
     // gist edge refs ("source → target") — the night's crown output.
     pub gists: Vec<String>,
     // Up to 5 most-injected edges: what memory was actually used for.
@@ -370,6 +371,7 @@ impl DayDigest {
             && self.pruned == 0
             && self.dream_events == 0
             && self.due_loops.is_empty()
+            && self.inbox_outcomes.is_empty()
             && self.top_injected.is_empty()
     }
 }
@@ -410,6 +412,7 @@ async fn day_digest_async(
     let mut digest = day_slice_digest(conn, day).await?;
     digest.dream_events = count_night_dream_events(conn, night).await?;
     digest.gists = load_night_gists(conn, night).await?;
+    digest.inbox_outcomes = db::load_inbox_outcomes(conn, &night.from, &night.until).await?;
     let loop_items = db::load_due_loops_async(conn, today).await?;
     for loop_item in loop_items {
         digest.due_loops.push(loop_item.display());

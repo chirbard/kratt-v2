@@ -349,6 +349,11 @@ async fn create_base_tables(conn: &Connection) -> Result<(), Box<dyn Error + Sen
         (),
     )
     .await?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS inbox (id INTEGER PRIMARY KEY AUTOINCREMENT, accepted_at TEXT NOT NULL, source TEXT NOT NULL, instruction TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'queued', resolved_at TEXT NOT NULL DEFAULT '', result TEXT NOT NULL DEFAULT '')",
+        (),
+    )
+    .await?;
     Ok(())
 }
 
@@ -509,6 +514,96 @@ pub fn parse_vector32_json(json_text: &str) -> Result<Vec<f64>, Box<dyn Error + 
 
 pub fn timestamp_now() -> String {
     crate::timeutil::timestamp_now()
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct InboxItem {
+    pub item_id: i64,
+    pub source: String,
+    pub instruction: String,
+}
+
+pub fn insert_inbox_item(
+    conn: &Connection,
+    source: &str,
+    instruction: &str,
+) -> Result<i64, Box<dyn Error + Send + Sync>> {
+    let accepted_at = timestamp_now();
+    block_on(async {
+        conn.execute(
+            "INSERT INTO inbox (accepted_at, source, instruction) VALUES (?1, ?2, ?3)",
+            params![accepted_at, source, instruction],
+        )
+        .await?;
+        Ok(conn.last_insert_rowid())
+    })
+}
+
+pub fn oldest_queued_inbox(
+    conn: &Connection,
+) -> Result<Option<InboxItem>, Box<dyn Error + Send + Sync>> {
+    block_on(async {
+        let mut rows = conn
+            .query(
+                "SELECT id, source, instruction FROM inbox WHERE status = 'queued' ORDER BY id LIMIT 1",
+                (),
+            )
+            .await?;
+        let Some(row) = rows.next().await? else { return Ok(None) };
+        Ok(Some(InboxItem {
+            item_id: row.get::<i64>(0)?,
+            source: row.get::<String>(1)?,
+            instruction: row.get::<String>(2)?,
+        }))
+    })
+}
+
+pub fn resolve_inbox_item(
+    conn: &Connection,
+    item_id: i64,
+    status: &str,
+    result: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let resolved_at = timestamp_now();
+    block_on(async {
+        conn.execute(
+            "UPDATE inbox SET status = ?1, resolved_at = ?2, result = ?3 WHERE id = ?4",
+            params![status, resolved_at, result, item_id],
+        )
+        .await?;
+        Ok(())
+    })
+}
+
+pub async fn count_queued_inbox(conn: &Connection) -> usize {
+    let Ok(mut rows) = conn.query("SELECT COUNT(*) FROM inbox WHERE status = 'queued'", ()).await else { return 0 };
+    match rows.next().await {
+        Ok(Some(row)) => row.get::<i64>(0).unwrap_or(0) as usize,
+        _ => 0,
+    }
+}
+
+pub async fn load_inbox_outcomes(
+    conn: &Connection,
+    from: &str,
+    until: &str,
+) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+    let Ok(mut rows) = conn.query(
+        "SELECT source, status, result FROM inbox WHERE status = 'queued' OR (resolved_at >= ?1 AND resolved_at < ?2) ORDER BY id",
+        params![from, until],
+    ).await else { return Ok(Vec::new()) };
+    let mut outcomes = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let source = row.get::<String>(0)?;
+        let status = row.get::<String>(1)?;
+        let result = row.get::<String>(2)?;
+        if status == "failed" {
+            outcomes.push(format!("{source}: failed ({result})"));
+        } else {
+            outcomes.push(format!("{source}: {status}"));
+        }
+    }
+    Ok(outcomes)
 }
 
 pub fn db_init() -> Result<(), Box<dyn Error + Send + Sync>> {

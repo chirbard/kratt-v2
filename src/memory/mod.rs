@@ -21,10 +21,11 @@ pub use db::{
     db_init, insert_message, last_sync_error, latest_session_id, read_message_context,
     register_session, search_messages_fts, sync_now, sync_pull_best_effort, sync_push_best_effort,
 };
+pub(crate) use db::{InboxItem, oldest_queued_inbox, open_connection, resolve_inbox_item};
 pub use dream::{DreamEvent, run_dream_pass};
 pub use embed::{SemanticEdge, edges_to_toon, run_embed_pass, select_semantic_edges_routed};
 pub use explore::{ExploreEvent, run_exploration_pass};
-pub use ingest::{IngestEvent, run_ingestion_pass};
+pub use ingest::{IngestEvent, run_focused_ingestion_pass, run_ingestion_pass};
 pub use ledger::{
     Actor, Attribution, DayDigest, EdgeRef, Event, EventContext, NightWindow, day_digest,
     newest_dream_session_id, recompute_positions, record_events, turn_attribution,

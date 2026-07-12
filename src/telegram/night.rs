@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use crate::api::{EmbeddingClient, LlmClient};
 use crate::memory::scheduler::{self, SchedulerAction};
-use crate::memory::{self, DreamEvent, ExploreEvent};
+use crate::memory::{self, DreamEvent, ExploreEvent, IngestEvent};
 use crate::runlog;
 use crate::timeutil;
 use crate::web::SearchClient;
@@ -84,6 +84,7 @@ struct NightGate {
     // revert to periodic checks) — correctness depends on single-writer.
     dirty: bool,
     dreamed_tonight: bool,
+    studied_inbox_tonight: bool,
 }
 
 impl NightGate {
@@ -97,6 +98,7 @@ impl NightGate {
             night_day: None,
             dirty: true,
             dreamed_tonight: false,
+            studied_inbox_tonight: false,
         }
     }
 
@@ -109,6 +111,7 @@ impl NightGate {
             self.night_day = Some(today.to_string());
             self.count = 0;
             self.dreamed_tonight = false;
+            self.studied_inbox_tonight = false;
             self.dirty = true;
         }
         inside && self.dirty && self.cooldown_elapsed(now) && self.count < self.max_actions
@@ -209,7 +212,10 @@ impl NightCycle {
     }
 
     fn run_scheduler_cycle(&mut self, now: Instant) {
-        let inputs = scheduler::gather_inputs();
+        let mut inputs = scheduler::gather_inputs();
+        if self.gate.studied_inbox_tonight {
+            inputs.queued_inbox = 0;
+        }
         let action = scheduler::decide(&inputs);
         scheduler::log_scheduler_decision(&action);
         if !matches!(action, SchedulerAction::Rest { .. }) {
@@ -229,6 +235,12 @@ impl NightCycle {
             SchedulerAction::Explore { reason } => {
                 runlog::log("tg", &format!("night action: explore ({reason})"));
                 self.run_explore();
+                self.gate.record_action(now);
+            }
+            SchedulerAction::InboxStudy { reason } => {
+                runlog::log("tg", &format!("night action: inbox study ({reason})"));
+                self.run_inbox_study();
+                self.gate.studied_inbox_tonight = true;
                 self.gate.record_action(now);
             }
             SchedulerAction::Ingest { path, reason } => {
@@ -266,6 +278,43 @@ impl NightCycle {
             runlog::log("tg", &format!("night explore failed: {err}"));
         }
         for _event in receiver {}
+    }
+
+    fn run_inbox_study(&self) {
+        let Ok(conn) = memory::open_connection() else { return };
+        let Ok(Some(item)) = memory::oldest_queued_inbox(&conn) else { return };
+        let result = self.study_inbox_item(&item);
+        match result {
+            Ok(session) => {
+                let _ = memory::resolve_inbox_item(&conn, item.item_id, "done", &session);
+                runlog::log("inbox", &format!("studied: {} (session {session})", item.source));
+            }
+            Err(reason) => {
+                let _ = memory::resolve_inbox_item(&conn, item.item_id, "failed", &reason);
+                runlog::log("inbox", &format!("failed: {} ({reason})", item.source));
+            }
+        }
+    }
+
+    fn study_inbox_item(&self, item: &memory::InboxItem) -> Result<String, String> {
+        let path = if item.source.starts_with("http://") || item.source.starts_with("https://") {
+            let search = self.search.as_ref().ok_or("web extraction is unavailable")?;
+            let text = search.extract_url(&item.source)?;
+            let dir = std::path::PathBuf::from(crate::paths::data_file("inbox"));
+            if let Err(err) = std::fs::create_dir_all(&dir) { return Err(err.to_string()) }
+            let path = dir.join(format!("{}.txt", item.item_id));
+            if let Err(err) = std::fs::write(&path, text) { return Err(err.to_string()) }
+            path
+        } else {
+            std::path::PathBuf::from(&item.source)
+        };
+        let (sender, receiver) = std::sync::mpsc::channel::<IngestEvent>();
+        let result = match memory::run_focused_ingestion_pass(
+            Arc::clone(&self.memory_llm), Arc::clone(&self.embed), self.search.clone(),
+            (&path, &item.instruction), sender,
+        ) { Ok(session) => Ok(session), Err(err) => Err(err.to_string()) };
+        for _event in receiver {}
+        result
     }
 }
 
