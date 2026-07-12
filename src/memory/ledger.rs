@@ -354,6 +354,9 @@ pub struct DayDigest {
     pub top_injected: Vec<String>,
     // Up to 5 example new edge refs, for concreteness.
     pub new_edges: Vec<String>,
+    // The day's most active turns, each with the edges it created — the raw
+    // material for narrating the day as a few threads instead of a topic soup.
+    pub turn_groups: Vec<String>,
 }
 
 impl DayDigest {
@@ -368,14 +371,23 @@ impl DayDigest {
     }
 }
 
+// The window the night slice covers: [from, until) as ISO-prefix timestamps.
+// Dreams for a day run after midnight (the 0-3 UTC window), so the civil-day
+// slice that works for turns systematically misses the night that consolidated
+// the day — the report was blind to its own dreams.
+pub struct NightWindow {
+    pub from: String,
+    pub until: String,
+}
+
 // Best-effort: any query failure yields an empty (quiet-looking) digest rather
 // than blocking the report path.
-pub fn day_digest(day: &str) -> DayDigest {
+pub fn day_digest(day: &str, night: &NightWindow) -> DayDigest {
     let conn = match db::open_connection() {
         Ok(conn) => conn,
         Err(_) => return DayDigest::default(),
     };
-    db::block_on(day_digest_async(&conn, day)).unwrap_or_default()
+    db::block_on(day_digest_async(&conn, day, night)).unwrap_or_default()
 }
 
 // The id of the most recently registered dream session, if any — the verdict
@@ -388,6 +400,17 @@ pub fn newest_dream_session_id() -> Option<String> {
 async fn day_digest_async(
     conn: &Connection,
     day: &str,
+    night: &NightWindow,
+) -> Result<DayDigest, Box<dyn Error + Send + Sync>> {
+    let mut digest = day_slice_digest(conn, day).await?;
+    digest.dream_events = count_night_dream_events(conn, night).await?;
+    digest.gists = load_night_gists(conn, night).await?;
+    Ok(digest)
+}
+
+async fn day_slice_digest(
+    conn: &Connection,
+    day: &str,
 ) -> Result<DayDigest, Box<dyn Error + Send + Sync>> {
     Ok(DayDigest {
         day: day.to_string(),
@@ -395,10 +418,10 @@ async fn day_digest_async(
         created: count_day_event_type(conn, day, "created").await?,
         updated: count_day_event_type(conn, day, "updated").await?,
         pruned: count_day_event_type(conn, day, "pruned").await?,
-        dream_events: count_day_dream_events(conn, day).await?,
-        gists: load_day_gists(conn, day).await?,
         top_injected: load_day_top_injected(conn, day).await?,
         new_edges: load_day_new_edges(conn, day).await?,
+        turn_groups: load_day_turn_groups(conn, day).await?,
+        ..DayDigest::default()
     })
 }
 
@@ -429,14 +452,14 @@ async fn count_day_event_type(
     count_from(&mut rows).await
 }
 
-async fn count_day_dream_events(
+async fn count_night_dream_events(
     conn: &Connection,
-    day: &str,
+    night: &NightWindow,
 ) -> Result<usize, Box<dyn Error + Send + Sync>> {
     let mut rows = conn
         .query(
-            "SELECT COUNT(*) FROM events WHERE substr(ts, 1, 10) = ?1 AND session_id LIKE 'dream-%'",
-            params![day],
+            "SELECT COUNT(*) FROM events WHERE ts >= ?1 AND ts < ?2 AND session_id LIKE 'dream-%'",
+            params![night.from.as_str(), night.until.as_str()],
         )
         .await?;
     count_from(&mut rows).await
@@ -453,14 +476,14 @@ async fn count_from(
 
 // gist_of provenance lives on the consolidation's 'updated' events; each names
 // the supporting episodes. We surface the gist edge ref itself.
-async fn load_day_gists(
+async fn load_night_gists(
     conn: &Connection,
-    day: &str,
+    night: &NightWindow,
 ) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
     let mut rows = conn
         .query(
-            "SELECT source, target FROM events WHERE substr(ts, 1, 10) = ?1 AND event_type = 'updated' AND payload LIKE '%gist_of%'",
-            params![day],
+            "SELECT source, target FROM events WHERE ts >= ?1 AND ts < ?2 AND event_type = 'updated' AND payload LIKE '%gist_of%'",
+            params![night.from.as_str(), night.until.as_str()],
         )
         .await?;
     let mut gists = Vec::new();
@@ -498,6 +521,29 @@ async fn load_day_new_edges(
         )
         .await?;
     collect_edge_refs(&mut rows).await
+}
+
+// The day's most active turns (by edges created) with what each created —
+// deterministic thread material. One line per turn, oldest first.
+async fn load_day_turn_groups(
+    conn: &Connection,
+    day: &str,
+) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+    let mut rows = conn
+        .query(
+            "SELECT turn_id, GROUP_CONCAT(source || ' → ' || target, '; ') FROM events WHERE substr(ts, 1, 10) = ?1 AND event_type = 'created' AND turn_id != '' AND session_id NOT LIKE 'dream-%' GROUP BY turn_id ORDER BY COUNT(*) DESC LIMIT 6",
+            params![day],
+        )
+        .await?;
+    let mut groups = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let turn = db::text(row.get_value(0)?);
+        let refs = db::text(row.get_value(1)?);
+        if !turn.is_empty() && !refs.is_empty() {
+            groups.push(refs);
+        }
+    }
+    Ok(groups)
 }
 
 async fn collect_edge_refs(
@@ -1370,7 +1416,21 @@ mod tests {
     }
 
     fn digest(conn: &Connection, day: &str) -> super::DayDigest {
-        let Ok(digest) = db::block_on(super::day_digest_async(conn, day)) else {
+        // Whole-civil-day night window: matches the old slice for tests that
+        // don't probe the boundary.
+        let night = super::NightWindow {
+            from: format!("{day}T00"),
+            until: format!("{day}T24"),
+        };
+        digest_with_night(conn, day, &night)
+    }
+
+    fn digest_with_night(
+        conn: &Connection,
+        day: &str,
+        night: &super::NightWindow,
+    ) -> super::DayDigest {
+        let Ok(digest) = db::block_on(super::day_digest_async(conn, day, night)) else {
             unreachable!("digest query runs")
         };
         digest
@@ -1403,6 +1463,31 @@ mod tests {
         // Dream events carry no turn_id, so they never count as turns.
         assert_eq!(digest.turns, 0);
         assert_eq!(digest.gists, vec!["lesson → topic".to_string()]);
+    }
+
+    // The production window is yesterday's report hour → today's: a dream 47
+    // seconds after midnight belongs to the night that consolidated yesterday.
+    #[test]
+    fn night_window_catches_the_post_midnight_dream() {
+        let conn = db::block_on(digest_harness());
+        db::block_on(insert_event(&conn, TODAY, "dream-200", "", "created", "x", "y", ""));
+        let night = super::NightWindow {
+            from: format!("{YESTERDAY}T07"),
+            until: format!("{TODAY}T07"),
+        };
+        let digest = digest_with_night(&conn, YESTERDAY, &night);
+        assert_eq!(digest.dream_events, 1);
+    }
+
+    #[test]
+    fn digest_groups_created_edges_by_turn() {
+        let conn = db::block_on(digest_harness());
+        db::block_on(insert_event(&conn, YESTERDAY, "tg-x", "turn-a", "created", "a", "b", ""));
+        db::block_on(insert_event(&conn, YESTERDAY, "tg-x", "turn-a", "created", "c", "d", ""));
+        db::block_on(insert_event(&conn, YESTERDAY, "tg-x", "turn-b", "created", "e", "f", ""));
+        let digest = digest(&conn, YESTERDAY);
+        assert_eq!(digest.turn_groups.len(), 2);
+        assert_eq!(digest.turn_groups[0], "a → b; c → d");
     }
 
     #[test]
