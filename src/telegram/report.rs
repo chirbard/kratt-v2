@@ -76,6 +76,18 @@ impl ReportCycle {
     }
 
     // Called after each idle poll. Sends at most one report per day.
+    // The night slice this report covers: yesterday's report hour → today's.
+    // Dreams run after midnight, so a civil-day slice for dream events would
+    // systematically miss the night that consolidated yesterday (live evidence
+    // 2026-07-12: dream at 00:00:47, report said "no dream events overnight").
+    fn night_window(&self, yesterday: &str) -> memory::NightWindow {
+        let hour = self.gate.hour;
+        memory::NightWindow {
+            from: format!("{yesterday}T{hour:02}"),
+            until: format!("{}T{hour:02}", timeutil::today_iso()),
+        }
+    }
+
     pub fn maybe_send(&mut self, transport: &dyn BotTransport) {
         let hour = timeutil::current_hour();
         let today = timeutil::today_iso();
@@ -85,7 +97,7 @@ impl ReportCycle {
         // A new report day supersedes any still-pending verdict.
         self.awaiting_verdict = None;
         let yesterday = timeutil::yesterday_iso();
-        let digest = memory::day_digest(&yesterday);
+        let digest = memory::day_digest(&yesterday, &self.night_window(&yesterday));
         if digest.is_quiet() {
             runlog::log("tg", "report skipped: quiet day");
             return;
@@ -212,6 +224,11 @@ fn render_digest(digest: &DayDigest) -> String {
     ));
     lines.push(format!("Overnight dream events: {}", digest.dream_events));
     push_ref_line(&mut lines, "Gists consolidated", &digest.gists);
+    let mut index = 0usize;
+    while index < digest.turn_groups.len() {
+        lines.push(format!("Thread {}: {}", index + 1, digest.turn_groups[index]));
+        index += 1;
+    }
     push_ref_line(&mut lines, "Most-used beliefs", &digest.top_injected);
     push_ref_line(&mut lines, "Example new edges", &digest.new_edges);
     lines.join("\n")

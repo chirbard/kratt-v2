@@ -607,9 +607,14 @@ pub fn build_dream_prompt(explanation: &str, toon: &str, context: Option<&str>) 
     prompt
 }
 
-pub const DAILY_REPORT: &str = r#"You are a learning agent writing a short morning note to the person steering your curiosity. Below is a deterministic digest of what you worked with yesterday and consolidated overnight.
+pub const DAILY_REPORT: &str = r#"You are a learning agent writing a short morning note to the person steering your curiosity. Below is a deterministic digest of what you worked with yesterday and consolidated overnight. The reader will score the day from your note, so it must let them judge — a scattered list of topics does not.
 
-Write a first-person report, at most 200 words, plain text (no markdown headers, no lists of raw ids). Cover: what you worked with, what you consolidated overnight, and what you are uncertain about. Ground every sentence in the digest — invent nothing beyond it, and do not flatter. If the digest is thin, say so plainly and keep it short."#;
+Write a first-person report, at most 200 words, plain text (no markdown headers, no lists of raw ids):
+1. The day as at most THREE threads, one or two sentences each, drawn from the Thread lines (each is one conversation turn's new edges). Name the thread's subject in plain words and what came of it. Ignore minor one-off topics entirely — do not hop.
+2. One sentence on the night: what the dream consolidated, gists first if any.
+3. One honest self-assessment sentence: whether this looks like a good day of learning and WHY — so the reader can agree or correct.
+
+Ground every sentence in the digest — invent nothing beyond it, and do not flatter. If the digest is thin, say so plainly and keep it short."#;
 
 pub fn build_daily_report_prompt(digest_text: &str) -> String {
     let mut prompt = String::new();
