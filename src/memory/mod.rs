@@ -8,6 +8,7 @@ mod graph;
 mod hygiene;
 mod ingest;
 mod ledger;
+mod loops;
 mod reinforce;
 mod routing;
 pub mod scheduler;
@@ -28,6 +29,7 @@ pub use ledger::{
     Actor, Attribution, DayDigest, EdgeRef, Event, EventContext, NightWindow, day_digest,
     newest_dream_session_id, recompute_positions, record_events, turn_attribution,
 };
+pub(crate) use loops::{OpenLoops, load_open_loops};
 #[allow(unused_imports)]
 pub use reinforce::{record_move_outcome, record_outcome};
 pub use routing::Routing;

@@ -611,6 +611,24 @@ fn normalize_call(call: &ToolCall, confidence: f64) -> ToolCall {
             result: result.clone(),
             comment: comment.clone(),
         },
+        ToolCall::OpenLoop {
+            intention,
+            anchor,
+            due,
+        } => ToolCall::OpenLoop {
+            intention: intention.clone(),
+            anchor: anchor.clone(),
+            due: due.clone(),
+        },
+        ToolCall::CloseLoop {
+            loop_id,
+            resolution,
+            note,
+        } => ToolCall::CloseLoop {
+            loop_id: loop_id.clone(),
+            resolution: resolution.clone(),
+            note: note.clone(),
+        },
     }
 }
 
@@ -759,7 +777,9 @@ fn apply_policy_overrides(cluster: &Cluster, calls: &[ToolCall], policy: &mut Sy
             | ToolCall::RecordMove { .. }
             | ToolCall::DefineTask { .. }
             | ToolCall::RecordRule { .. }
-            | ToolCall::RecordOutcome { .. } => {}
+            | ToolCall::RecordOutcome { .. }
+            | ToolCall::OpenLoop { .. }
+            | ToolCall::CloseLoop { .. } => {}
         }
         idx += 1;
     }
@@ -809,6 +829,16 @@ fn tool_call_json(call: &ToolCall) -> serde_json::Value {
             json!({"tool":"promote_edge","args":{"source":source,"target":target}})
         }
         ToolCall::GistEdge { .. } => gist_edge_json(call),
+        ToolCall::RecordMove { .. }
+        | ToolCall::DefineTask { .. }
+        | ToolCall::RecordRule { .. }
+        | ToolCall::RecordOutcome { .. } => task_tool_json(call),
+        ToolCall::OpenLoop { .. } | ToolCall::CloseLoop { .. } => loop_tool_json(call),
+    }
+}
+
+fn task_tool_json(call: &ToolCall) -> serde_json::Value {
+    match call {
         ToolCall::RecordMove { move_text, actor } => {
             json!({"tool":"record_move","args":{"move":move_text,"actor":actor}})
         }
@@ -819,6 +849,27 @@ fn tool_call_json(call: &ToolCall) -> serde_json::Value {
         ToolCall::RecordOutcome { result, comment } => {
             json!({"tool":"record_outcome","args":{"result":result,"comment":comment}})
         }
+        _ => unreachable!("task_tool_json called with a non-task tool"),
+    }
+}
+
+fn loop_tool_json(call: &ToolCall) -> serde_json::Value {
+    match call {
+        ToolCall::OpenLoop {
+            intention,
+            anchor,
+            due,
+        } => {
+            json!({"tool":"open_loop","args":{"intention":intention,"anchor":anchor,"due":due}})
+        }
+        ToolCall::CloseLoop {
+            loop_id,
+            resolution,
+            note,
+        } => {
+            json!({"tool":"close_loop","args":{"loop":loop_id,"resolution":resolution,"note":note}})
+        }
+        _ => unreachable!("loop_tool_json called with a non-loop tool"),
     }
 }
 

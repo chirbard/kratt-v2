@@ -34,6 +34,12 @@ The "Beliefs injected into this turn" section, when present, is what memory retr
 - Events and observations (moved, left, sold, likes, hates): a fact node (one-sentence body, date if known), a subject edge from the fact to its primary entity (subject=true, importance=1.0), and an edge from the source entity to the fact node.
 - Post-training facts (software versions, release dates, world events) are highest priority — prefer the user's stated version over your training data, and extract even when stated casually.
 - If the assistant cites or corrects a fact from a web result, extract with confidence 0.9.
+
+## Prospective memory — open loops
+
+- Use open_loop for a real intended future action or expected event stated by the user or assistant ("remind me", "next time", "I'll send it tomorrow"). Be conservative: ordinary future-tense discussion is not an intention.
+- Choose the topic whose appearance should trigger the intention as anchor. It must already exist, or emit its upsert_node before open_loop. Resolve a relative due date to YYYY-MM-DD; omit due for a purely contextual trigger.
+- Use close_loop only when this exchange confirms the intention was done, deliberately abandoned, or an expected event did not happen. Never infer absence from silence or auto-close merely because a due date passed.
 - No respond call; always set date=today on every upsert_edge.
 - Emit at most 8 tool calls in this response. If more work remains you will be asked to continue, so never rush the rest in."#;
 
@@ -166,6 +172,17 @@ delete_edge — remove a directed edge.
 expire_edge — mark an edge historical instead of deleting it.
 - Use expiry for superseded-but-true-then beliefs; use delete only for absorbed scaffolding.
 {"tool":"expire_edge","args":{"source":"string","target":"string","rewritten_content":"string"}}
+
+open_loop — remember one concrete intended future action or expected event until it is honestly resolved.
+- intention: one sentence describing what should happen
+- anchor: existing topic node whose appearance should surface the loop; emit upsert_node first if needed
+- due: optional YYYY-MM-DD deadline or expected-by date; empty for contextual-only loops
+{"tool":"open_loop","args":{"intention":"ask Markus whether the systemd unit survived the reboot","anchor":"home-server","due":"2026-07-15"}}
+
+close_loop — close a live loop only when the exchange confirms its resolution.
+- resolution: "done" | "abandoned" | "absence"
+- note: brief evidence or reason; never use absence without human confirmation
+{"tool":"close_loop","args":{"loop":"ask-markus-whether-the-systemd-unit-survived-the-reboot","resolution":"done","note":"confirmed running"}}
 
 record_rule — when the conversation states a rule of a game the graph already knows, use this instead of a loose upsert_edge; it anchors the rule to the game-definition node as durable knowledge.
 {"tool":"record_rule","args":{"rule":"the king moves exactly one square in any direction"}}
@@ -612,7 +629,8 @@ pub const DAILY_REPORT: &str = r#"You are a learning agent writing a short morni
 Write a first-person report, at most 200 words, plain text (no markdown headers, no lists of raw ids):
 1. The day as at most THREE threads, one or two sentences each, drawn from the Thread lines (each is one conversation turn's new edges). Name the thread's subject in plain words and what came of it. Ignore minor one-off topics entirely — do not hop.
 2. One sentence on the night: what the dream consolidated, gists first if any.
-3. One honest self-assessment sentence: whether this looks like a good day of learning and WHY — so the reader can agree or correct.
+3. Mention Due loops in one sentence when present. If a past-due loop is an expected event, ask whether it happened: "X was expected by YYYY-MM-DD; did it happen?" Never treat the deadline alone as evidence of absence.
+4. One honest self-assessment sentence: whether this looks like a good day of learning and WHY — so the reader can agree or correct.
 
 Ground every sentence in the digest — invent nothing beyond it, and do not flatter. If the digest is thin, say so plainly and keep it short."#;
 
@@ -715,7 +733,10 @@ mod tests {
         assert!(!unbiased.contains("ongoing task"));
     }
 
-    use super::{AgentPrompt, EXTRACT_EXPLANATION, build_agent_prompt, build_continue_prompt};
+    use super::{
+        AgentPrompt, DAILY_REPORT, EXTRACT_EXPLANATION, build_agent_prompt, build_continue_prompt,
+        build_scribe_prompt,
+    };
 
     const INJECTED_HEADING: &str = "## Beliefs injected into this turn";
 
@@ -753,5 +774,23 @@ mod tests {
         assert!(!continuation.contains(INJECTED_HEADING));
         assert!(!continuation.contains("## Current memory state"));
         assert!(continuation.contains("upsert_edge: alice → berlin"));
+    }
+
+    #[test]
+    fn heavy_prompt_documents_loops_but_scribe_prompt_does_not() {
+        let heavy = prompt_with(None);
+        assert!(heavy.contains("## Prospective memory — open loops"));
+        assert!(heavy.contains(r#"{"tool":"open_loop""#));
+        assert!(heavy.contains(r#"{"tool":"close_loop""#));
+        let scribe = build_scribe_prompt("user", "assistant");
+        assert!(!scribe.contains("open_loop"));
+        assert!(!scribe.contains("close_loop"));
+    }
+
+    #[test]
+    fn daily_report_prompt_mentions_due_loops_and_confirmed_absence() {
+        assert!(DAILY_REPORT.contains("Mention Due loops in one sentence"));
+        assert!(DAILY_REPORT.contains("did it happen?"));
+        assert!(DAILY_REPORT.contains("Never treat the deadline alone as evidence of absence"));
     }
 }

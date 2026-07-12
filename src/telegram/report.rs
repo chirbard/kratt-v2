@@ -62,10 +62,7 @@ pub struct ReportCycle {
 }
 
 impl ReportCycle {
-    pub fn from_env(
-        memory_llm: Arc<dyn LlmClient>,
-        chat_id: i64,
-    ) -> Result<Self, Box<dyn Error>> {
+    pub fn from_env(memory_llm: Arc<dyn LlmClient>, chat_id: i64) -> Result<Self, Box<dyn Error>> {
         let hour = report_hour_from_env()?;
         runlog::log("tg", &format!("daily report hour {hour}"));
         Ok(Self {
@@ -117,7 +114,10 @@ impl ReportCycle {
     // the report never silently vanishes. The verdict ask is appended in code.
     fn compose_message(&self, digest: &DayDigest) -> String {
         let digest_text = render_digest(digest);
-        let body = match self.memory_llm.collect(&prompts::build_daily_report_prompt(&digest_text)) {
+        let body = match self
+            .memory_llm
+            .collect(&prompts::build_daily_report_prompt(&digest_text))
+        {
             Ok(text) if !text.trim().is_empty() => text.trim().to_string(),
             Ok(_) | Err(_) => {
                 runlog::log("tg", "daily report: LLM phrasing failed, sending digest");
@@ -193,7 +193,10 @@ fn record_day_verdict(yesterday: &str, score: f64) {
     let payload = serde_json::json!({"kind": "daily-1:1"}).to_string();
     for session_id in verdict_session_ids(yesterday, memory::newest_dream_session_id()) {
         if let Err(err) = memory::record_outcome(&session_id, score, &payload) {
-            runlog::log("tg", &format!("verdict outcome failed ({session_id}): {err}"));
+            runlog::log(
+                "tg",
+                &format!("verdict outcome failed ({session_id}): {err}"),
+            );
         }
     }
 }
@@ -237,9 +240,14 @@ fn render_digest(digest: &DayDigest) -> String {
     ));
     lines.push(format!("Overnight dream events: {}", digest.dream_events));
     push_ref_line(&mut lines, "Gists consolidated", &digest.gists);
+    push_ref_line(&mut lines, "Due loops", &digest.due_loops);
     let mut index = 0usize;
     while index < digest.turn_groups.len() {
-        lines.push(format!("Thread {}: {}", index + 1, digest.turn_groups[index]));
+        lines.push(format!(
+            "Thread {}: {}",
+            index + 1,
+            digest.turn_groups[index]
+        ));
         index += 1;
     }
     push_ref_line(&mut lines, "Most-used beliefs", &digest.top_injected);
@@ -262,9 +270,7 @@ mod tests {
 
     use crate::api::{Chunk, LlmClient, TurnOutcome};
 
-    use super::{
-        DayDigest, ReportGate, parse_verdict, render_digest, verdict_session_ids,
-    };
+    use super::{DayDigest, ReportGate, parse_verdict, render_digest, verdict_session_ids};
 
     // The classification tests never phrase a report, so the LLM is never
     // called — this stub exists only to construct a ReportCycle.
@@ -316,7 +322,10 @@ mod tests {
         let mut cycle = armed_cycle(Some("2026-07-10".to_string()));
         assert_eq!(cycle.take_verdict("2 but great"), None);
         // Still armed: the user can chat first and score later that day.
-        assert_eq!(cycle.take_verdict("1"), Some(("2026-07-10".to_string(), 0.5)));
+        assert_eq!(
+            cycle.take_verdict("1"),
+            Some(("2026-07-10".to_string(), 0.5))
+        );
     }
 
     #[test]
@@ -343,7 +352,10 @@ mod tests {
     fn gate_fires_again_on_the_next_day() {
         let mut gate = ReportGate::new(7);
         assert!(gate.should_fire(7, "2026-07-11"));
-        assert!(gate.should_fire(7, "2026-07-12"), "a new day re-arms the gate");
+        assert!(
+            gate.should_fire(7, "2026-07-12"),
+            "a new day re-arms the gate"
+        );
     }
 
     #[test]
@@ -376,6 +388,11 @@ mod tests {
             ..DayDigest::default()
         };
         assert!(!busy.is_quiet());
+        let due_only = DayDigest {
+            due_loops: vec!["ask about the file (due 2026-07-10)".to_string()],
+            ..DayDigest::default()
+        };
+        assert!(!due_only.is_quiet());
     }
 
     #[test]
@@ -390,5 +407,21 @@ mod tests {
         assert!(text.contains("Turns handled: 4"));
         assert!(text.contains("Edges created 2"));
         assert!(!text.contains("Gists consolidated"));
+        assert!(!text.contains("Due loops"));
+    }
+
+    #[test]
+    fn render_includes_due_loops() {
+        let digest = DayDigest {
+            due_loops: vec![
+                "ask about the file (due 2026-07-10)".to_string(),
+                "check the service (due 2026-07-11)".to_string(),
+            ],
+            ..DayDigest::default()
+        };
+        let text = render_digest(&digest);
+        assert!(text.contains(
+            "Due loops: ask about the file (due 2026-07-10); check the service (due 2026-07-11)"
+        ));
     }
 }
