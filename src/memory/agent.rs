@@ -1268,6 +1268,12 @@ fn apply_inbox_add_call<'scope>(
     if source.is_empty() || (!is_url && !std::path::Path::new(source).exists()) {
         return Ok("inbox_add denied: source is neither a URL nor an existing file".to_string());
     }
+    // Apply-side dedup: the looped passes forget prompt-side "one per source"
+    // across iterations (observed live: the scribe queued the same file twice
+    // in one pass). A queued duplicate is a no-op, not an error.
+    if db::inbox_source_is_queued(conn, source)? {
+        return Ok(format!("inbox_add: {source} is already queued"));
+    }
     let item_id = db::insert_inbox_item(conn, source, instruction)?;
     crate::runlog::log("inbox", &format!("queued: {source}"));
     Ok(format!("inbox_add: queued item {item_id}"))
@@ -2813,6 +2819,24 @@ mod tests {
             assert!(add(&conn, "extract", "http://example.com/b").contains("queued"));
             let count = db::block_on(db::count_queued_inbox(&conn));
             assert_eq!(count, 2);
+        }
+
+        // Looped passes re-emit across iterations; the apply layer holds the line.
+        #[test]
+        fn inbox_add_dedups_a_source_already_queued() {
+            let conn = db::block_on(harness());
+            assert!(add(&conn, "scribe", "https://example.com/a").contains("queued item"));
+            let second = add(&conn, "scribe", "https://example.com/a");
+            assert!(second.contains("already queued"), "{second}");
+            assert_eq!(db::block_on(db::count_queued_inbox(&conn)), 1);
+            // A resolved source may be queued again (re-study is legitimate).
+            let Ok(Some(item)) = db::oldest_queued_inbox(&conn) else {
+                unreachable!("item exists")
+            };
+            let Ok(()) = db::resolve_inbox_item(&conn, item.item_id, "done", "ingest-1") else {
+                unreachable!("resolve succeeds")
+            };
+            assert!(add(&conn, "scribe", "https://example.com/a").contains("queued item"));
         }
 
         #[test]

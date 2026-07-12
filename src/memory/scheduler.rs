@@ -64,6 +64,48 @@ async fn gather_inputs_async(conn: &Connection) -> SchedulerInputs {
     }
 }
 
+// Half the dream-forcing threshold: pressure becomes visible in conversation
+// before the scheduler is forced to act on it.
+const PRESSURE_VISIBLE_DEBT: usize = 25; // replay-tunable
+
+// The chat-visible slice of interoception: real backlog counters, surfaced
+// only when they would actually change behaviour (a dream is approaching, or
+// queued study exists). None = no line, zero cost in the prompt.
+pub fn pressure_line() -> Option<String> {
+    let Ok(conn) = db::open_connection() else {
+        return None;
+    };
+    let (debt, queued) = db::block_on(async {
+        (
+            count_acquisition_debt(&conn).await,
+            db::load_queued_inbox_names(&conn).await,
+        )
+    });
+    render_pressure(debt, &queued)
+}
+
+// Names, not counts: a bare count made the model guess wrongly at WHICH items
+// were unread (observed live: it refused to synthesize an already-studied
+// document, assuming it was among the queued ones).
+fn render_pressure(debt: usize, queued: &[String]) -> Option<String> {
+    if debt < PRESSURE_VISIBLE_DEBT && queued.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if debt >= PRESSURE_VISIBLE_DEBT {
+        parts.push(format!(
+            "{debt} unconsolidated experience events since the last dream (a dream is forced at {ACQUISITION_DEBT_THRESHOLD})"
+        ));
+    }
+    if !queued.is_empty() {
+        parts.push(format!(
+            "queued study items not yet read: {}",
+            queued.join(", ")
+        ));
+    }
+    Some(format!("Internal state: {}.", parts.join("; ")))
+}
+
 /// Pure decision function - first matching rule wins (priority order)
 pub fn decide(inputs: &SchedulerInputs) -> SchedulerAction {
     if let Some(action) = check_consolidation_debt(inputs) {
@@ -692,6 +734,26 @@ mod tests {
             decide(&inputs),
             SchedulerAction::InboxStudy { reason: "2 inbox items queued".to_string() }
         );
+    }
+
+    #[test]
+    fn pressure_line_renders_only_real_backlog() {
+        let none: Vec<String> = Vec::new();
+        assert_eq!(super::render_pressure(0, &none), None);
+        assert_eq!(super::render_pressure(24, &none), None);
+        let Some(debt_line) = super::render_pressure(30, &none) else {
+            unreachable!("debt renders")
+        };
+        assert!(debt_line.contains("30 unconsolidated"));
+        let queued = vec!["okf.md".to_string(), "paper.html".to_string()];
+        let Some(both) = super::render_pressure(30, &queued) else {
+            unreachable!("both render")
+        };
+        assert!(both.contains("queued study items not yet read: okf.md, paper.html"));
+        let Some(queued_only) = super::render_pressure(0, &queued) else {
+            unreachable!("queued renders")
+        };
+        assert!(queued_only.starts_with("Internal state: queued study items"));
     }
 
     #[test]
