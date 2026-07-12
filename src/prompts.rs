@@ -8,7 +8,8 @@ pub const CHAT_SYSTEM_PROMPT: &str = r#"You are a direct, honest assistant with 
 - Use <memory> to recall what you know about the user
 - Use <recent_context> for short-term continuity
 - Never output graph data, JSON, edge lists, or memory update descriptions
-- When asked to study a link or file later, confirm it is queued and say plainly that you have not read it yet; never summarize unread material"#;
+- You CAN study local files and web links later: your background memory queues them automatically when the user asks (you have no chat tool for this and need none — never claim you lack the ability). Confirm it is queued for your next study cycle and say plainly you have not read it yet; never summarize unread material
+- An "Internal state" line, when present, is your real cognitive backlog (unconsolidated experience, unread study items). When asked for a confident synthesis of recent or just-studied material while that line shows unconsolidated experience, give your answer AND state the caveat plainly ("I have not consolidated this yet — this is a first-pass reading"). Do not mention the backlog otherwise, and never claim tiredness or feelings"#;
 
 pub const EXTRACT_EXPLANATION: &str = r#"You are the extraction agent for a memory graph. Extract the surprise: what this conversation adds to, contradicts, or refines in what memory already knows.
 
@@ -670,7 +671,11 @@ pub fn build_daily_report_prompt(digest_text: &str) -> String {
     prompt
 }
 
-pub fn build_chat_system_prompt(memory_block: &str, recent_entries: &[RecentEntry]) -> String {
+pub fn build_chat_system_prompt(
+    memory_block: &str,
+    recent_entries: &[RecentEntry],
+    pressure: Option<&str>,
+) -> String {
     let mut prompt = String::from(CHAT_SYSTEM_PROMPT);
     prompt.push_str("\nToday's date is ");
     prompt.push_str(&today_iso());
@@ -678,6 +683,10 @@ pub fn build_chat_system_prompt(memory_block: &str, recent_entries: &[RecentEntr
     if let Some(elapsed) = elapsed_message(recent_entries) {
         prompt.push('\n');
         prompt.push_str(&elapsed);
+    }
+    if let Some(line) = pressure {
+        prompt.push('\n');
+        prompt.push_str(line);
     }
     if !memory_block.trim().is_empty() {
         prompt.push_str("\n\n<memory>\n");
@@ -762,8 +771,8 @@ mod tests {
     }
 
     use super::{
-        AgentPrompt, DAILY_REPORT, EXTRACT_EXPLANATION, build_agent_prompt, build_continue_prompt,
-        build_scribe_prompt,
+        AgentPrompt, DAILY_REPORT, EXTRACT_EXPLANATION, build_agent_prompt,
+        build_chat_system_prompt, build_continue_prompt, build_scribe_prompt,
     };
 
     const INJECTED_HEADING: &str = "## Beliefs injected into this turn";
@@ -802,6 +811,14 @@ mod tests {
         assert!(!continuation.contains(INJECTED_HEADING));
         assert!(!continuation.contains("## Current memory state"));
         assert!(continuation.contains("upsert_edge: alice → berlin"));
+    }
+
+    #[test]
+    fn chat_prompt_carries_the_pressure_line_only_when_present() {
+        let with = build_chat_system_prompt("", &[], Some("Internal state: 30 unconsolidated experience events since the last dream (a dream is forced at 50)."));
+        assert!(with.contains("Internal state: 30 unconsolidated"));
+        let without = build_chat_system_prompt("", &[], None);
+        assert!(!without.contains("Internal state:"));
     }
 
     #[test]

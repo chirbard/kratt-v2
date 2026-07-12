@@ -12,6 +12,7 @@ mod loops;
 mod reinforce;
 mod routing;
 pub mod scheduler;
+pub use scheduler::pressure_line;
 mod synthesis;
 mod task_chain;
 

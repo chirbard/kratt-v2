@@ -68,7 +68,12 @@ pub(crate) fn prepare_stream_context(
     let recent_entries = load_recent_with_prior(ctx);
     let session_id = session::session_id_from_path(ctx.session_path);
     let memory = build_memory_block(ctx.embed, ctx.prompt, &session_id, ctx.turn_id);
-    let mut system = prompts::build_chat_system_prompt(&memory.block, &recent_entries);
+    let pressure = memory::pressure_line();
+    if let Some(line) = &pressure {
+        crate::runlog::log("chat", &format!("pressure: {line}"));
+    }
+    let mut system =
+        prompts::build_chat_system_prompt(&memory.block, &recent_entries, pressure.as_deref());
     if let Some(hint) = ctx.style_hint {
         system.push_str("\n\n");
         system.push_str(hint);

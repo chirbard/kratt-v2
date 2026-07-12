@@ -558,6 +558,45 @@ pub fn oldest_queued_inbox(
     })
 }
 
+// Short display names (last path/URL segment) of queued items, oldest first,
+// capped — feeds the chat-visible internal-state line.
+pub async fn load_queued_inbox_names(conn: &Connection) -> Vec<String> {
+    let Ok(mut rows) = conn
+        .query(
+            "SELECT source FROM inbox WHERE status = 'queued' ORDER BY id LIMIT 3",
+            (),
+        )
+        .await
+    else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    while let Ok(Some(row)) = rows.next().await {
+        let source = row.get::<String>(0).unwrap_or_default();
+        let name = match source.trim_end_matches('/').rsplit('/').next() {
+            Some(tail) if !tail.is_empty() => tail.to_string(),
+            _ => source,
+        };
+        names.push(name);
+    }
+    names
+}
+
+pub fn inbox_source_is_queued(
+    conn: &Connection,
+    source: &str,
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    block_on(async {
+        let mut rows = conn
+            .query(
+                "SELECT 1 FROM inbox WHERE status = 'queued' AND source = ?1 LIMIT 1",
+                params![source],
+            )
+            .await?;
+        Ok(rows.next().await?.is_some())
+    })
+}
+
 pub fn resolve_inbox_item(
     conn: &Connection,
     item_id: i64,
