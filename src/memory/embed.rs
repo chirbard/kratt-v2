@@ -347,8 +347,28 @@ fn rank_by_exploration(
         rank += 1;
     }
     scored.sort_by(|left, right| right.score.total_cmp(&left.score));
+    log_attention_profile(attention);
     log_satiation_shift(&scored, &base_top, attention);
     top_ranked_edges(scored)
+}
+
+// Always-on profile: distinguishes "attention query returned nothing" from
+// "pool uniformly saturated" when the shift log stays silent.
+fn log_attention_profile(attention: &HashMap<(String, String), usize>) {
+    let mut hit = 0usize;
+    let mut max = 0usize;
+    for count in attention.values() {
+        if *count > 0 {
+            hit += 1;
+        }
+        if *count > max {
+            max = *count;
+        }
+    }
+    runlog::log(
+        "explore",
+        &format!("satiation profile: {hit} candidates with attention, max {max}"),
+    );
 }
 
 fn satiation_factor(recent_attention: usize) -> f64 {
