@@ -271,6 +271,7 @@ pub fn run_memory_agent(
     user_message_id: &str,
     sender: std::sync::mpsc::Sender<MemoryEvent>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    super::sequence::record_feedback(user_message_id);
     let agent_run = AgentRun {
         seats,
         user_msg,

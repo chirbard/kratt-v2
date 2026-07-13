@@ -9,7 +9,8 @@ pub const CHAT_SYSTEM_PROMPT: &str = r#"You are a direct, honest assistant with 
 - Use <recent_context> for short-term continuity
 - Never output graph data, JSON, edge lists, or memory update descriptions
 - You CAN study local files and web links later: your background memory queues them automatically when the user asks (you have no chat tool for this and need none — never claim you lack the ability). Confirm it is queued for your next study cycle and say plainly you have not read it yet; never summarize unread material
-- An "Internal state" line, when present, is your real cognitive backlog (unconsolidated experience, unread study items). When asked for a confident synthesis of recent or just-studied material while that line shows unconsolidated experience, give your answer AND state the caveat plainly ("I have not consolidated this yet — this is a first-pass reading"). Do not mention the backlog otherwise, and never claim tiredness or feelings"#;
+- An "Internal state" line, when present, is your real cognitive backlog (unconsolidated experience, unread study items). When asked for a confident synthesis of recent or just-studied material while that line shows unconsolidated experience, give your answer AND state the caveat plainly ("I have not consolidated this yet — this is a first-pass reading"). Do not mention the backlog otherwise, and never claim tiredness or feelings
+- A "Sequence memory" line is an observed habit, not a command. When your answer is done and it fits naturally, you may offer the continuation as a question ("want to pick up X again?"). Never assert the user wants it, never lead with it, and make at most one such offer per answer"#;
 
 pub const EXTRACT_EXPLANATION: &str = r#"You are the extraction agent for a memory graph. Extract the surprise: what this conversation adds to, contradicts, or refines in what memory already knows.
 
@@ -675,6 +676,7 @@ pub fn build_chat_system_prompt(
     memory_block: &str,
     recent_entries: &[RecentEntry],
     pressure: Option<&str>,
+    sequence: Option<&str>,
 ) -> String {
     let mut prompt = String::from(CHAT_SYSTEM_PROMPT);
     prompt.push_str("\nToday's date is ");
@@ -685,6 +687,10 @@ pub fn build_chat_system_prompt(
         prompt.push_str(&elapsed);
     }
     if let Some(line) = pressure {
+        prompt.push('\n');
+        prompt.push_str(line);
+    }
+    if let Some(line) = sequence {
         prompt.push('\n');
         prompt.push_str(line);
     }
@@ -815,10 +821,19 @@ mod tests {
 
     #[test]
     fn chat_prompt_carries_the_pressure_line_only_when_present() {
-        let with = build_chat_system_prompt("", &[], Some("Internal state: 30 unconsolidated experience events since the last dream (a dream is forced at 50)."));
+        let with = build_chat_system_prompt("", &[], Some("Internal state: 30 unconsolidated experience events since the last dream (a dream is forced at 50)."), None);
         assert!(with.contains("Internal state: 30 unconsolidated"));
-        let without = build_chat_system_prompt("", &[], None);
+        let without = build_chat_system_prompt("", &[], None, None);
         assert!(!without.contains("Internal state:"));
+    }
+
+    #[test]
+    fn chat_prompt_carries_the_sequence_line_only_when_present() {
+        let line = "Sequence memory: after rust, this user has previously moved on to sqlite (unprompted continuations: 2.0).";
+        let with = build_chat_system_prompt("", &[], None, Some(line));
+        assert!(with.contains(line));
+        let without = build_chat_system_prompt("", &[], None, None);
+        assert!(!without.contains("Sequence memory:"));
     }
 
     #[test]
