@@ -27,6 +27,8 @@ pub type SemanticEdgeRow = (
     Option<Vec<f64>>,
 );
 
+pub type OpenCuriosityNoteRow = (String, String, String, String);
+
 #[allow(clippy::expect_used)]
 fn runtime() -> &'static Runtime {
     static RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -1401,6 +1403,58 @@ pub fn load_edge_actor_views(actor_type: &str, actor_id: &str) -> HashMap<(Strin
     runtime().block_on(load_edge_actor_views_async(&conn, actor_type, actor_id))
 }
 
+pub fn load_recent_attention_counts(
+    candidates: &[(String, String)],
+    window_days: usize,
+) -> HashMap<(String, String), usize> {
+    if candidates.is_empty() {
+        return HashMap::new();
+    }
+    let Ok(conn) = open_connection() else {
+        return HashMap::new();
+    };
+    runtime()
+        .block_on(load_recent_attention_counts_async(
+            &conn,
+            candidates,
+            window_days,
+        ))
+        .unwrap_or_default()
+}
+
+async fn load_recent_attention_counts_async(
+    conn: &Connection,
+    candidates: &[(String, String)],
+    window_days: usize,
+) -> Result<HashMap<(String, String), usize>, Box<dyn Error + Send + Sync>> {
+    let mut values = Vec::new();
+    let mut params = Vec::new();
+    for (source, target) in candidates {
+        values.push("(?, ?)");
+        params.push(Value::Text(source.clone()));
+        params.push(Value::Text(target.clone()));
+    }
+    params.push(Value::Integer(-(window_days as i64)));
+    let query = format!(
+        "WITH candidates(source, target) AS (VALUES {})
+         SELECT ev.source, ev.target, COUNT(*)
+         FROM events ev
+         JOIN candidates c ON c.source = ev.source AND c.target = ev.target
+         WHERE ev.event_type IN ('reinforced', 'marked')
+           AND julianday(ev.ts) >= julianday('now', printf('%d days', ?))
+         GROUP BY ev.source, ev.target",
+        values.join(", ")
+    );
+    let mut rows = conn.query(&query, turso::params_from_iter(params)).await?;
+    let mut counts = HashMap::new();
+    while let Some(row) = rows.next().await? {
+        let source = text(row.get_value(0)?);
+        let target = text(row.get_value(1)?);
+        counts.insert((source, target), int(row.get_value(2)?) as usize);
+    }
+    Ok(counts)
+}
+
 async fn load_edge_actor_views_async(
     conn: &Connection,
     actor_type: &str,
@@ -1597,14 +1651,22 @@ async fn latest_session_id_async(conn: &Connection, session_type: &str) -> Optio
     }
 }
 
-pub fn load_oldest_open_curiosity_note() -> Option<(String, String, String)> {
+pub fn load_open_curiosity_notes(limit: usize) -> Vec<OpenCuriosityNoteRow> {
     let Ok(conn) = open_connection() else {
-        return None;
+        return Vec::new();
     };
-    runtime().block_on(async {
-        let mut rows = conn
-            .query(
-                "SELECT n.id, n.body, e.target
+    runtime()
+        .block_on(load_open_curiosity_notes_async(&conn, limit))
+        .unwrap_or_default()
+}
+
+async fn load_open_curiosity_notes_async(
+    conn: &Connection,
+    limit: usize,
+) -> Result<Vec<OpenCuriosityNoteRow>, Box<dyn Error + Send + Sync>> {
+    let mut rows = conn
+        .query(
+            "SELECT n.id, n.body, e.target, n.date
                  FROM nodes n
                  JOIN edges e ON e.source = n.id
                  LEFT JOIN (
@@ -1615,18 +1677,64 @@ pub fn load_oldest_open_curiosity_note() -> Option<(String, String, String)> {
                  ) consumed ON consumed.source = e.source AND consumed.target = e.target
                  WHERE n.node_type = 'note' AND e.expired_at IS NULL AND consumed.source IS NULL
                  ORDER BY n.date ASC, n.id ASC
-                 LIMIT 1",
-                (),
-            )
-            .await
-            .ok()?;
-        let row = rows.next().await.ok()??;
-        Some((
-            text(row.get_value(0).ok()?),
-            text(row.get_value(1).ok()?),
-            text(row.get_value(2).ok()?),
-        ))
-    })
+                 LIMIT ?1",
+            params![limit as i64],
+        )
+        .await?;
+    let mut notes = Vec::new();
+    while let Some(row) = rows.next().await? {
+        notes.push((
+            text(row.get_value(0)?),
+            text(row.get_value(1)?),
+            text(row.get_value(2)?),
+            text(row.get_value(3)?),
+        ));
+    }
+    Ok(notes)
+}
+
+pub fn count_new_embedding_neighbours(
+    vector: &[f64],
+    created_at: &str,
+    max_distance: f64,
+) -> Result<usize, Box<dyn Error + Send + Sync>> {
+    let conn = open_connection()?;
+    runtime().block_on(count_new_embedding_neighbours_async(
+        &conn,
+        vector,
+        created_at,
+        max_distance,
+    ))
+}
+
+async fn count_new_embedding_neighbours_async(
+    conn: &Connection,
+    vector: &[f64],
+    created_at: &str,
+    max_distance: f64,
+) -> Result<usize, Box<dyn Error + Send + Sync>> {
+    let json_str = vector32_json(vector)?;
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*)
+             FROM edges e
+             JOIN (
+                 SELECT source, target, MIN(ts) AS created_at
+                 FROM events
+                 WHERE event_type = 'created' AND source != '' AND target != ''
+                 GROUP BY source, target
+             ) created ON created.source = e.source AND created.target = e.target
+             WHERE e.expired_at IS NULL
+               AND e.embedding IS NOT NULL
+               AND created.created_at > ?2
+               AND vector_distance_cos(e.embedding, vector32(?1)) <= ?3",
+            params![json_str, created_at, max_distance],
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(0);
+    };
+    Ok(int(row.get_value(0)?) as usize)
 }
 
 const OPEN_LOOP_SELECT: &str = "SELECT e.source, e.target, n.body, n.date FROM nodes n JOIN edges e ON e.source = n.id JOIN nodes anchor ON anchor.id = e.target";
@@ -2076,12 +2184,15 @@ pub(crate) fn int(val: Value) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        block_on, load_all_edges_semantic_async, load_due_loops, load_game_edges,
-        load_loops_for_anchors, load_session_game, load_task_chain, load_unembedded_edges_async,
+        block_on, count_new_embedding_neighbours_async, load_all_edges_semantic_async,
+        load_due_loops, load_game_edges, load_loops_for_anchors,
+        load_recent_attention_counts_async, load_session_game, load_task_chain,
+        load_unembedded_edges_async,
     };
     use turso::{Builder, Connection, params};
 
     const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', embedding BLOB, PRIMARY KEY (source, target))";
+    const EVENTS_DDL: &str = "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')";
     const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
 
     async fn harness() -> Connection {
@@ -2118,6 +2229,28 @@ mod tests {
         let conn = harness().await;
         let _ = conn.execute(NODES_DDL, ()).await;
         conn
+    }
+
+    async fn policy_harness() -> Connection {
+        let conn = harness().await;
+        let _ = conn.execute(EVENTS_DDL, ()).await;
+        conn
+    }
+
+    async fn insert_policy_edge(conn: &Connection, details: (&str, &str, &str, &str)) {
+        let (source, target, vector, created_at) = details;
+        let _ = conn
+            .execute(
+                "INSERT INTO edges (source, target, embedding) VALUES (?1, ?2, vector32(?3))",
+                params![source, target, vector],
+            )
+            .await;
+        let _ = conn
+            .execute(
+                "INSERT INTO events (ts, event_type, source, target) VALUES (?1, 'created', ?2, ?3)",
+                params![created_at, source, target],
+            )
+            .await;
     }
 
     async fn insert_loop(
@@ -2393,6 +2526,69 @@ mod tests {
         let semantic = block_on(load_all_edges_semantic_async(&conn));
         assert_eq!(semantic.len(), 1);
         assert_eq!(semantic[0].0, "ordinary");
+    }
+
+    #[test]
+    fn recent_attention_counts_only_candidate_events_inside_window() {
+        let conn = block_on(policy_harness());
+        block_on(async {
+            let _ = conn
+                .execute(
+                    "INSERT INTO events (ts, event_type, source, target) VALUES
+                     (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'reinforced', 'a', 'b'),
+                     (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'marked', 'a', 'b'),
+                     (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'retrieved', 'a', 'b'),
+                     (strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-8 days'), 'reinforced', 'a', 'b'),
+                     (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'marked', 'other', 'edge')",
+                    (),
+                )
+                .await;
+        });
+        let candidates = vec![("a".to_string(), "b".to_string())];
+        let Ok(counts) = block_on(load_recent_attention_counts_async(&conn, &candidates, 7)) else {
+            unreachable!("attention counts load")
+        };
+        assert_eq!(counts.get(&("a".to_string(), "b".to_string())), Some(&2));
+        assert_eq!(counts.len(), 1);
+    }
+
+    #[test]
+    fn incubation_counts_only_new_near_live_edges() {
+        let conn = block_on(policy_harness());
+        let note_created = "2026-07-01T12:00:00Z";
+        let cases = [
+            ("near-1", "topic-1", "[1.0,0.0]", "2026-07-02T12:00:00Z"),
+            ("near-2", "topic-2", "[0.99,0.01]", "2026-07-03T12:00:00Z"),
+            ("near-3", "topic-3", "[0.98,0.02]", "2026-07-04T12:00:00Z"),
+            ("old-near", "topic-4", "[1.0,0.0]", "2026-06-30T12:00:00Z"),
+            ("new-far", "topic-5", "[0.0,1.0]", "2026-07-05T12:00:00Z"),
+            (
+                "expired-near",
+                "topic-6",
+                "[1.0,0.0]",
+                "2026-07-06T12:00:00Z",
+            ),
+        ];
+        for details in cases {
+            block_on(insert_policy_edge(&conn, details));
+        }
+        block_on(async {
+            let _ = conn
+                .execute(
+                    "UPDATE edges SET expired_at = '2026-07-07T12:00:00Z' WHERE source = 'expired-near'",
+                    (),
+                )
+                .await;
+        });
+        let Ok(count) = block_on(count_new_embedding_neighbours_async(
+            &conn,
+            &[1.0, 0.0],
+            note_created,
+            0.45,
+        )) else {
+            unreachable!("incubation neighbours count")
+        };
+        assert_eq!(count, 3);
     }
 
     async fn insert_ply(
