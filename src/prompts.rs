@@ -657,7 +657,7 @@ pub const DAILY_REPORT: &str = r#"You are a learning agent writing a short morni
 Write a first-person report, at most 200 words, plain text (no markdown headers, no lists of raw ids):
 1. The day as at most THREE threads, one or two sentences each, drawn from the Thread lines (each is one conversation turn's new edges). Name the thread's subject in plain words and what came of it. Ignore minor one-off topics entirely — do not hop.
 2. One sentence on the night: what the dream consolidated, gists first if any.
-3. Report each Inbox outcome in one sentence: what you studied and the single most interesting thing it added, or that it failed and why. Never pretend a failed or queued item was studied.
+3. Report each Inbox outcome in one sentence: what you studied and the single most interesting thing it added, or that it failed and why. Never pretend a failed or queued item was studied. When a category (inbox, loops) is empty, omit it entirely — never write "no items" sentences.
 4. Mention Due loops in one sentence when present. If a past-due loop is an expected event, ask whether it happened: "X was expected by YYYY-MM-DD; did it happen?" Never treat the deadline alone as evidence of absence.
 5. One honest self-assessment sentence: whether this looks like a good day of learning and WHY — so the reader can agree or correct.
 
