@@ -26,6 +26,9 @@ const RETRIEVE_LIMIT: usize = 15; // replay-tunable.
 const TRAVERSE_LIMIT: usize = 20; // replay-tunable.
 const MAX_TOOL_ROUNDS: usize = 6; // per turn; runaway guard for the autonomous loop.
 const EXPLORE_WEB_CONFIDENCE_CAP: f64 = 0.5; // replay-tunable.
+const INCUBATION_NEIGHBOUR_DISTANCE: f64 = 0.45; // replay-tunable.
+const RIPE_NEIGHBOUR_THRESHOLD: usize = 3; // replay-tunable.
+const INCUBATION_CHECK_LIMIT: usize = 10; // replay-tunable.
 
 pub enum ExploreEvent {
     Log { phase: &'static str, text: String },
@@ -92,16 +95,7 @@ fn execute_exploration_pass(
     let session_id = exploration_session_id();
     let created_at = crate::timeutil::timestamp_now();
     db::register_exploration_session(&session_id, &created_at);
-    let open_note;
-    if let Some((note_id, question, topic_id)) = db::load_oldest_open_curiosity_note() {
-        open_note = Some(OpenCuriosityNote {
-            note_id,
-            question,
-            topic_id,
-        });
-    } else {
-        open_note = None;
-    }
+    let open_note = load_open_note(&*embed, sender);
     send_log(
         sender,
         "explore",
@@ -136,6 +130,89 @@ fn execute_exploration_pass(
         "pass complete — consider a dream pass to consolidate".to_string(),
     );
     Ok(total_events)
+}
+
+fn load_open_note(
+    embed: &dyn EmbeddingClient,
+    sender: &Sender<ExploreEvent>,
+) -> Option<OpenCuriosityNote> {
+    let mut rows = db::load_open_curiosity_notes(INCUBATION_CHECK_LIMIT);
+    if rows.is_empty() {
+        return None;
+    }
+    let mut questions = Vec::new();
+    for row in &rows {
+        questions.push(row.1.clone());
+    }
+    let Ok(vectors) = embed.embed(&questions) else {
+        return Some(open_note_from_row(rows.remove(0)));
+    };
+    if vectors.len() != rows.len() {
+        return Some(open_note_from_row(rows.remove(0)));
+    }
+    let counts = incubation_counts(&rows, &vectors);
+    let selected = choose_note_index(&counts);
+    if counts[selected] >= RIPE_NEIGHBOUR_THRESHOLD {
+        let prefix = question_prefix(&rows[selected].1);
+        send_log(
+            sender,
+            "explore",
+            format!(
+                "incubation: note '{prefix}' ripe ({} new neighbours)",
+                counts[selected]
+            ),
+        );
+    }
+    Some(open_note_from_row(rows.remove(selected)))
+}
+
+fn incubation_counts(rows: &[db::OpenCuriosityNoteRow], vectors: &[Vec<f64>]) -> Vec<usize> {
+    let mut counts = Vec::new();
+    let mut index = 0usize;
+    while index < rows.len() {
+        let count = db::count_new_embedding_neighbours(
+            &vectors[index],
+            &rows[index].3,
+            INCUBATION_NEIGHBOUR_DISTANCE,
+        )
+        .unwrap_or_default();
+        counts.push(count);
+        index += 1;
+    }
+    counts
+}
+
+fn choose_note_index(counts: &[usize]) -> usize {
+    let mut index = 0usize;
+    while index < counts.len() {
+        if counts[index] >= RIPE_NEIGHBOUR_THRESHOLD {
+            return index;
+        }
+        index += 1;
+    }
+    0
+}
+
+fn open_note_from_row(row: db::OpenCuriosityNoteRow) -> OpenCuriosityNote {
+    OpenCuriosityNote {
+        note_id: row.0,
+        question: row.1,
+        topic_id: row.2,
+    }
+}
+
+fn question_prefix(question: &str) -> String {
+    let mut prefix = String::new();
+    let mut characters = question.chars();
+    let mut remaining = 48usize;
+    while remaining > 0 {
+        let Some(character) = characters.next() else {
+            break;
+        };
+        prefix.push(character);
+        remaining -= 1;
+    }
+    prefix
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -813,4 +890,24 @@ fn exploration_session_id() -> String {
 fn send_log(sender: &Sender<ExploreEvent>, phase: &'static str, text: String) {
     runlog::log(phase, &text);
     let _ = sender.send(ExploreEvent::Log { phase, text });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::choose_note_index;
+
+    #[test]
+    fn ripe_note_precedes_older_unripe_note() {
+        assert_eq!(choose_note_index(&[0, 3]), 1);
+    }
+
+    #[test]
+    fn oldest_of_two_ripe_notes_is_selected() {
+        assert_eq!(choose_note_index(&[3, 4]), 0);
+    }
+
+    #[test]
+    fn oldest_note_remains_first_when_none_are_ripe() {
+        assert_eq!(choose_note_index(&[0, 2]), 0);
+    }
 }

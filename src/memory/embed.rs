@@ -19,6 +19,8 @@ pub const SMALL_GRAPH_THRESHOLD: usize = 100;
 pub const MAX_POOL: usize = 150;
 pub const EXPLORATION_CANDIDATES: usize = 200;
 pub const NOVELTY_WEIGHT: f64 = 0.3;
+const SATIATION_WINDOW_DAYS: usize = 7; // replay-tunable.
+const SATIATION_WEIGHT: f64 = 0.5; // replay-tunable.
 const W_SIM: f64 = 0.65; // replay-tunable.
 const W_CONF: f64 = 0.2; // replay-tunable.
 const W_RECENCY: f64 = 0.15; // replay-tunable.
@@ -270,7 +272,17 @@ fn choose_exploration_anchors(
         return candidates;
     }
     let views = db::load_edge_actor_views("agent", agent_name);
-    rank_by_exploration(candidates, &views)
+    let keys = edge_keys(&candidates);
+    let attention = db::load_recent_attention_counts(&keys, SATIATION_WINDOW_DAYS);
+    rank_by_exploration(candidates, &views, &attention)
+}
+
+fn edge_keys(candidates: &[SemanticEdge]) -> Vec<(String, String)> {
+    let mut keys = Vec::new();
+    for edge in candidates {
+        keys.push((edge.source.clone(), edge.target.clone()));
+    }
+    keys
 }
 
 fn query_embedding(embed: &dyn EmbeddingClient, query: &str) -> Option<Vec<f64>> {
@@ -315,21 +327,72 @@ fn node_view_totals(views: &HashMap<(String, String), f64>) -> HashMap<String, f
 fn rank_by_exploration(
     candidates: Vec<SemanticEdge>,
     views: &HashMap<(String, String), f64>,
+    attention: &HashMap<(String, String), usize>,
 ) -> Vec<SemanticEdge> {
     let node_totals = node_view_totals(views);
     let mut scored = Vec::new();
     let total = EXPLORATION_CANDIDATES as f64;
+    let mut base_top: Option<(f64, (String, String))> = None;
     let mut rank = 0usize;
     while rank < candidates.len() {
         let edge = candidates[rank].clone();
         let semantic_pos = EXPLORATION_CANDIDATES.saturating_sub(rank) as f64 / total;
         let novelty = novelty_score(&edge, views, &node_totals);
-        let score = (1.0 - NOVELTY_WEIGHT) * semantic_pos + NOVELTY_WEIGHT * novelty;
+        let base_score = (1.0 - NOVELTY_WEIGHT) * semantic_pos + NOVELTY_WEIGHT * novelty;
+        let key = (edge.source.clone(), edge.target.clone());
+        update_base_top(&mut base_top, base_score, &key);
+        let recent_attention = *attention.get(&key).unwrap_or(&0);
+        let score = base_score * satiation_factor(recent_attention);
         scored.push(ScoredEdge { score, edge });
         rank += 1;
     }
     scored.sort_by(|left, right| right.score.total_cmp(&left.score));
+    log_satiation_shift(&scored, &base_top, attention);
     top_ranked_edges(scored)
+}
+
+fn satiation_factor(recent_attention: usize) -> f64 {
+    1.0 / (1.0 + SATIATION_WEIGHT * recent_attention as f64)
+}
+
+fn update_base_top(
+    base_top: &mut Option<(f64, (String, String))>,
+    score: f64,
+    key: &(String, String),
+) {
+    let replace = match base_top {
+        Some((top_score, _)) => score > *top_score,
+        None => true,
+    };
+    if replace {
+        *base_top = Some((score, key.clone()));
+    }
+}
+
+fn log_satiation_shift(
+    scored: &[ScoredEdge],
+    base_top: &Option<(f64, (String, String))>,
+    attention: &HashMap<(String, String), usize>,
+) {
+    let Some(first) = scored.first() else {
+        return;
+    };
+    let Some((_, base_key)) = base_top else {
+        return;
+    };
+    if first.edge.source == base_key.0 && first.edge.target == base_key.1 {
+        return;
+    }
+    let mut penalized = 0usize;
+    for count in attention.values() {
+        if *count > 0 {
+            penalized += 1;
+        }
+    }
+    runlog::log(
+        "explore",
+        &format!("satiation: {penalized} candidates penalized, top anchor shifted"),
+    );
 }
 
 fn top_ranked_edges(mut scored: Vec<ScoredEdge>) -> Vec<SemanticEdge> {
@@ -599,7 +662,9 @@ fn send_log(sender: &std::sync::mpsc::Sender<MemoryEvent>, phase: &'static str, 
 
 #[cfg(test)]
 mod tests {
-    use super::{SemanticEdge, scope_episodic};
+    use std::collections::HashMap;
+
+    use super::{SemanticEdge, rank_by_exploration, satiation_factor, scope_episodic};
 
     fn test_edge(memory_type: &str, origin_session: &str) -> SemanticEdge {
         SemanticEdge {
@@ -645,5 +710,37 @@ mod tests {
         let edges = vec![test_edge("semantic", "")];
         let scoped = scope_episodic(edges, Some("game-2"));
         assert_eq!(scoped.len(), 1);
+    }
+
+    #[test]
+    fn satiation_factor_decreases_but_never_reaches_zero() {
+        assert_eq!(satiation_factor(0), 1.0);
+        assert!(satiation_factor(1) < satiation_factor(0));
+        assert!(satiation_factor(4) < satiation_factor(1));
+        assert!(satiation_factor(usize::MAX) > 0.0);
+    }
+
+    #[test]
+    fn satiation_shifts_ranking_without_removing_candidate() {
+        let mut penalized = test_edge("semantic", "");
+        penalized.source = "penalized".to_string();
+        penalized.target = "region".to_string();
+        let mut untouched = test_edge("semantic", "");
+        untouched.source = "untouched".to_string();
+        untouched.target = "region".to_string();
+        let mut attention = HashMap::new();
+        attention.insert(("penalized".to_string(), "region".to_string()), 8);
+
+        let ranked = rank_by_exploration(vec![penalized, untouched], &HashMap::new(), &attention);
+
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].source, "untouched");
+        let mut found_penalized = false;
+        for edge in ranked {
+            if edge.source == "penalized" {
+                found_penalized = true;
+            }
+        }
+        assert!(found_penalized);
     }
 }
