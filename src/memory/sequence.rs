@@ -161,6 +161,7 @@ mod tests {
     const VIEWS_DDL: &str = "CREATE TABLE edge_actor_views (actor_type TEXT NOT NULL, actor_id TEXT NOT NULL, source TEXT NOT NULL, target TEXT NOT NULL, views REAL NOT NULL DEFAULT 0, last_visited_at TEXT NOT NULL, PRIMARY KEY (actor_type, actor_id, source, target))";
     const POSITIONS_DDL: &str = "CREATE TABLE actor_positions (actor_type TEXT NOT NULL, actor_id TEXT NOT NULL, sum_vector BLOB, total_weight REAL NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY (actor_type, actor_id))";
     const HISTORY_DDL: &str = "CREATE TABLE actor_position_history (actor_type TEXT NOT NULL, actor_id TEXT NOT NULL, embedding BLOB, recorded_at TEXT NOT NULL)";
+    const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
 
     async fn harness() -> Connection {
         let Ok(database) = Builder::new_local(":memory:").build().await else {
@@ -177,10 +178,46 @@ mod tests {
             VIEWS_DDL,
             POSITIONS_DDL,
             HISTORY_DDL,
+            NODES_DDL,
         ] {
             let _ = conn.execute(ddl, ()).await;
         }
         conn
+    }
+
+    // A fact node outranking an entity by confidence must still lose the
+    // region to the entity (live finding: reverse fact->entity edges made
+    // 'ghostty-supports-windows' a region, fragmenting 'ghostty' counts).
+    #[test]
+    fn region_prefers_entity_sources_over_higher_confidence_facts() {
+        db::block_on(async {
+            let conn = harness().await;
+            add_turn(&conn, ("s1", "t1", "2026-07-13T10:00:00", Some("ghostty-supports-windows"), 0.9)).await;
+            let _ = conn
+                .execute(
+                    "INSERT OR REPLACE INTO edges (source, target, confidence) VALUES ('ghostty', 'ghostty-detail', 0.4)",
+                    (),
+                )
+                .await;
+            let _ = conn
+                .execute(
+                    "INSERT INTO events (turn_id, event_type, source, target) VALUES ('t1', 'injected', 'ghostty', 'ghostty-detail')",
+                    (),
+                )
+                .await;
+            for (node_id, node_type) in [("ghostty", "entity"), ("ghostty-supports-windows", "fact")] {
+                let _ = conn
+                    .execute(
+                        "INSERT OR REPLACE INTO nodes (id, node_type) VALUES (?1, ?2)",
+                        params![node_id, node_type],
+                    )
+                    .await;
+            }
+            let Ok(region) = db::load_turn_region(&conn, "t1").await else {
+                unreachable!("region query succeeds")
+            };
+            assert_eq!(region.as_deref(), Some("ghostty"));
+        });
     }
 
     async fn add_turn(conn: &Connection, details: (&str, &str, &str, Option<&str>, f64)) {
