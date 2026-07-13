@@ -11,8 +11,10 @@ mod ledger;
 mod loops;
 mod reinforce;
 mod routing;
+mod sequence;
 pub mod scheduler;
 pub use scheduler::pressure_line;
+pub use sequence::sequence_line;
 mod synthesis;
 mod task_chain;
 

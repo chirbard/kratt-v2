@@ -29,6 +29,20 @@ pub type SemanticEdgeRow = (
 
 pub type OpenCuriosityNoteRow = (String, String, String, String);
 
+#[derive(Clone, Debug)]
+pub(crate) struct RegionTransition {
+    pub target: String,
+    pub timestamp: String,
+    pub signal: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SequenceSuggestion {
+    pub turn_id: String,
+    pub source: String,
+    pub target: String,
+}
+
 #[allow(clippy::expect_used)]
 fn runtime() -> &'static Runtime {
     static RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -1453,6 +1467,190 @@ async fn load_recent_attention_counts_async(
         counts.insert((source, target), int(row.get_value(2)?) as usize);
     }
     Ok(counts)
+}
+
+pub(crate) async fn load_turn_region(
+    conn: &Connection,
+    turn_id: &str,
+) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+    let mut rows = conn
+        .query(
+            "SELECT ev.source
+             FROM events ev
+             JOIN edges ed ON ed.source = ev.source AND ed.target = ev.target
+             WHERE ev.turn_id = ?1 AND ev.event_type = 'injected'
+               AND ed.expired_at IS NULL
+             ORDER BY ed.confidence DESC, ev.id ASC
+             LIMIT 1",
+            params![turn_id],
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(None);
+    };
+    let region = text(row.get_value(0)?);
+    if region.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(region))
+}
+
+pub(crate) async fn load_previous_turn_region(
+    conn: &Connection,
+    session_id: &str,
+    current_turn: &str,
+) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+    let Some(turn_id) = load_previous_user_turn(conn, session_id, current_turn).await? else {
+        return Ok(None);
+    };
+    load_turn_region(conn, &turn_id).await
+}
+
+async fn load_previous_user_turn(
+    conn: &Connection,
+    session_id: &str,
+    current_turn: &str,
+) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+    let mut rows = conn
+        .query(
+            "SELECT previous.id
+             FROM messages current
+             JOIN messages previous ON previous.session_id = current.session_id
+             WHERE current.id = ?1 AND current.session_id = ?2
+               AND previous.role = 'user'
+               AND (previous.created_at < current.created_at
+                    OR (previous.created_at = current.created_at
+                        AND previous.rowid < current.rowid))
+             ORDER BY previous.created_at DESC, previous.rowid DESC
+             LIMIT 1",
+            params![current_turn, session_id],
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(None);
+    };
+    Ok(Some(text(row.get_value(0)?)))
+}
+
+pub(crate) async fn load_region_transitions(
+    conn: &Connection,
+    source: &str,
+    window_days: usize,
+) -> Result<Vec<RegionTransition>, Box<dyn Error + Send + Sync>> {
+    let mut signals = load_adjacent_region_transitions(conn, source, window_days).await?;
+    load_sequence_feedback(conn, source, window_days, &mut signals).await?;
+    Ok(signals)
+}
+
+const REGION_TRANSITIONS_QUERY: &str = "SELECT current.created_at,
+           (SELECT ev.source FROM events ev
+            JOIN edges ed ON ed.source = ev.source AND ed.target = ev.target
+            WHERE ev.turn_id = (
+                SELECT previous.id FROM messages previous
+                WHERE previous.session_id = current.session_id
+                  AND previous.role = 'user'
+                  AND (previous.created_at < current.created_at
+                       OR (previous.created_at = current.created_at
+                           AND previous.rowid < current.rowid))
+                ORDER BY previous.created_at DESC, previous.rowid DESC LIMIT 1
+            )
+              AND ev.event_type = 'injected' AND ed.expired_at IS NULL
+            ORDER BY ed.confidence DESC, ev.id ASC LIMIT 1),
+           (SELECT ev.source FROM events ev
+            JOIN edges ed ON ed.source = ev.source AND ed.target = ev.target
+            WHERE ev.turn_id = current.id
+              AND ev.event_type = 'injected' AND ed.expired_at IS NULL
+            ORDER BY ed.confidence DESC, ev.id ASC LIMIT 1)
+    FROM messages current
+    JOIN sessions session ON session.id = current.session_id
+    WHERE current.role = 'user' AND session.session_type = 'conversation'
+      AND julianday(current.created_at) >= julianday('now', printf('%d days', ?1))";
+
+async fn load_adjacent_region_transitions(
+    conn: &Connection,
+    source: &str,
+    window_days: usize,
+) -> Result<Vec<RegionTransition>, Box<dyn Error + Send + Sync>> {
+    let mut rows = conn
+        .query(REGION_TRANSITIONS_QUERY, params![-(window_days as i64)])
+        .await?;
+    let mut signals = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let previous = text(row.get_value(1)?);
+        let current = text(row.get_value(2)?);
+        if previous != source || current.is_empty() || current == previous {
+            continue;
+        }
+        signals.push(RegionTransition {
+            target: current,
+            timestamp: text(row.get_value(0)?),
+            signal: "transition".to_string(),
+        });
+    }
+    Ok(signals)
+}
+
+async fn load_sequence_feedback(
+    conn: &Connection,
+    source: &str,
+    window_days: usize,
+    signals: &mut Vec<RegionTransition>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut rows = conn
+        .query(
+            "SELECT target, ts, event_type FROM events
+             WHERE actor_id = 'sequence' AND source = ?1
+               AND event_type IN ('followed', 'rejected')
+               AND julianday(ts) >= julianday('now', printf('%d days', ?2))
+             ORDER BY id",
+            params![source, -(window_days as i64)],
+        )
+        .await?;
+    while let Some(row) = rows.next().await? {
+        signals.push(RegionTransition {
+            target: text(row.get_value(0)?),
+            timestamp: text(row.get_value(1)?),
+            signal: text(row.get_value(2)?),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) async fn last_suggestion_for_session(
+    conn: &Connection,
+    session_id: &str,
+    current_turn: &str,
+) -> Result<Option<SequenceSuggestion>, Box<dyn Error + Send + Sync>> {
+    let Some(previous_turn) = load_previous_user_turn(conn, session_id, current_turn).await? else {
+        return Ok(None);
+    };
+    let mut rows = conn
+        .query(
+            "SELECT suggested.turn_id, suggested.source, suggested.target
+             FROM events suggested
+             WHERE suggested.session_id = ?1 AND suggested.turn_id = ?2
+               AND suggested.actor_id = 'sequence'
+               AND suggested.event_type = 'suggested'
+               AND NOT EXISTS (
+                   SELECT 1 FROM events outcome
+                   WHERE outcome.session_id = ?1 AND outcome.turn_id = ?3
+                     AND outcome.actor_id = 'sequence'
+                     AND outcome.event_type IN ('followed', 'rejected')
+                     AND outcome.source = suggested.source
+                     AND outcome.target = suggested.target
+               )
+             ORDER BY suggested.id DESC LIMIT 1",
+            params![session_id, previous_turn, current_turn],
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(None);
+    };
+    Ok(Some(SequenceSuggestion {
+        turn_id: text(row.get_value(0)?),
+        source: text(row.get_value(1)?),
+        target: text(row.get_value(2)?),
+    }))
 }
 
 async fn load_edge_actor_views_async(

@@ -171,6 +171,21 @@ impl Event {
         )
     }
 
+    pub fn sequence(
+        event_type: &str,
+        edge: EdgeRef,
+        context: EventContext,
+        payload: String,
+    ) -> Self {
+        Self::new(
+            Actor::new("system", "sequence"),
+            event_type,
+            edge,
+            context,
+            EventBody::new(1.0, payload),
+        )
+    }
+
     fn new(
         actor: Actor,
         event_type: &str,
