@@ -1478,9 +1478,10 @@ pub(crate) async fn load_turn_region(
             "SELECT ev.source
              FROM events ev
              JOIN edges ed ON ed.source = ev.source AND ed.target = ev.target
+             LEFT JOIN nodes n ON n.id = ev.source
              WHERE ev.turn_id = ?1 AND ev.event_type = 'injected'
                AND ed.expired_at IS NULL
-             ORDER BY ed.confidence DESC, ev.id ASC
+             ORDER BY (n.node_type = 'entity') DESC, ed.confidence DESC, ev.id ASC
              LIMIT 1",
             params![turn_id],
         )
@@ -1545,6 +1546,7 @@ pub(crate) async fn load_region_transitions(
 const REGION_TRANSITIONS_QUERY: &str = "SELECT current.created_at,
            (SELECT ev.source FROM events ev
             JOIN edges ed ON ed.source = ev.source AND ed.target = ev.target
+            LEFT JOIN nodes n ON n.id = ev.source
             WHERE ev.turn_id = (
                 SELECT previous.id FROM messages previous
                 WHERE previous.session_id = current.session_id
@@ -1555,12 +1557,13 @@ const REGION_TRANSITIONS_QUERY: &str = "SELECT current.created_at,
                 ORDER BY previous.created_at DESC, previous.rowid DESC LIMIT 1
             )
               AND ev.event_type = 'injected' AND ed.expired_at IS NULL
-            ORDER BY ed.confidence DESC, ev.id ASC LIMIT 1),
+            ORDER BY (n.node_type = 'entity') DESC, ed.confidence DESC, ev.id ASC LIMIT 1),
            (SELECT ev.source FROM events ev
             JOIN edges ed ON ed.source = ev.source AND ed.target = ev.target
+            LEFT JOIN nodes n ON n.id = ev.source
             WHERE ev.turn_id = current.id
               AND ev.event_type = 'injected' AND ed.expired_at IS NULL
-            ORDER BY ed.confidence DESC, ev.id ASC LIMIT 1)
+            ORDER BY (n.node_type = 'entity') DESC, ed.confidence DESC, ev.id ASC LIMIT 1)
     FROM messages current
     JOIN sessions session ON session.id = current.session_id
     WHERE current.role = 'user' AND session.session_type = 'conversation'
