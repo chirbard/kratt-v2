@@ -382,6 +382,7 @@ pub struct DayDigest {
 pub struct AutonomySummary {
     pub actions: usize,
     pub yielded: usize,
+    pub news_findings: usize,
     pub positive_reactions: usize,
     pub negative_reactions: usize,
 }
@@ -396,6 +397,17 @@ impl AutonomySummary {
             "Autonomy: Ran {} self-directed {} ({} added knowledge)",
             self.actions, pass_word, self.yielded
         );
+        if self.news_findings > 0 {
+            let finding_word = if self.news_findings == 1 {
+                "finding"
+            } else {
+                "findings"
+            };
+            line.push_str(&format!(
+                "; {} news {} on your interests",
+                self.news_findings, finding_word
+            ));
+        }
         let surfaced = self.positive_reactions + self.negative_reactions;
         if surfaced > 0 {
             line.push_str(&format!(
@@ -494,12 +506,30 @@ async fn load_autonomy_summary(
 ) -> Result<AutonomySummary, Box<dyn Error + Send + Sync>> {
     let (actions, yielded) = count_autonomy_passes(conn, activity, night).await?;
     let (positive_reactions, negative_reactions) = count_reactions(conn, activity, night).await?;
+    let news_findings = count_window_findings(conn, activity, night).await;
     Ok(AutonomySummary {
         actions,
         yielded,
+        news_findings,
         positive_reactions,
         negative_reactions,
     })
+}
+
+async fn count_window_findings(
+    conn: &Connection,
+    activity: &NightWindow,
+    night: &NightWindow,
+) -> usize {
+    db::count_findings_in_windows(
+        conn,
+        &activity.from,
+        &activity.until,
+        &night.from,
+        &night.until,
+    )
+    .await
+    .unwrap_or(0)
 }
 
 async fn count_autonomy_passes(
@@ -509,7 +539,7 @@ async fn count_autonomy_passes(
 ) -> Result<(usize, usize), Box<dyn Error + Send + Sync>> {
     let mut rows = conn
         .query(
-            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN EXISTS (SELECT 1 FROM events ev WHERE ev.session_id = sessions.id AND ev.event_type = 'created') THEN 1 ELSE 0 END), 0) FROM sessions WHERE session_type IN ('exploration', 'dream', 'ingestion') AND ((created_at >= ?1 AND created_at < ?2) OR (created_at >= ?3 AND created_at < ?4))",
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN EXISTS (SELECT 1 FROM events ev WHERE ev.session_id = sessions.id AND ev.event_type = 'created') THEN 1 ELSE 0 END), 0) FROM sessions WHERE session_type IN ('exploration', 'dream', 'ingestion', 'news') AND ((created_at >= ?1 AND created_at < ?2) OR (created_at >= ?3 AND created_at < ?4))",
             params![activity.from.as_str(), activity.until.as_str(), night.from.as_str(), night.until.as_str()],
         )
         .await?;
@@ -1801,7 +1831,9 @@ mod tests {
     fn digest_counts_autonomy_yield_and_reactions() {
         let conn = db::block_on(digest_harness());
         db::block_on(async {
-            let _ = conn.execute("INSERT INTO sessions (id, session_type, created_at) VALUES ('explore-1', 'exploration', '2026-07-10T02:00:00'), ('dream-1', 'dream', '2026-07-10T03:00:00'), ('chat-1', 'conversation', '2026-07-10T04:00:00')", ()).await;
+            let _ = conn.execute("INSERT INTO sessions (id, session_type, created_at) VALUES ('explore-1', 'exploration', '2026-07-10T02:00:00'), ('dream-1', 'dream', '2026-07-10T03:00:00'), ('chat-1', 'conversation', '2026-07-10T04:00:00'), ('news:2026-07-10', 'news', '2026-07-10T05:00:00')", ()).await;
+            let _ = conn.execute("CREATE TABLE findings (id INTEGER PRIMARY KEY, interest_topic TEXT, title TEXT, url TEXT, snippet TEXT, novelty REAL, found_at TEXT, status TEXT, surfaced_at TEXT)", ()).await;
+            let _ = conn.execute("INSERT INTO findings (interest_topic, title, url, snippet, novelty, found_at, status, surfaced_at) VALUES ('Rust', 'Compiler news', 'https://example.com', '', 0.8, '2026-07-10T05:00:00', 'candidate', '')", ()).await;
         });
         db::block_on(insert_event(
             &conn,
@@ -1835,14 +1867,16 @@ mod tests {
         ));
 
         let digest = digest(&conn, YESTERDAY);
-        assert_eq!(digest.autonomy.actions, 2);
+        assert_eq!(digest.autonomy.actions, 3);
         assert_eq!(digest.autonomy.yielded, 1);
+        assert_eq!(digest.autonomy.news_findings, 1);
         assert_eq!(digest.autonomy.positive_reactions, 1);
         assert_eq!(digest.autonomy.negative_reactions, 1);
         let Some(line) = digest.autonomy.line() else {
             unreachable!("non-empty autonomy renders")
         };
         assert!(line.contains("1 of 2 surfaced items useful"));
+        assert!(line.contains("1 news finding on your interests"));
     }
 
     #[test]

@@ -22,6 +22,7 @@ pub enum SchedulerAction {
     Dream { reason: String },
     Explore { reason: String },
     Curiosity { reason: String },
+    NewsScan { reason: String },
     InboxStudy { reason: String },
     Ingest { path: PathBuf, reason: String },
     Rest { reason: String },
@@ -36,6 +37,7 @@ pub struct SchedulerInputs {
     pub open_curiosity_notes_count: usize,
     pub coldest_edge_age_days: Option<i64>,
     pub actor_positions: Vec<(String, String, Option<Vec<f64>>)>, // (actor_type, actor_id, position)
+    pub news_scan_due: bool,
     pub last_curiosity_had_yield: Option<bool>,
 }
 
@@ -63,6 +65,7 @@ async fn gather_inputs_async(conn: &Connection) -> SchedulerInputs {
         open_curiosity_notes_count,
         coldest_edge_age_days,
         actor_positions,
+        news_scan_due: true,
         last_curiosity_had_yield: None,
     }
 }
@@ -127,6 +130,11 @@ pub fn decide(inputs: &SchedulerInputs) -> SchedulerAction {
     }
     if let Some(action) = check_cold_region(inputs) {
         return action;
+    }
+    if inputs.news_scan_due {
+        return SchedulerAction::NewsScan {
+            reason: "daily interest-driven scan".to_string(),
+        };
     }
     if inputs.last_curiosity_had_yield != Some(false) {
         return SchedulerAction::Curiosity {
@@ -298,6 +306,9 @@ pub fn log_scheduler_decision(action: &SchedulerAction) {
         }
         SchedulerAction::Curiosity { reason } => {
             crate::runlog::log("sched", &format!("[autonomy] curiosity — {reason}"));
+        }
+        SchedulerAction::NewsScan { reason } => {
+            crate::runlog::log("sched", &format!("[autonomy] news scan — {reason}"));
         }
         SchedulerAction::InboxStudy { reason } => {
             crate::runlog::log("sched", &format!("[autonomy] inbox study — {reason}"));
@@ -597,6 +608,7 @@ mod tests {
             open_curiosity_notes_count: 0,
             coldest_edge_age_days: Some(20),
             actor_positions: vec![],
+            news_scan_due: false,
             last_curiosity_had_yield: None,
         };
         let action = decide(&inputs);
@@ -626,6 +638,7 @@ mod tests {
             open_curiosity_notes_count: 0,
             coldest_edge_age_days: Some(5),
             actor_positions: vec![],
+            news_scan_due: false,
             last_curiosity_had_yield: None,
         };
         let action = decide(&inputs);
@@ -651,6 +664,7 @@ mod tests {
             open_curiosity_notes_count: 5,
             coldest_edge_age_days: Some(5),
             actor_positions: vec![],
+            news_scan_due: false,
             last_curiosity_had_yield: None,
         };
         let action = decide(&inputs);
@@ -671,6 +685,7 @@ mod tests {
             open_curiosity_notes_count: 0,
             coldest_edge_age_days: Some(15), // > COLD_REGION_DAYS (14)
             actor_positions: vec![],
+            news_scan_due: false,
             last_curiosity_had_yield: None,
         };
         let action = decide(&inputs);
@@ -692,6 +707,7 @@ mod tests {
             open_curiosity_notes_count: 0,
             coldest_edge_age_days: None, // no edge_actor_views rows yet
             actor_positions: vec![],
+            news_scan_due: false,
             last_curiosity_had_yield: None,
         };
         let action = decide(&inputs);
@@ -710,6 +726,7 @@ mod tests {
             open_curiosity_notes_count: 0,
             coldest_edge_age_days: Some(5),
             actor_positions: vec![],
+            news_scan_due: false,
             last_curiosity_had_yield: None,
         };
         let action = decide(&inputs);
@@ -729,6 +746,31 @@ mod tests {
     }
 
     #[test]
+    fn news_scan_runs_below_maintenance_and_above_curiosity() {
+        let due = SchedulerInputs {
+            news_scan_due: true,
+            ..SchedulerInputs::default()
+        };
+        assert!(matches!(decide(&due), SchedulerAction::NewsScan { .. }));
+
+        let debt = SchedulerInputs {
+            acquisition_debt: ACQUISITION_DEBT_THRESHOLD,
+            news_scan_due: true,
+            ..SchedulerInputs::default()
+        };
+        assert!(matches!(decide(&debt), SchedulerAction::Dream { .. }));
+
+        let scanned = SchedulerInputs {
+            news_scan_due: false,
+            ..SchedulerInputs::default()
+        };
+        assert!(matches!(
+            decide(&scanned),
+            SchedulerAction::Curiosity { .. }
+        ));
+    }
+
+    #[test]
     fn test_rule_priority_dream_over_ingest() {
         // Dream should win over ingest when debt is high
         let inputs = SchedulerInputs {
@@ -738,6 +780,7 @@ mod tests {
             open_curiosity_notes_count: 0,
             coldest_edge_age_days: Some(5),
             actor_positions: vec![],
+            news_scan_due: false,
             last_curiosity_had_yield: None,
         };
         let action = decide(&inputs);
@@ -802,6 +845,7 @@ mod tests {
             open_curiosity_notes_count: 5,
             coldest_edge_age_days: Some(5),
             actor_positions: vec![],
+            news_scan_due: false,
             last_curiosity_had_yield: None,
         };
         // Note: This test assumes the file exists. In a real scenario,
