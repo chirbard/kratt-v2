@@ -26,7 +26,7 @@ pub use db::{
 };
 pub(crate) use db::{InboxItem, oldest_queued_inbox, open_connection, resolve_inbox_item};
 pub(crate) use db::{
-    RecentLearning, block_on, latest_assistant_message_timestamp_async,
+    RecentLearning, block_on, conversation_boundary_async, latest_assistant_message_timestamp_async,
     load_inbox_snapshot_async, load_open_curiosity_notes_async, load_open_intentions_async,
     load_recent_learning_async,
 };
