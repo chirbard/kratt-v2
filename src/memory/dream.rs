@@ -674,6 +674,10 @@ fn apply_dream_call<'scope, 'policy>(
             "inbox_add denied: inbox_add is a chat memory tool".to_string(),
             false,
         )),
+        ToolCall::RegisterInterest { .. } => Ok((
+            "register_interest denied: register_interest is not a dreaming tool".to_string(),
+            false,
+        )),
     }
 }
 

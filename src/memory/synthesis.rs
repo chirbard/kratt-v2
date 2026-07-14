@@ -631,6 +631,16 @@ fn normalize_call(call: &ToolCall, confidence: f64) -> ToolCall {
             note: note.clone(),
         },
         ToolCall::InboxAdd { .. } => normalize_inbox_add(call),
+        ToolCall::RegisterInterest { .. } => normalize_interest(call),
+    }
+}
+
+fn normalize_interest(call: &ToolCall) -> ToolCall {
+    let ToolCall::RegisterInterest { topic } = call else {
+        unreachable!("normalize_interest called with non-interest call");
+    };
+    ToolCall::RegisterInterest {
+        topic: topic.clone(),
     }
 }
 
@@ -807,7 +817,8 @@ fn apply_policy_overrides(cluster: &Cluster, calls: &[ToolCall], policy: &mut Sy
             | ToolCall::RecordReaction { .. }
             | ToolCall::OpenLoop { .. }
             | ToolCall::CloseLoop { .. }
-            | ToolCall::InboxAdd { .. } => {}
+            | ToolCall::InboxAdd { .. }
+            | ToolCall::RegisterInterest { .. } => {}
         }
         idx += 1;
     }
@@ -869,7 +880,15 @@ fn tool_call_json(call: &ToolCall) -> serde_json::Value {
         } => {
             json!({"tool":"inbox_add","args":{"source":source,"instruction":instruction}})
         }
+        ToolCall::RegisterInterest { .. } => interest_tool_json(call),
     }
+}
+
+fn interest_tool_json(call: &ToolCall) -> serde_json::Value {
+    let ToolCall::RegisterInterest { topic } = call else {
+        unreachable!("interest_tool_json called with non-interest call");
+    };
+    json!({"tool":"register_interest","args":{"topic":topic}})
 }
 
 fn task_tool_json(call: &ToolCall) -> serde_json::Value {

@@ -184,6 +184,9 @@ pub(crate) enum ToolCall {
         source: String,
         instruction: String,
     },
+    RegisterInterest {
+        topic: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,6 +253,7 @@ pub(crate) fn describe_tool_call(call: &ToolCall) -> String {
             format!("close_loop {loop_id} ({resolution})")
         }
         ToolCall::InboxAdd { source, .. } => format!("inbox_add {source}"),
+        ToolCall::RegisterInterest { topic } => format!("register_interest {topic}"),
     }
 }
 
@@ -786,6 +790,7 @@ fn parse_single_tool(obj: &serde_json::Value) -> Option<ToolCall> {
         "open_loop" => parse_open_loop(args),
         "close_loop" => parse_close_loop(args),
         "inbox_add" => parse_inbox_add(args),
+        "register_interest" => parse_register_interest(args),
         _ => None,
     }
 }
@@ -813,6 +818,7 @@ pub(crate) fn parse_tool_call_request(call: &ToolCallRequest) -> Option<ToolCall
         "promote_edge" => parse_promote_edge(&args),
         "inbox_add" => parse_inbox_add(&args),
         "record_reaction" => parse_record_reaction(&args),
+        "register_interest" => parse_register_interest(&args),
         _ => None,
     }
 }
@@ -832,6 +838,15 @@ pub(crate) fn memory_mutation_tools() -> serde_json::Value {
                     "date": {"type": "string"}
                 },
                 "required": ["name", "type", "body", "date"]
+            }),
+        ),
+        memory_tool(
+            "register_interest",
+            "Adopt a topic as a durable standing interest.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"topic": {"type": "string"}},
+                "required": ["topic"]
             }),
         ),
         memory_tool(
@@ -1071,6 +1086,14 @@ fn parse_inbox_add(args: &serde_json::Value) -> Option<ToolCall> {
     })
 }
 
+fn parse_register_interest(args: &serde_json::Value) -> Option<ToolCall> {
+    let topic = json_str(args, "topic");
+    if topic.trim().is_empty() {
+        return None;
+    }
+    Some(ToolCall::RegisterInterest { topic })
+}
+
 fn parse_close_loop(args: &serde_json::Value) -> Option<ToolCall> {
     let loop_id = json_str(args, "loop");
     let resolution = json_str(args, "resolution");
@@ -1252,7 +1275,28 @@ pub(crate) fn apply_tool_call<'scope>(
             apply_close_loop_call(conn, options, events, CloseLoopCall { loop_id, resolution, note }),
         ToolCall::InboxAdd { source, instruction } =>
             apply_inbox_add_call(conn, options, &source, &instruction),
+        ToolCall::RegisterInterest { topic } =>
+            apply_register_interest_call(conn, options, &topic),
     }
+}
+
+fn apply_register_interest_call<'scope>(
+    conn: &Connection,
+    options: &ApplyToolOptions<'scope>,
+    topic: &str,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    if !interest_seat_allowed(&options.actor.actor_id) {
+        return Ok(
+            "register_interest denied: register_interest is a scribe or heavy tool".to_string(),
+        );
+    }
+    let interest_id = db::insert_interest(conn, topic, "user")?;
+    runlog::log("interest", &format!("registered: {} (user)", topic.trim()));
+    Ok(format!("register_interest: {interest_id}"))
+}
+
+fn interest_seat_allowed(actor_id: &str) -> bool {
+    matches!(actor_id, "scribe" | "extract" | "consolidate")
 }
 
 fn apply_inbox_add_call<'scope>(
@@ -1578,7 +1622,8 @@ pub(super) fn tool_call_touches_loop(
         | ToolCall::RecordReaction { .. }
         | ToolCall::OpenLoop { .. }
         | ToolCall::CloseLoop { .. }
-        | ToolCall::InboxAdd { .. } => Ok(false),
+        | ToolCall::InboxAdd { .. }
+        | ToolCall::RegisterInterest { .. } => Ok(false),
     }
 }
 
@@ -2933,6 +2978,76 @@ mod tests {
             for line in &outcomes {
                 assert!(!line.starts_with("https://old"), "{outcomes:?}");
             }
+        }
+    }
+
+    mod interests {
+        use super::super::{ApplyToolOptions, ToolCall, apply_tool_call, parse_tool_calls};
+        use crate::memory::db;
+        use crate::memory::ledger::{Actor, Event, EventContext};
+        use turso::Builder;
+
+        async fn harness() -> turso::Connection {
+            let Ok(database) = Builder::new_local(":memory:").build().await else {
+                unreachable!("in-memory database builds")
+            };
+            let Ok(conn) = database.connect() else {
+                unreachable!("in-memory database connects")
+            };
+            let _ = conn.execute("CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')", ()).await;
+            conn
+        }
+
+        fn register(conn: &turso::Connection, phase: &'static str, topic: &str) -> String {
+            let options = ApplyToolOptions {
+                actor: Actor::new("system", phase),
+                context: EventContext::new("chat-1", "turn-1"),
+                source_message_id: "message-1",
+                event_payload: "",
+                confidence_cap: None,
+                default_memory_type: "semantic",
+            };
+            let mut events: Vec<Event> = Vec::new();
+            let call = ToolCall::RegisterInterest {
+                topic: topic.to_string(),
+            };
+            apply_tool_call(call, conn, &options, &mut events).unwrap_or_default()
+        }
+
+        #[test]
+        fn registration_is_seat_symmetric_and_idempotent() {
+            let conn = db::block_on(harness());
+            for phase in ["scribe", "extract", "consolidate"] {
+                assert!(register(&conn, phase, "libsql internals").contains("libsql-internals"));
+            }
+            let interests = db::block_on(db::top_interests_with(&conn, 10)).unwrap_or_default();
+            assert_eq!(interests.len(), 1);
+            assert_eq!(interests[0].topic, "libsql internals");
+            assert_eq!(interests[0].origin, "user");
+        }
+
+        #[test]
+        fn registration_is_denied_from_dream_and_ingest() {
+            let conn = db::block_on(harness());
+            for phase in ["consolidation", "ingest"] {
+                assert!(register(&conn, phase, "libsql internals").contains("denied"));
+            }
+            let interests = db::block_on(db::top_interests_with(&conn, 10)).unwrap_or_default();
+            assert!(interests.is_empty());
+        }
+
+        #[test]
+        fn register_interest_parses_only_non_empty_topics() {
+            let calls = parse_tool_calls(
+                r#"{"tool":"register_interest","args":{"topic":"libsql internals"}}"#,
+            );
+            assert!(matches!(
+                calls.first(),
+                Some(ToolCall::RegisterInterest { .. })
+            ));
+            assert!(
+                parse_tool_calls(r#"{"tool":"register_interest","args":{"topic":""}}"#).is_empty()
+            );
         }
     }
 

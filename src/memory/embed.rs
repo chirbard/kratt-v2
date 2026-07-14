@@ -21,6 +21,8 @@ pub const EXPLORATION_CANDIDATES: usize = 200;
 pub const NOVELTY_WEIGHT: f64 = 0.3;
 const SATIATION_WINDOW_DAYS: usize = 7; // replay-tunable.
 const SATIATION_WEIGHT: f64 = 0.5; // replay-tunable.
+const INTEREST_WEIGHT: f64 = 0.6; // replay-tunable.
+const INTEREST_TARGETS: usize = 5; // replay-tunable.
 const W_SIM: f64 = 0.65; // replay-tunable.
 const W_CONF: f64 = 0.2; // replay-tunable.
 const W_RECENCY: f64 = 0.15; // replay-tunable.
@@ -94,12 +96,39 @@ pub fn run_embed_pass(
             }
             start = end;
         }
+        match embed_interest_batch(&*embed, &db::load_unembedded_interests()) {
+            Ok(count) => embedded += count,
+            Err(err) => send_log(sender, "embed", format!("interest batch failed — {err}")),
+        }
         embedded
     };
     if embedded > 0 {
         db::sync_push_best_effort("embed");
     }
     send_log(sender, "embed", format!("{embedded} edges embedded"));
+}
+
+fn embed_interest_batch(
+    embed: &dyn EmbeddingClient,
+    rows: &[(String, String)],
+) -> Result<usize, Box<dyn Error + Send + Sync>> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let mut texts = Vec::new();
+    for (_, topic) in rows {
+        texts.push(topic.clone());
+    }
+    let vectors = embed.embed(&texts)?;
+    if rows.len() != vectors.len() {
+        return Err("interest embedding count mismatch".into());
+    }
+    let mut index = 0usize;
+    while index < rows.len() {
+        db::save_interest_embedding(&rows[index].0, &vectors[index])?;
+        index += 1;
+    }
+    Ok(rows.len())
 }
 
 pub fn select_semantic_edges(embed: &dyn EmbeddingClient, query: &str) -> Vec<SemanticEdge> {
@@ -278,7 +307,8 @@ fn choose_exploration_anchors(
     let views = db::load_edge_actor_views("agent", agent_name);
     let keys = edge_keys(&candidates);
     let attention = db::load_recent_attention_counts(&keys, SATIATION_WINDOW_DAYS);
-    rank_by_exploration(candidates, &views, &attention)
+    let interests = db::densification_targets(INTEREST_TARGETS);
+    rank_by_exploration(candidates, &views, &attention, &interests)
 }
 
 fn edge_keys(candidates: &[SemanticEdge]) -> Vec<(String, String)> {
@@ -332,11 +362,13 @@ fn rank_by_exploration(
     candidates: Vec<SemanticEdge>,
     views: &HashMap<(String, String), f64>,
     attention: &HashMap<(String, String), usize>,
+    interests: &[db::InterestTarget],
 ) -> Vec<SemanticEdge> {
     let node_totals = node_view_totals(views);
     let mut scored = Vec::new();
     let total = EXPLORATION_CANDIDATES as f64;
     let mut base_top: Option<(f64, (String, String))> = None;
+    let mut unpulled_top: Option<(f64, (String, String))> = None;
     let mut rank = 0usize;
     while rank < candidates.len() {
         let edge = candidates[rank].clone();
@@ -346,14 +378,87 @@ fn rank_by_exploration(
         let key = (edge.source.clone(), edge.target.clone());
         update_base_top(&mut base_top, base_score, &key);
         let recent_attention = *attention.get(&key).unwrap_or(&0);
-        let score = base_score * satiation_factor(recent_attention);
+        let satiation = satiation_factor(recent_attention);
+        update_base_top(&mut unpulled_top, base_score * satiation, &key);
+        let score = (base_score + interest_bonus(&edge, interests)) * satiation;
         scored.push(ScoredEdge { score, edge });
         rank += 1;
     }
     scored.sort_by(|left, right| right.score.total_cmp(&left.score));
     log_attention_profile(attention);
     log_satiation_shift(&scored, &base_top, attention);
+    log_interest_anchor(&scored, interests, &unpulled_top);
     top_ranked_edges(scored)
+}
+
+fn interest_bonus(edge: &SemanticEdge, interests: &[db::InterestTarget]) -> f64 {
+    let Some(edge_embedding) = edge.embedding.as_deref() else {
+        return 0.0;
+    };
+    let mut bonus: f64 = 0.0;
+    for interest in interests {
+        let similarity = cosine_similarity(edge_embedding, &interest.embedding).max(0.0);
+        let density_pull = 1.0 / (1.0 + interest.density as f64);
+        bonus = bonus.max(INTEREST_WEIGHT * similarity * density_pull);
+    }
+    bonus
+}
+
+fn cosine_similarity(left: &[f64], right: &[f64]) -> f64 {
+    if left.len() != right.len() || left.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0;
+    let mut left_norm = 0.0;
+    let mut right_norm = 0.0;
+    let mut index = 0usize;
+    while index < left.len() {
+        dot += left[index] * right[index];
+        left_norm += left[index] * left[index];
+        right_norm += right[index] * right[index];
+        index += 1;
+    }
+    let denominator = left_norm.sqrt() * right_norm.sqrt();
+    if denominator == 0.0 {
+        return 0.0;
+    }
+    dot / denominator
+}
+
+fn log_interest_anchor(
+    scored: &[ScoredEdge],
+    interests: &[db::InterestTarget],
+    unpulled_top: &Option<(f64, (String, String))>,
+) {
+    let Some(first) = scored.first() else {
+        return;
+    };
+    if matches!(
+        unpulled_top,
+        Some((_, key)) if key.0 == first.edge.source && key.1 == first.edge.target
+    )
+    {
+        return;
+    }
+    let mut best: Option<(&db::InterestTarget, f64)> = None;
+    for interest in interests {
+        let bonus = interest_bonus(&first.edge, std::slice::from_ref(interest));
+        if bonus <= 0.0 {
+            continue;
+        }
+        if best.is_none_or(|(_, best_bonus)| bonus > best_bonus) {
+            best = Some((interest, bonus));
+        }
+    }
+    if let Some((interest, _)) = best {
+        runlog::log(
+            "explore",
+            &format!(
+                "interest: densifying {} (density {})",
+                interest.topic, interest.density
+            ),
+        );
+    }
 }
 
 // Always-on profile: distinguishes "attention query returned nothing" from
@@ -688,7 +793,10 @@ fn send_log(sender: &std::sync::mpsc::Sender<MemoryEvent>, phase: &'static str, 
 mod tests {
     use std::collections::HashMap;
 
-    use super::{SemanticEdge, rank_by_exploration, satiation_factor, scope_episodic};
+    use super::{
+        SemanticEdge, interest_bonus, rank_by_exploration, satiation_factor, scope_episodic,
+    };
+    use crate::memory::db::InterestTarget;
 
     fn test_edge(memory_type: &str, origin_session: &str) -> SemanticEdge {
         SemanticEdge {
@@ -755,7 +863,8 @@ mod tests {
         let mut attention = HashMap::new();
         attention.insert(("penalized".to_string(), "region".to_string()), 8);
 
-        let ranked = rank_by_exploration(vec![penalized, untouched], &HashMap::new(), &attention);
+        let ranked =
+            rank_by_exploration(vec![penalized, untouched], &HashMap::new(), &attention, &[]);
 
         assert_eq!(ranked.len(), 2);
         assert_eq!(ranked[0].source, "untouched");
@@ -766,5 +875,49 @@ mod tests {
             }
         }
         assert!(found_penalized);
+    }
+
+    #[test]
+    fn sparse_interest_pulls_nearby_candidate_more_strongly() {
+        let mut nearby = test_edge("semantic", "");
+        nearby.embedding = Some(vec![1.0, 0.0]);
+        let sparse = InterestTarget {
+            topic: "libsql internals".to_string(),
+            density: 0,
+            embedding: vec![1.0, 0.0],
+        };
+        let dense = InterestTarget {
+            topic: "rust".to_string(),
+            density: 8,
+            embedding: vec![1.0, 0.0],
+        };
+        assert!(interest_bonus(&nearby, &[sparse]) > interest_bonus(&nearby, &[dense]));
+
+        let mut outside = nearby.clone();
+        outside.embedding = Some(vec![0.0, 1.0]);
+        let target = InterestTarget {
+            topic: "libsql internals".to_string(),
+            density: 0,
+            embedding: vec![1.0, 0.0],
+        };
+        assert!(
+            interest_bonus(&nearby, std::slice::from_ref(&target))
+                > interest_bonus(&outside, &[target])
+        );
+
+        outside.source = "outside".to_string();
+        nearby.source = "nearby".to_string();
+        let target = InterestTarget {
+            topic: "libsql internals".to_string(),
+            density: 0,
+            embedding: vec![1.0, 0.0],
+        };
+        let ranked = rank_by_exploration(
+            vec![outside, nearby],
+            &HashMap::new(),
+            &HashMap::new(),
+            &[target],
+        );
+        assert_eq!(ranked[0].source, "nearby");
     }
 }
