@@ -437,6 +437,10 @@ pub(crate) fn build_tools(has_search: bool) -> Value {
         "Recall up to five real open questions you are curious about, with their age.",
     ));
     tools.push(simple_recall_tool(
+        "recall_interests",
+        "Recall up to five durable or self-derived topics you are interested in.",
+    ));
+    tools.push(simple_recall_tool(
         "recall_intentions",
         "Recall up to five real open or due intentions and what each is waiting on.",
     ));
@@ -570,6 +574,7 @@ fn execute_tool(
         "read_history" => execute_read_history(&call.args, session_path),
         "read_source" => execute_read_source(&call.args),
         "recall_curiosities" => execute_recall_curiosities(),
+        "recall_interests" => execute_recall_interests(),
         "recall_intentions" => execute_recall_intentions(),
         "recall_recent_learning" => execute_recall_recent_learning(&call.args),
         "recall_queue" => execute_recall_queue(),
@@ -660,6 +665,28 @@ fn execute_recall_curiosities_with(conn: &turso::Connection, today: &str) -> Str
             "- {question} ({}; about {target})",
             curiosity_age(&opened, today)
         ));
+    }
+    lines.join("\n")
+}
+
+fn execute_recall_interests() -> String {
+    render_interests(memory::top_interests(INTROSPECTION_LIMIT))
+}
+
+#[cfg(test)]
+fn execute_recall_interests_with(conn: &turso::Connection) -> String {
+    let interests =
+        memory::block_on(memory::top_interests_with(conn, INTROSPECTION_LIMIT)).unwrap_or_default();
+    render_interests(interests)
+}
+
+fn render_interests(interests: Vec<memory::Interest>) -> String {
+    if interests.is_empty() {
+        return "No interests have emerged yet.".to_string();
+    }
+    let mut lines = vec!["Interests:".to_string()];
+    for interest in interests {
+        lines.push(format!("- {} ({})", interest.topic, interest.origin));
     }
     lines.join("\n")
 }
@@ -912,7 +939,7 @@ mod tests {
     use super::{
         MemorySections, assemble_memory_block, build_memory_events, build_tools,
         catch_up_since, collect_anchor_ids, execute_catch_up_with, execute_recall_curiosities_with,
-        execute_recall_intentions_with, execute_recall_queue_with,
+        execute_recall_intentions_with, execute_recall_interests_with, execute_recall_queue_with,
         execute_recall_recent_learning_with, execute_tool, parse_since_days,
     };
     use crate::api::ToolCallRequest;
@@ -1070,6 +1097,20 @@ mod tests {
         assert!(rendered.contains("Why does sleep improve recall?"));
         assert!(rendered.contains("2 days old"));
         assert!(rendered.contains("about sleep"));
+    }
+
+    #[test]
+    fn interest_recall_surfaces_registration_and_honest_empty_state() {
+        let conn = crate::memory::block_on(introspection_harness());
+        assert_eq!(
+            execute_recall_interests_with(&conn),
+            "No interests have emerged yet."
+        );
+        let inserted = crate::memory::insert_interest(&conn, "libsql internals", "user");
+        assert!(inserted.is_ok());
+        let rendered = execute_recall_interests_with(&conn);
+        assert!(rendered.contains("libsql internals"));
+        assert!(rendered.contains("user"));
     }
 
     #[test]

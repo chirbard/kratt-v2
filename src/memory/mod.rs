@@ -26,10 +26,13 @@ pub use db::{
 };
 pub(crate) use db::{InboxItem, oldest_queued_inbox, open_connection, resolve_inbox_item};
 pub(crate) use db::{
-    RecentLearning, block_on, conversation_boundary_async, latest_assistant_message_timestamp_async,
-    load_inbox_snapshot_async, load_open_curiosity_notes_async, load_open_intentions_async,
-    load_recent_learning_async,
+    Interest, RecentLearning, block_on, conversation_boundary_async,
+    latest_assistant_message_timestamp_async, load_inbox_snapshot_async,
+    load_open_curiosity_notes_async, load_open_intentions_async, load_recent_learning_async,
+    top_interests,
 };
+#[cfg(test)]
+pub(crate) use db::{insert_interest, top_interests_with};
 pub use dream::{DreamEvent, run_dream_pass};
 pub use embed::{SemanticEdge, edges_to_toon, run_embed_pass, select_semantic_edges_routed};
 pub use explore::{ExploreEvent, run_exploration_pass};

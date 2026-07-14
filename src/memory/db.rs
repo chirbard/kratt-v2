@@ -29,6 +29,24 @@ pub type SemanticEdgeRow = (
 
 pub type OpenCuriosityNoteRow = (String, String, String, String);
 
+pub(crate) const INTEREST_NEIGHBOUR_DISTANCE: f64 = 0.25; // replay-tunable.
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Interest {
+    pub node_id: String,
+    pub topic: String,
+    pub origin: String,
+    pub created_at: String,
+    pub strength: f64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct InterestTarget {
+    pub topic: String,
+    pub density: usize,
+    pub embedding: Vec<f64>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RecentLearning {
     pub content: String,
@@ -362,10 +380,23 @@ async fn init_schema(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     create_base_tables(conn).await?;
     create_history_tables(conn, create_fts_index).await?;
+    add_interest_node_columns(conn).await;
     add_edge_columns(conn).await;
     add_ledger_tables(conn).await;
     drop_node_agent_views_table(conn).await;
     Ok(())
+}
+
+async fn add_interest_node_columns(conn: &Connection) {
+    let _ = conn
+        .execute(
+            "ALTER TABLE nodes ADD COLUMN origin TEXT NOT NULL DEFAULT ''",
+            (),
+        )
+        .await;
+    let _ = conn
+        .execute("ALTER TABLE nodes ADD COLUMN embedding BLOB", ())
+        .await;
 }
 
 async fn create_base_tables(conn: &Connection) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -821,6 +852,212 @@ pub fn write_node(
     })
 }
 
+pub(crate) fn insert_interest(
+    conn: &Connection,
+    topic: &str,
+    origin: &str,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let interest_id = normalize_id(topic);
+    if interest_id.is_empty() {
+        return Err("interest topic is empty".into());
+    }
+    let created_at = crate::timeutil::timestamp_now();
+    runtime().block_on(async {
+        add_interest_node_columns(conn).await;
+        conn.execute(
+            "INSERT INTO nodes (id, node_type, body, date, origin, embedding)
+             VALUES (?1, 'interest', ?2, ?3, ?4, NULL)
+             ON CONFLICT(id) DO UPDATE SET node_type = 'interest', body = excluded.body,
+                 date = excluded.date, origin = excluded.origin, embedding = NULL",
+            params![interest_id.as_str(), topic.trim(), created_at, origin],
+        )
+        .await?;
+        Ok::<(), Box<dyn Error + Send + Sync>>(())
+    })?;
+    Ok(interest_id)
+}
+
+pub(crate) fn top_interests(limit: usize) -> Vec<Interest> {
+    let Ok(conn) = open_connection() else {
+        return Vec::new();
+    };
+    runtime()
+        .block_on(top_interests_with(&conn, limit))
+        .unwrap_or_default()
+}
+
+pub(crate) async fn top_interests_with(
+    conn: &Connection,
+    limit: usize,
+) -> Result<Vec<Interest>, Box<dyn Error + Send + Sync>> {
+    add_interest_node_columns(conn).await;
+    let mut interests = load_registered_interests(conn).await?;
+    append_attention_interests(conn, &mut interests).await?;
+    append_curiosity_interests(conn, &mut interests).await?;
+    append_actor_position_interests(conn, &mut interests).await?;
+    interests.sort_by(|left, right| {
+        right
+            .strength
+            .total_cmp(&left.strength)
+            .then_with(|| right.created_at.cmp(&left.created_at))
+    });
+    dedup_interests(&mut interests);
+    interests.truncate(limit);
+    Ok(interests)
+}
+
+async fn load_registered_interests(
+    conn: &Connection,
+) -> Result<Vec<Interest>, Box<dyn Error + Send + Sync>> {
+    let mut rows = conn
+        .query(
+            "SELECT id, body, origin, date FROM nodes WHERE node_type = 'interest' ORDER BY date DESC",
+            (),
+        )
+        .await?;
+    let mut interests = Vec::new();
+    while let Some(row) = rows.next().await? {
+        interests.push(Interest {
+            node_id: text(row.get_value(0)?),
+            topic: text(row.get_value(1)?),
+            origin: text(row.get_value(2)?),
+            created_at: text(row.get_value(3)?),
+            strength: 1.0,
+        });
+    }
+    Ok(interests)
+}
+
+async fn append_attention_interests(
+    conn: &Connection,
+    interests: &mut Vec<Interest>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let Ok(mut rows) = conn
+        .query(
+            "SELECT endpoint, MAX(ts) AS newest, COUNT(*) AS strength
+             FROM (
+                 SELECT source AS endpoint, ts FROM events
+                 WHERE event_type IN ('reinforced', 'marked') AND source != ''
+                 UNION ALL
+                 SELECT target AS endpoint, ts FROM events
+                 WHERE event_type IN ('reinforced', 'marked') AND target != ''
+             ) attention
+             JOIN nodes n ON n.id = endpoint
+             WHERE n.node_type NOT IN ('interest', 'loop', 'note')
+             GROUP BY endpoint ORDER BY COUNT(*) DESC, newest DESC LIMIT 12",
+            (),
+        )
+        .await
+    else {
+        return Ok(());
+    };
+    while let Some(row) = rows.next().await? {
+        let node_id = text(row.get_value(0)?);
+        interests.push(derived_interest(
+            &node_id,
+            &node_id,
+            text(row.get_value(1)?),
+            real(row.get_value(2)?),
+        ));
+    }
+    Ok(())
+}
+
+async fn append_curiosity_interests(
+    conn: &Connection,
+    interests: &mut Vec<Interest>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let Ok(mut rows) = conn
+        .query(
+            "SELECT e.target, COALESCE(NULLIF(target.body, ''), e.target), note.date
+             FROM nodes note JOIN edges e ON e.source = note.id
+             LEFT JOIN nodes target ON target.id = e.target
+             WHERE note.node_type = 'note' AND e.expired_at IS NULL
+             ORDER BY note.date DESC LIMIT 12",
+            (),
+        )
+        .await
+    else {
+        return Ok(());
+    };
+    while let Some(row) = rows.next().await? {
+        interests.push(derived_interest(
+            &text(row.get_value(0)?),
+            &text(row.get_value(1)?),
+            text(row.get_value(2)?),
+            1.0,
+        ));
+    }
+    Ok(())
+}
+
+async fn append_actor_position_interests(
+    conn: &Connection,
+    interests: &mut Vec<Interest>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let Ok(mut rows) = conn
+        .query(
+            "SELECT vector_extract(sum_vector), updated_at, total_weight FROM actor_positions
+             WHERE sum_vector IS NOT NULL ORDER BY updated_at DESC LIMIT 6",
+            (),
+        )
+        .await
+    else {
+        return Ok(());
+    };
+    while let Some(row) = rows.next().await? {
+        let vector_text = text(row.get_value(0)?);
+        let Ok(vector) = parse_vector32_json(&vector_text) else {
+            continue;
+        };
+        let Some(node_id) = nearest_node_to_vector(conn, &vector).await? else {
+            continue;
+        };
+        interests.push(derived_interest(
+            &node_id,
+            &node_id,
+            text(row.get_value(1)?),
+            real(row.get_value(2)?),
+        ));
+    }
+    Ok(())
+}
+
+async fn nearest_node_to_vector(
+    conn: &Connection,
+    vector: &[f64],
+) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+    let json_str = vector32_json(vector)?;
+    let mut rows = conn
+        .query(
+            "SELECT e.source FROM edges e JOIN nodes n ON n.id = e.source
+             WHERE e.expired_at IS NULL AND e.embedding IS NOT NULL
+               AND n.node_type NOT IN ('interest', 'loop', 'note')
+             ORDER BY vector_distance_cos(e.embedding, vector32(?1)) LIMIT 1",
+            params![json_str],
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(None);
+    };
+    Ok(Some(text(row.get_value(0)?)))
+}
+
+fn derived_interest(node_id: &str, topic: &str, created_at: String, strength: f64) -> Interest {
+    Interest {
+        node_id: normalize_id(node_id),
+        topic: topic.to_string(),
+        origin: "derived".to_string(),
+        created_at,
+        strength,
+    }
+}
+
+fn dedup_interests(interests: &mut Vec<Interest>) {
+    let mut seen = HashSet::new();
+    interests.retain(|interest| seen.insert(interest.node_id.clone()));
+}
+
 pub fn write_edge(
     conn: &Connection,
     edge: &Edge,
@@ -1240,6 +1477,117 @@ pub fn load_unembedded_edges() -> Vec<(String, String, String)> {
     runtime().block_on(load_unembedded_edges_async(&conn))
 }
 
+pub(crate) fn load_unembedded_interests() -> Vec<(String, String)> {
+    let Ok(conn) = open_connection() else {
+        return Vec::new();
+    };
+    runtime().block_on(async {
+        add_interest_node_columns(&conn).await;
+        let Ok(mut rows) = conn
+            .query(
+                "SELECT id, body FROM nodes WHERE node_type = 'interest' AND embedding IS NULL",
+                (),
+            )
+            .await
+        else {
+            return Vec::new();
+        };
+        let mut interests = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            let (Ok(node_id), Ok(topic)) = (row.get_value(0), row.get_value(1)) else {
+                continue;
+            };
+            interests.push((text(node_id), text(topic)));
+        }
+        interests
+    })
+}
+
+pub(crate) fn save_interest_embedding(
+    node_id: &str,
+    vector: &[f64],
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let json_str = vector32_json(vector)?;
+    let conn = open_connection()?;
+    runtime().block_on(async {
+        add_interest_node_columns(&conn).await;
+        conn.execute(
+            "UPDATE nodes SET embedding = vector32(?1) WHERE id = ?2 AND node_type = 'interest'",
+            params![json_str, node_id],
+        )
+        .await?;
+        Ok(())
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn interest_density(
+    vector: &[f64],
+    max_distance: f64,
+) -> Result<usize, Box<dyn Error + Send + Sync>> {
+    let conn = open_connection()?;
+    runtime().block_on(interest_density_with(&conn, vector, max_distance))
+}
+
+async fn interest_density_with(
+    conn: &Connection,
+    vector: &[f64],
+    max_distance: f64,
+) -> Result<usize, Box<dyn Error + Send + Sync>> {
+    let json_str = vector32_json(vector)?;
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*) FROM edges WHERE expired_at IS NULL AND embedding IS NOT NULL
+             AND vector_distance_cos(embedding, vector32(?1)) <= ?2",
+            params![json_str, max_distance],
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(0);
+    };
+    Ok(int(row.get_value(0)?) as usize)
+}
+
+pub(crate) fn densification_targets(limit: usize) -> Vec<InterestTarget> {
+    let Ok(conn) = open_connection() else {
+        return Vec::new();
+    };
+    runtime()
+        .block_on(densification_targets_with(&conn, limit))
+        .unwrap_or_default()
+}
+
+async fn densification_targets_with(
+    conn: &Connection,
+    limit: usize,
+) -> Result<Vec<InterestTarget>, Box<dyn Error + Send + Sync>> {
+    add_interest_node_columns(conn).await;
+    let mut rows = conn
+        .query(
+            "SELECT body, vector_extract(embedding) FROM nodes
+             WHERE node_type = 'interest' AND embedding IS NOT NULL",
+            (),
+        )
+        .await?;
+    let mut targets = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let topic = text(row.get_value(0)?);
+        let vector_text = text(row.get_value(1)?);
+        let Ok(embedding) = parse_vector32_json(&vector_text) else {
+            continue;
+        };
+        let density = interest_density_with(conn, &embedding, INTEREST_NEIGHBOUR_DISTANCE).await?;
+        targets.push(InterestTarget {
+            topic,
+            density,
+            embedding,
+        });
+    }
+    targets.sort_by_key(|target| target.density);
+    targets.truncate(limit);
+    Ok(targets)
+}
+
 async fn load_unembedded_edges_async(conn: &Connection) -> Vec<(String, String, String)> {
     let Ok(mut rows) = conn
         .query(
@@ -1342,7 +1690,7 @@ async fn query_edges_ann(
 ) -> Result<Vec<SemanticEdgeRow>, Box<dyn Error + Send + Sync>> {
     execute_semantic_query(
         conn,
-        "SELECT e.source, e.target, e.content, e.stability, e.confidence, e.importance, e.subject, e.date, e.occurred_at, e.expired_at, e.memory_type, e.origin_session, vector_extract(e.embedding) FROM vector_top_k('edges_vec', vector32(?1), ?2) AS vt JOIN edges AS e ON e.rowid = vt.id LEFT JOIN nodes AS n ON n.id = e.source WHERE e.expired_at IS NULL AND (n.node_type IS NULL OR n.node_type != 'loop')",
+        "SELECT e.source, e.target, e.content, e.stability, e.confidence, e.importance, e.subject, e.date, e.occurred_at, e.expired_at, e.memory_type, e.origin_session, vector_extract(e.embedding) FROM vector_top_k('edges_vec', vector32(?1), ?2) AS vt JOIN edges AS e ON e.rowid = vt.id LEFT JOIN nodes AS source_node ON source_node.id = e.source LEFT JOIN nodes AS target_node ON target_node.id = e.target WHERE e.expired_at IS NULL AND COALESCE(source_node.node_type, '') NOT IN ('loop', 'interest') AND COALESCE(target_node.node_type, '') NOT IN ('loop', 'interest')",
         json_str,
         limit,
     )
@@ -1356,7 +1704,7 @@ async fn query_edges_scan(
 ) -> Result<Vec<SemanticEdgeRow>, Box<dyn Error + Send + Sync>> {
     execute_semantic_query(
         conn,
-        "SELECT e.source, e.target, e.content, e.stability, e.confidence, e.importance, e.subject, e.date, e.occurred_at, e.expired_at, e.memory_type, e.origin_session, vector_extract(e.embedding) FROM edges e LEFT JOIN nodes n ON n.id = e.source WHERE e.embedding IS NOT NULL AND e.expired_at IS NULL AND (n.node_type IS NULL OR n.node_type != 'loop') ORDER BY vector_distance_cos(e.embedding, vector32(?1)) LIMIT ?2",
+        "SELECT e.source, e.target, e.content, e.stability, e.confidence, e.importance, e.subject, e.date, e.occurred_at, e.expired_at, e.memory_type, e.origin_session, vector_extract(e.embedding) FROM edges e LEFT JOIN nodes source_node ON source_node.id = e.source LEFT JOIN nodes target_node ON target_node.id = e.target WHERE e.embedding IS NOT NULL AND e.expired_at IS NULL AND COALESCE(source_node.node_type, '') NOT IN ('loop', 'interest') AND COALESCE(target_node.node_type, '') NOT IN ('loop', 'interest') ORDER BY vector_distance_cos(e.embedding, vector32(?1)) LIMIT ?2",
         json_str,
         limit,
     )
@@ -1410,7 +1758,7 @@ pub fn load_all_edges_semantic() -> Vec<SemanticEdgeRow> {
 async fn load_all_edges_semantic_async(conn: &Connection) -> Vec<SemanticEdgeRow> {
     let Ok(mut rows) = conn
         .query(
-            "SELECT e.source, e.target, e.content, e.stability, e.confidence, e.importance, e.subject, e.date, e.occurred_at, e.expired_at, e.memory_type, e.origin_session, CASE WHEN e.embedding IS NULL THEN NULL ELSE vector_extract(e.embedding) END FROM edges e LEFT JOIN nodes n ON n.id = e.source WHERE e.expired_at IS NULL AND (n.node_type IS NULL OR n.node_type != 'loop')",
+            "SELECT e.source, e.target, e.content, e.stability, e.confidence, e.importance, e.subject, e.date, e.occurred_at, e.expired_at, e.memory_type, e.origin_session, CASE WHEN e.embedding IS NULL THEN NULL ELSE vector_extract(e.embedding) END FROM edges e LEFT JOIN nodes source_node ON source_node.id = e.source LEFT JOIN nodes target_node ON target_node.id = e.target WHERE e.expired_at IS NULL AND COALESCE(source_node.node_type, '') NOT IN ('loop', 'interest') AND COALESCE(target_node.node_type, '') NOT IN ('loop', 'interest')",
             (),
         )
         .await
@@ -2526,16 +2874,67 @@ pub(crate) fn int(val: Value) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        block_on, count_new_embedding_neighbours_async, load_all_edges_semantic_async,
-        load_due_loops, load_game_edges, load_loops_for_anchors,
+        block_on, count_new_embedding_neighbours_async, insert_interest, interest_density_with,
+        load_all_edges_semantic_async, load_due_loops, load_game_edges, load_loops_for_anchors,
         load_recent_attention_counts_async, load_session_game, load_task_chain,
-        load_unembedded_edges_async, with_write_lock,
+        load_unembedded_edges_async, top_interests_with, with_write_lock,
     };
     use turso::{Builder, Connection, params};
 
     const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', embedding BLOB, PRIMARY KEY (source, target))";
     const EVENTS_DDL: &str = "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')";
     const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
+
+    #[test]
+    fn top_interests_unifies_registered_and_derived_regions_and_caps() {
+        let conn = block_on(harness());
+        block_on(async {
+            let _ = conn.execute(NODES_DDL, ()).await;
+            let _ = conn.execute(EVENTS_DDL, ()).await;
+            let _ = conn
+                .execute(
+                    "INSERT INTO nodes (id, node_type) VALUES ('rust', 'entity')",
+                    (),
+                )
+                .await;
+            let _ = conn
+                .execute(
+                    "INSERT INTO events (ts, actor_type, actor_id, event_type, source) VALUES
+                ('2026-07-14T01:00:00Z', 'agent', 'local', 'marked', 'rust'),
+                ('2026-07-14T02:00:00Z', 'agent', 'local', 'reinforced', 'rust')",
+                    (),
+                )
+                .await;
+        });
+        assert!(insert_interest(&conn, "libsql internals", "user").is_ok());
+        let interests = block_on(top_interests_with(&conn, 10)).unwrap_or_default();
+        let mut found_registered = false;
+        let mut found_derived = false;
+        for item in interests {
+            if item.topic == "libsql internals" {
+                found_registered = true;
+            }
+            if item.topic == "rust" {
+                found_derived = true;
+            }
+        }
+        assert!(found_registered);
+        assert!(found_derived);
+        let capped = block_on(top_interests_with(&conn, 1)).unwrap_or_default();
+        assert_eq!(capped.len(), 1);
+        assert_eq!(capped[0].topic, "rust");
+    }
+
+    #[test]
+    fn interest_density_counts_live_embedding_neighbours() {
+        let conn = block_on(harness());
+        block_on(async {
+            let _ = conn.execute(NODES_DDL, ()).await;
+            let _ = conn.execute("INSERT INTO edges (source, target, embedding) VALUES ('a', 'b', vector32('[1.0,0.0]')), ('c', 'd', vector32('[0.0,1.0]'))", ()).await;
+        });
+        let density = block_on(interest_density_with(&conn, &[1.0, 0.0], 0.1)).unwrap_or(0);
+        assert_eq!(density, 1);
+    }
 
     #[test]
     fn sync_operation_waits_for_write_pass() {
@@ -2879,17 +3278,21 @@ mod tests {
             "topic",
             ("ask about the service", "", "2026-07-10", None),
         ));
+        assert!(insert_interest(&conn, "libsql internals", "user").is_ok());
         block_on(async {
             let _ = conn
                 .execute(
-                    "INSERT INTO edges (source, target, content) VALUES ('ordinary', 'topic', 'ordinary belief')",
+                    "INSERT INTO edges (source, target, content) VALUES
+                     ('ordinary', 'topic', 'ordinary belief'),
+                     ('libsql-internals', 'topic', 'standing interest edge')",
                     (),
                 )
                 .await;
         });
-        // Loop edges ARE embedded (the similarity trigger needs them)…
+        // Standing-node edges ARE embedded for their dedicated similarity
+        // paths…
         let pending = block_on(load_unembedded_edges_async(&conn));
-        assert_eq!(pending.len(), 2);
+        assert_eq!(pending.len(), 3);
         // …but stay excluded from ranked retrieval.
         let semantic = block_on(load_all_edges_semantic_async(&conn));
         assert_eq!(semantic.len(), 1);

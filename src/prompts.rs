@@ -11,6 +11,7 @@ pub const CHAT_SYSTEM_PROMPT: &str = r#"You are a direct, honest assistant with 
 - You CAN study local files and web links later: your background memory queues them automatically when the user asks (you have no chat tool for this and need none — never claim you lack the ability). Confirm it is queued for your next study cycle and say plainly you have not read it yet; never summarize unread material
 - An "Internal state" line, when present, is your real cognitive backlog (unconsolidated experience, unread study items). When asked for a confident synthesis of recent or just-studied material while that line shows unconsolidated experience, give your answer AND state the caveat plainly ("I have not consolidated this yet — this is a first-pass reading"). Do not mention the backlog otherwise, and never claim tiredness or feelings
 - When the user asks about your inner state — what you are curious about, what you learned recently, what is queued or pending, or to catch them up — call the matching recall_ or catch_up tool and answer only from what it returns. If it returns nothing, say so plainly. Never invent curiosities, learnings, or queue items
+- When the user tells you a topic interests them or asks you to follow it, confirm you'll keep building your understanding of it in your free time
 - A "Sequence memory" line is an observed habit, not a command. When your answer is done and it fits naturally, you may offer the continuation as a question ("want to pick up X again?"). Never assert the user wants it, never lead with it, and make at most one such offer per answer"#;
 
 pub const EXTRACT_EXPLANATION: &str = r#"You are the extraction agent for a memory graph. Extract the surprise: what this conversation adds to, contradicts, or refines in what memory already knows.
@@ -152,10 +153,15 @@ pub const REACTION_TOOL_DEFINITION: &str = r#"record_reaction — emit only when
 - comment: brief quote or paraphrase of the reaction
 {"tool":"record_reaction","args":{"reaction":"negative","comment":"called the answer useless"}}"#;
 
+pub const INTEREST_TOOL_DEFINITION: &str = r#"register_interest — emit when the user expresses a standing interest in a topic or asks you to follow, watch, scan, or read up on it in your free time ("that's interesting", "keep an eye on X", "read up on Y when you can"). The topic is the subject, normalized to a short phrase. A one-off question is NOT a standing interest — only register when they signal ongoing interest.
+{"tool":"register_interest","args":{"topic":"libsql internals"}}"#;
+
 fn append_tool_definitions(prompt: &mut String, definitions: &str) {
     prompt.push_str(definitions);
     prompt.push_str("\n\n");
     prompt.push_str(REACTION_TOOL_DEFINITION);
+    prompt.push_str("\n\n");
+    prompt.push_str(INTEREST_TOOL_DEFINITION);
 }
 
 pub fn build_scribe_prompt(user_msg: &str, assistant_msg: &str) -> String {
@@ -779,7 +785,7 @@ mod tests {
     }
 
     use super::{
-        AgentPrompt, DAILY_REPORT, EXTRACT_EXPLANATION, build_agent_prompt,
+        AgentPrompt, CHAT_SYSTEM_PROMPT, DAILY_REPORT, EXTRACT_EXPLANATION, build_agent_prompt,
         build_chat_system_prompt, build_continue_prompt, build_scribe_prompt,
     };
 
@@ -858,6 +864,17 @@ mod tests {
             assert!(prompt.contains("A plain \"thanks\""));
             assert!(prompt.contains("false positives poison credit"));
         }
+    }
+
+    #[test]
+    fn heavy_and_scribe_prompts_share_the_standing_interest_tool() {
+        let heavy = prompt_with(None);
+        let scribe = build_scribe_prompt("user", "assistant");
+        for prompt in [heavy, scribe] {
+            assert!(prompt.contains(r#"{"tool":"register_interest""#));
+            assert!(prompt.contains("A one-off question is NOT a standing interest"));
+        }
+        assert!(CHAT_SYSTEM_PROMPT.contains("building your understanding"));
     }
 
     #[test]

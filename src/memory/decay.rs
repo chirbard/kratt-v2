@@ -15,13 +15,24 @@ pub fn apply_decay_if_needed(graph: &mut Graph) -> bool {
 fn decay_graph(graph: &mut Graph, today: &str) {
     let nodes = &graph.nodes;
     for edge in &mut graph.edges {
-        if edge.expired_at.is_none()
-            && matches!(nodes.get(&edge.source), Some(node) if node.node_type == "loop")
-        {
+        if edge.expired_at.is_none() && edge_touches_standing_node(nodes, edge) {
             continue;
         }
         decay_edge(edge, today);
     }
+}
+
+fn edge_touches_standing_node(
+    nodes: &std::collections::HashMap<String, super::graph::Node>,
+    edge: &Edge,
+) -> bool {
+    for node_id in [&edge.source, &edge.target] {
+        if matches!(nodes.get(node_id), Some(node) if matches!(node.node_type.as_str(), "loop" | "interest"))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 // Episodic edges are memory of lived experience, not durable belief — they

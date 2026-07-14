@@ -266,7 +266,7 @@ async fn find_orphan_nodes(
 ) -> Result<(usize, Vec<String>), Box<dyn Error + Send + Sync>> {
     let mut rows = conn
         .query(
-            "SELECT id FROM nodes WHERE node_type != 'note' AND id NOT IN (SELECT source FROM edges WHERE expired_at IS NULL UNION SELECT target FROM edges WHERE expired_at IS NULL)",
+            "SELECT id FROM nodes WHERE node_type NOT IN ('note', 'interest') AND id NOT IN (SELECT source FROM edges WHERE expired_at IS NULL UNION SELECT target FROM edges WHERE expired_at IS NULL)",
             (),
         )
         .await?;
