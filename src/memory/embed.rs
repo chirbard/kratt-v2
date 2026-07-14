@@ -80,6 +80,7 @@ pub fn run_embed_pass(
     embed: Arc<dyn EmbeddingClient>,
     sender: &std::sync::mpsc::Sender<MemoryEvent>,
 ) {
+    let _timer = runlog::time_step("embed", "pass");
     let embedded = {
         let _write_guard = db::acquire_write_lock();
         let pending = db::load_unembedded_edges();

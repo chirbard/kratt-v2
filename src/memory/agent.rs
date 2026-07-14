@@ -207,6 +207,7 @@ fn classify_turn(
     assistant_msg: &str,
     active_task: bool,
 ) -> TurnMode {
+    let _timer = runlog::time_step("mem", "classify");
     let prompt = build_classify_prompt(user_msg, assistant_msg, active_task);
     match llm.collect(&prompt) {
         Ok(reply) => parse_turn_mode(&reply),
@@ -479,6 +480,7 @@ impl<'run> AgentRun<'run> {
         iteration: usize,
         prompt: String,
     ) -> Result<IterationOutcome, Box<dyn Error + Send + Sync>> {
+        let _timer = runlog::time_step(pass.phase, format!("iteration {iteration}"));
         self.send_log(pass.phase, format!("iteration {iteration}: calling LLM…"));
         let call_text = match stream_collect(
             Arc::clone(ctx.llm),
