@@ -424,7 +424,26 @@ async fn day_digest_async(
     night: &NightWindow,
     today: &str,
 ) -> Result<DayDigest, Box<dyn Error + Send + Sync>> {
-    let mut digest = day_slice_digest(conn, day).await?;
+    let activity = day_window(day);
+    window_digest_async(conn, &activity, night, today, day).await
+}
+
+pub(crate) async fn catch_up_digest_async(
+    conn: &Connection,
+    window: &NightWindow,
+    today: &str,
+) -> Result<DayDigest, Box<dyn Error + Send + Sync>> {
+    window_digest_async(conn, window, window, today, today).await
+}
+
+async fn window_digest_async(
+    conn: &Connection,
+    activity: &NightWindow,
+    night: &NightWindow,
+    today: &str,
+    label: &str,
+) -> Result<DayDigest, Box<dyn Error + Send + Sync>> {
+    let mut digest = window_slice_digest(conn, activity, label).await?;
     digest.dream_events = count_night_dream_events(conn, night).await?;
     digest.gists = load_night_gists(conn, night).await?;
     digest.inbox_outcomes = db::load_inbox_outcomes(conn, &night.from, &night.until).await?;
@@ -435,45 +454,53 @@ async fn day_digest_async(
     Ok(digest)
 }
 
-async fn day_slice_digest(
+fn day_window(day: &str) -> NightWindow {
+    NightWindow {
+        from: format!("{day}T"),
+        until: format!("{day}U"),
+    }
+}
+
+async fn window_slice_digest(
     conn: &Connection,
-    day: &str,
+    window: &NightWindow,
+    label: &str,
 ) -> Result<DayDigest, Box<dyn Error + Send + Sync>> {
     Ok(DayDigest {
-        day: day.to_string(),
-        turns: count_day_turns(conn, day).await?,
-        created: count_day_event_type(conn, day, "created").await?,
-        updated: count_day_event_type(conn, day, "updated").await?,
-        pruned: count_day_event_type(conn, day, "pruned").await?,
-        top_injected: load_day_top_injected(conn, day).await?,
-        new_edges: load_day_new_edges(conn, day).await?,
-        turn_groups: load_day_turn_groups(conn, day).await?,
+        day: label.to_string(),
+        turns: count_window_turns(conn, window).await?,
+        created: count_window_event_type(conn, window, "created").await?,
+        updated: count_window_event_type(conn, window, "updated").await?,
+        pruned: count_window_event_type(conn, window, "pruned").await?,
+        top_injected: load_window_top_injected(conn, window).await?,
+        new_edges: load_window_new_edges(conn, window).await?,
+        turn_groups: load_window_turn_groups(conn, window).await?,
         ..DayDigest::default()
     })
 }
 
-async fn count_day_turns(
+async fn count_window_turns(
     conn: &Connection,
-    day: &str,
+    window: &NightWindow,
 ) -> Result<usize, Box<dyn Error + Send + Sync>> {
     let mut rows = conn
         .query(
-            "SELECT COUNT(DISTINCT turn_id) FROM events WHERE substr(ts, 1, 10) = ?1 AND turn_id != '' AND session_id NOT LIKE 'dream-%'",
-            params![day],
+            "SELECT COUNT(DISTINCT turn_id) FROM events WHERE ts >= ?1 AND ts < ?2 AND turn_id != '' AND session_id NOT LIKE 'dream-%'",
+            params![window.from.as_str(), window.until.as_str()],
         )
         .await?;
     count_from(&mut rows).await
 }
 
-async fn count_day_event_type(
+async fn count_window_event_type(
     conn: &Connection,
-    day: &str,
+    window: &NightWindow,
     event_type: &str,
 ) -> Result<usize, Box<dyn Error + Send + Sync>> {
     let mut rows = conn
         .query(
-            "SELECT COUNT(*) FROM events WHERE substr(ts, 1, 10) = ?1 AND event_type = ?2",
-            params![day, event_type],
+            "SELECT COUNT(*) FROM events WHERE ts >= ?1 AND ts < ?2 AND event_type = ?3",
+            params![window.from.as_str(), window.until.as_str(), event_type],
         )
         .await?;
     count_from(&mut rows).await
@@ -522,27 +549,27 @@ async fn load_night_gists(
     Ok(gists)
 }
 
-async fn load_day_top_injected(
+async fn load_window_top_injected(
     conn: &Connection,
-    day: &str,
+    window: &NightWindow,
 ) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
     let mut rows = conn
         .query(
-            "SELECT source, target, COUNT(*) AS freq FROM events WHERE substr(ts, 1, 10) = ?1 AND event_type = 'injected' AND source != '' AND target != '' GROUP BY source, target ORDER BY freq DESC LIMIT 5",
-            params![day],
+            "SELECT source, target, COUNT(*) AS freq FROM events WHERE ts >= ?1 AND ts < ?2 AND event_type = 'injected' AND source != '' AND target != '' GROUP BY source, target ORDER BY freq DESC LIMIT 5",
+            params![window.from.as_str(), window.until.as_str()],
         )
         .await?;
     collect_edge_refs(&mut rows).await
 }
 
-async fn load_day_new_edges(
+async fn load_window_new_edges(
     conn: &Connection,
-    day: &str,
+    window: &NightWindow,
 ) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
     let mut rows = conn
         .query(
-            "SELECT source, target FROM events WHERE substr(ts, 1, 10) = ?1 AND event_type = 'created' AND source != '' AND target != '' LIMIT 5",
-            params![day],
+            "SELECT source, target FROM events WHERE ts >= ?1 AND ts < ?2 AND event_type = 'created' AND source != '' AND target != '' ORDER BY id DESC LIMIT 5",
+            params![window.from.as_str(), window.until.as_str()],
         )
         .await?;
     collect_edge_refs(&mut rows).await
@@ -550,14 +577,14 @@ async fn load_day_new_edges(
 
 // The day's most active turns (by edges created) with what each created —
 // deterministic thread material. One line per turn, oldest first.
-async fn load_day_turn_groups(
+async fn load_window_turn_groups(
     conn: &Connection,
-    day: &str,
+    window: &NightWindow,
 ) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
     let mut rows = conn
         .query(
-            "SELECT turn_id, GROUP_CONCAT(source || ' → ' || target, '; ') FROM events WHERE substr(ts, 1, 10) = ?1 AND event_type = 'created' AND turn_id != '' AND session_id NOT LIKE 'dream-%' GROUP BY turn_id ORDER BY COUNT(*) DESC LIMIT 6",
-            params![day],
+            "SELECT turn_id, GROUP_CONCAT(source || ' → ' || target, '; ') FROM events WHERE ts >= ?1 AND ts < ?2 AND event_type = 'created' AND turn_id != '' AND session_id NOT LIKE 'dream-%' GROUP BY turn_id ORDER BY COUNT(*) DESC LIMIT 6",
+            params![window.from.as_str(), window.until.as_str()],
         )
         .await?;
     let mut groups = Vec::new();

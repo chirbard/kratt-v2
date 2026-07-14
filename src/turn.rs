@@ -427,7 +427,54 @@ pub(crate) fn build_tools(has_search: bool) -> Value {
     tools.push(search_history_tool());
     tools.push(read_history_tool());
     tools.push(read_source_tool());
+    tools.push(simple_recall_tool(
+        "recall_curiosities",
+        "Recall up to five real open questions you are curious about, with their age.",
+    ));
+    tools.push(simple_recall_tool(
+        "recall_intentions",
+        "Recall up to five real open or due intentions and what each is waiting on.",
+    ));
+    tools.push(recall_recent_learning_tool());
+    tools.push(simple_recall_tool(
+        "recall_queue",
+        "Recall up to five queued and recently completed or failed inbox studies.",
+    ));
+    tools.push(simple_recall_tool(
+        "catch_up",
+        "Summarize real graph, dream, study, and due-loop activity since the previous conversation.",
+    ));
     Value::Array(tools)
+}
+
+fn simple_recall_tool(name: &str, description: &str) -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {"type": "object", "properties": {}}
+        }
+    })
+}
+
+fn recall_recent_learning_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "recall_recent_learning",
+            "description": "Recall up to five beliefs actually created or strengthened recently. Defaults to today.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "since_days": {
+                        "type": "integer", "minimum": 0, "maximum": 7,
+                        "description": "Days to look back; 0 means today and values above 7 are clamped"
+                    }
+                }
+            }
+        }
+    })
 }
 
 fn search_web_tool() -> Value {
@@ -516,6 +563,11 @@ fn execute_tool(
         "search_history" => execute_search_history(&call.args),
         "read_history" => execute_read_history(&call.args, session_path),
         "read_source" => execute_read_source(&call.args),
+        "recall_curiosities" => execute_recall_curiosities(),
+        "recall_intentions" => execute_recall_intentions(),
+        "recall_recent_learning" => execute_recall_recent_learning(&call.args),
+        "recall_queue" => execute_recall_queue(),
+        "catch_up" => execute_catch_up(session_path),
         _ => "unknown tool".to_string(),
     }
 }
@@ -578,6 +630,221 @@ fn execute_read_source(args: &str) -> String {
     result
 }
 
+const INTROSPECTION_LIMIT: usize = 5;
+
+fn execute_recall_curiosities() -> String {
+    let Ok(conn) = memory::open_connection() else {
+        return "No open curiosities right now.".to_string();
+    };
+    execute_recall_curiosities_with(&conn, &crate::timeutil::today_iso())
+}
+
+fn execute_recall_curiosities_with(conn: &turso::Connection, today: &str) -> String {
+    let notes = memory::block_on(memory::load_open_curiosity_notes_async(
+        conn,
+        INTROSPECTION_LIMIT,
+    ))
+    .unwrap_or_default();
+    if notes.is_empty() {
+        return "No open curiosities right now.".to_string();
+    }
+    let mut lines = vec!["Open curiosities:".to_string()];
+    for (_, question, target, opened) in notes {
+        lines.push(format!(
+            "- {question} ({}; about {target})",
+            curiosity_age(&opened, today)
+        ));
+    }
+    lines.join("\n")
+}
+
+fn curiosity_age(opened: &str, today: &str) -> String {
+    let opened_ts = format!("{}T00:00:00", opened.trim());
+    let today_ts = format!("{}T00:00:00", today.trim());
+    let Some(opened_secs) = crate::timeutil::timestamp_to_epoch_seconds(&opened_ts) else {
+        return "age unknown".to_string();
+    };
+    let Some(today_secs) = crate::timeutil::timestamp_to_epoch_seconds(&today_ts) else {
+        return "age unknown".to_string();
+    };
+    let days = (today_secs - opened_secs).max(0) / 86_400;
+    match days {
+        0 => "opened today".to_string(),
+        1 => "1 day old".to_string(),
+        _ => format!("{days} days old"),
+    }
+}
+
+fn execute_recall_intentions() -> String {
+    let Ok(conn) = memory::open_connection() else {
+        return "No open loops.".to_string();
+    };
+    execute_recall_intentions_with(&conn, &crate::timeutil::today_iso())
+}
+
+fn execute_recall_intentions_with(conn: &turso::Connection, today: &str) -> String {
+    let loops = memory::block_on(memory::load_open_intentions_async(
+        conn,
+        today,
+        INTROSPECTION_LIMIT,
+    ))
+    .unwrap_or_default();
+    if loops.is_empty() {
+        return "No open loops.".to_string();
+    }
+    let mut lines = vec!["Open loops:".to_string()];
+    for open_loop in loops {
+        let due = if open_loop.due.is_empty() {
+            String::new()
+        } else {
+            format!("; due {}", open_loop.due)
+        };
+        lines.push(format!(
+            "- Waiting on {}: {}{due}",
+            open_loop.target, open_loop.intention
+        ));
+    }
+    lines.join("\n")
+}
+
+fn execute_recall_recent_learning(args: &str) -> String {
+    let Ok(conn) = memory::open_connection() else {
+        return "Nothing new consolidated recently.".to_string();
+    };
+    execute_recall_recent_learning_with(&conn, parse_since_days(args))
+}
+
+fn execute_recall_recent_learning_with(conn: &turso::Connection, since_days: usize) -> String {
+    let learning = memory::block_on(memory::load_recent_learning_async(
+        conn,
+        since_days,
+        INTROSPECTION_LIMIT,
+    ))
+    .unwrap_or_default();
+    render_recent_learning(&learning)
+}
+
+fn render_recent_learning(learning: &[memory::RecentLearning]) -> String {
+    if learning.is_empty() {
+        return "Nothing new consolidated recently.".to_string();
+    }
+    let mut lines = vec!["Recent learning:".to_string()];
+    for item in learning {
+        let verb = if item.event_type == "created" {
+            "New"
+        } else {
+            "Strengthened"
+        };
+        lines.push(format!(
+            "- {verb}: {} ({} → {})",
+            item.content, item.source, item.target
+        ));
+    }
+    lines.join("\n")
+}
+
+fn parse_since_days(args: &str) -> usize {
+    let Ok(root) = serde_json::from_str::<Value>(args) else {
+        return 0;
+    };
+    let Some(value) = root.get("since_days") else {
+        return 0;
+    };
+    value.as_u64().unwrap_or(0).min(7) as usize
+}
+
+fn execute_recall_queue() -> String {
+    let Ok(conn) = memory::open_connection() else {
+        return "Inbox is empty.".to_string();
+    };
+    execute_recall_queue_with(&conn)
+}
+
+fn execute_recall_queue_with(conn: &turso::Connection) -> String {
+    let items = memory::block_on(memory::load_inbox_snapshot_async(
+        conn,
+        INTROSPECTION_LIMIT,
+    ))
+    .unwrap_or_default();
+    if items.is_empty() {
+        return "Inbox is empty.".to_string();
+    }
+    let mut lines = vec!["Inbox:".to_string()];
+    for item in items {
+        lines.push(format!("- {item}"));
+    }
+    lines.join("\n")
+}
+
+fn execute_catch_up(session_path: &Path) -> String {
+    let Ok(conn) = memory::open_connection() else {
+        return "Nothing has happened since we last talked.".to_string();
+    };
+    let since = catch_up_since(&conn, session_path);
+    let until = crate::timeutil::timestamp_now();
+    execute_catch_up_with(&conn, &since, &until, &crate::timeutil::today_iso())
+}
+
+fn catch_up_since(conn: &turso::Connection, session_path: &Path) -> String {
+    let recent = session::load_recent_entries(session_path, 1);
+    if let Some(entry) = recent.last()
+        && !entry.timestamp.trim().is_empty()
+    {
+        return entry.timestamp.clone();
+    }
+    let prior = memory::block_on(memory::latest_assistant_message_timestamp_async(conn))
+        .unwrap_or_default();
+    prior.unwrap_or_else(|| format!("{}T", crate::timeutil::today_iso()))
+}
+
+fn execute_catch_up_with(
+    conn: &turso::Connection,
+    since: &str,
+    until: &str,
+    today: &str,
+) -> String {
+    let window = memory::NightWindow {
+        from: since.to_string(),
+        until: until.to_string(),
+    };
+    let digest = memory::block_on(memory::catch_up_digest_async(conn, &window, today))
+        .unwrap_or_default();
+    render_catch_up(&digest)
+}
+
+fn render_catch_up(digest: &memory::DayDigest) -> String {
+    if digest.is_quiet() {
+        return "Nothing has happened since we last talked.".to_string();
+    }
+    let mut lines = vec![format!(
+        "Since we last talked: {} beliefs added, {} updated, {} pruned; {} dream events.",
+        digest.created, digest.updated, digest.pruned, digest.dream_events
+    )];
+    if !digest.gists.is_empty() {
+        lines.push(format!("Dream gists: {}.", join_capped(&digest.gists)));
+    }
+    if !digest.inbox_outcomes.is_empty() {
+        lines.push(format!(
+            "Inbox: {}.",
+            join_capped(&digest.inbox_outcomes)
+        ));
+    }
+    if !digest.due_loops.is_empty() {
+        lines.push(format!("Due now: {}.", join_capped(&digest.due_loops)));
+    }
+    lines.join("\n")
+}
+
+fn join_capped(items: &[String]) -> String {
+    let mut capped = Vec::new();
+    let mut index = 0usize;
+    while index < items.len() && index < INTROSPECTION_LIMIT {
+        capped.push(items[index].as_str());
+        index += 1;
+    }
+    capped.join("; ")
+}
+
 fn parse_queries(args: &str) -> Vec<String> {
     let root = match serde_json::from_str::<Value>(args) {
         Ok(root) => root,
@@ -621,8 +888,36 @@ fn parse_string_field(root: &Value, key: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MemorySections, assemble_memory_block, build_memory_events, collect_anchor_ids};
+    use super::{
+        MemorySections, assemble_memory_block, build_memory_events, build_tools,
+        collect_anchor_ids, execute_catch_up_with, execute_recall_curiosities_with,
+        execute_recall_intentions_with, execute_recall_queue_with,
+        execute_recall_recent_learning_with, execute_tool, parse_since_days,
+    };
+    use crate::api::ToolCallRequest;
     use crate::memory::{EdgeRef, GameKnowledge, OpenLoops, Routing, SemanticEdge, TaskChain};
+    use turso::{Builder, Connection};
+
+    async fn introspection_harness() -> Connection {
+        let Ok(database) = Builder::new_local(":memory:").build().await else {
+            unreachable!("in-memory database builds")
+        };
+        let Ok(conn) = database.connect() else {
+            unreachable!("in-memory database connects")
+        };
+        let statements = [
+            "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')",
+            "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', embedding BLOB, PRIMARY KEY (source, target))",
+            "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')",
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, session_type TEXT NOT NULL DEFAULT 'conversation', created_at TEXT NOT NULL DEFAULT '')",
+            "CREATE TABLE inbox (id INTEGER PRIMARY KEY AUTOINCREMENT, accepted_at TEXT NOT NULL, source TEXT NOT NULL, instruction TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'queued', resolved_at TEXT NOT NULL DEFAULT '', result TEXT NOT NULL DEFAULT '')",
+            "CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL)",
+        ];
+        for statement in statements {
+            let _ = conn.execute(statement, ()).await;
+        }
+        conn
+    }
 
     fn loops(block: &str) -> OpenLoops {
         OpenLoops {
@@ -736,5 +1031,141 @@ mod tests {
         assert_eq!(events[1].actor_id, "local");
         assert_eq!(events[1].source, "loop-reminder");
         assert_eq!(events[1].target, "home-server");
+    }
+
+    #[test]
+    fn curiosity_recall_renders_real_questions_and_honest_empty_state() {
+        let conn = crate::memory::block_on(introspection_harness());
+        assert_eq!(
+            execute_recall_curiosities_with(&conn, "2026-07-14"),
+            "No open curiosities right now."
+        );
+        crate::memory::block_on(async {
+            let _ = conn.execute("INSERT INTO nodes VALUES ('note-1', 'note', 'Why does sleep improve recall?', '2026-07-12')", ()).await;
+            let _ = conn.execute("INSERT INTO nodes VALUES ('sleep', 'entity', '', '')", ()).await;
+            let _ = conn.execute("INSERT INTO edges (source, target, content, date) VALUES ('note-1', 'sleep', 'curious about sleep', '2026-07-12')", ()).await;
+        });
+        let rendered = execute_recall_curiosities_with(&conn, "2026-07-14");
+        assert!(rendered.contains("Why does sleep improve recall?"));
+        assert!(rendered.contains("2 days old"));
+        assert!(rendered.contains("about sleep"));
+    }
+
+    #[test]
+    fn intention_recall_renders_trigger_and_due_date() {
+        let conn = crate::memory::block_on(introspection_harness());
+        assert_eq!(
+            execute_recall_intentions_with(&conn, "2026-07-14"),
+            "No open loops."
+        );
+        crate::memory::block_on(async {
+            let _ = conn.execute("INSERT INTO nodes VALUES ('loop-1', 'loop', 'ask whether the deploy worked', '2026-07-14')", ()).await;
+            let _ = conn.execute("INSERT INTO nodes VALUES ('deploy', 'entity', '', '')", ()).await;
+            let _ = conn.execute("INSERT INTO edges (source, target, content, date) VALUES ('loop-1', 'deploy', 'open loop: ask whether the deploy worked', '2026-07-13')", ()).await;
+        });
+        let rendered = execute_recall_intentions_with(&conn, "2026-07-14");
+        assert!(rendered.contains("Waiting on deploy"));
+        assert!(rendered.contains("due 2026-07-14"));
+    }
+
+    #[test]
+    fn recent_learning_respects_window_and_clamps_arguments() {
+        let conn = crate::memory::block_on(introspection_harness());
+        assert_eq!(
+            execute_recall_recent_learning_with(&conn, 0),
+            "Nothing new consolidated recently."
+        );
+        crate::memory::block_on(async {
+            let _ = conn.execute("INSERT INTO edges (source, target, content) VALUES ('new', 'belief', 'a new belief'), ('old', 'belief', 'an old belief')", ()).await;
+            let _ = conn.execute("INSERT INTO events (ts, event_type, source, target) VALUES (strftime('%Y-%m-%dT%H:%M:%S', 'now'), 'created', 'new', 'belief'), (strftime('%Y-%m-%dT%H:%M:%S', 'now', '-8 days'), 'created', 'old', 'belief')", ()).await;
+        });
+        let rendered = execute_recall_recent_learning_with(&conn, 7);
+        assert!(rendered.contains("a new belief"));
+        assert!(!rendered.contains("an old belief"));
+        assert_eq!(parse_since_days(r#"{"since_days":99}"#), 7);
+        assert_eq!(parse_since_days("{}"), 0);
+    }
+
+    #[test]
+    fn queue_recall_renders_queued_and_recent_outcomes() {
+        let conn = crate::memory::block_on(introspection_harness());
+        assert_eq!(execute_recall_queue_with(&conn), "Inbox is empty.");
+        crate::memory::block_on(async {
+            let _ = conn.execute("INSERT INTO inbox (accepted_at, source) VALUES ('2026-07-14T08:00:00', 'paper.pdf')", ()).await;
+            let _ = conn.execute("INSERT INTO inbox (accepted_at, source, status, resolved_at, result) VALUES ('2026-07-13T08:00:00', 'broken.html', 'failed', '2026-07-14T07:00:00', '404')", ()).await;
+        });
+        let rendered = execute_recall_queue_with(&conn);
+        assert!(rendered.contains("paper.pdf: queued"));
+        assert!(rendered.contains("broken.html: failed (404)"));
+    }
+
+    #[test]
+    fn catch_up_uses_windowed_digest_and_handles_a_quiet_window() {
+        let conn = crate::memory::block_on(introspection_harness());
+        assert_eq!(
+            execute_catch_up_with(
+                &conn,
+                "2026-07-14T08:00:00",
+                "2026-07-14T12:00:00",
+                "2026-07-14"
+            ),
+            "Nothing has happened since we last talked."
+        );
+        crate::memory::block_on(async {
+            let _ = conn.execute("INSERT INTO events (ts, session_id, turn_id, event_type, source, target) VALUES ('2026-07-14T09:00:00', 'tg-1', 'turn-1', 'created', 'new', 'belief'), ('2026-07-14T10:00:00', 'dream-1', '', 'updated', 'gist', 'sleep')", ()).await;
+            let _ = conn.execute("INSERT INTO events (ts, session_id, event_type, source, target, payload) VALUES ('2026-07-14T10:01:00', 'dream-1', 'updated', 'gist', 'sleep', 'gist_of: x')", ()).await;
+            let _ = conn.execute("INSERT INTO inbox (accepted_at, source, status, resolved_at, result) VALUES ('2026-07-14T08:30:00', 'paper.pdf', 'done', '2026-07-14T11:00:00', 'study-1')", ()).await;
+        });
+        let rendered = execute_catch_up_with(
+            &conn,
+            "2026-07-14T08:00:00",
+            "2026-07-14T12:00:00",
+            "2026-07-14",
+        );
+        assert!(rendered.contains("1 beliefs added"));
+        assert!(rendered.contains("2 dream events"));
+        assert!(rendered.contains("Dream gists: gist → sleep"));
+        assert!(rendered.contains("Inbox: paper.pdf: done"));
+    }
+
+    #[test]
+    fn chat_tool_registry_and_dispatch_include_introspection_tools() {
+        let tools = build_tools(false);
+        let Some(array) = tools.as_array() else {
+            unreachable!("tools are an array")
+        };
+        let mut names = Vec::new();
+        for tool in array {
+            let Some(value) = tool.pointer("/function/name") else {
+                continue;
+            };
+            if let Some(name) = value.as_str() {
+                names.push(name);
+            }
+        }
+        for expected in [
+            "recall_curiosities",
+            "recall_intentions",
+            "recall_recent_learning",
+            "recall_queue",
+            "catch_up",
+        ] {
+            assert!(names.contains(&expected));
+            let call = ToolCallRequest {
+                id: "1".to_string(),
+                name: expected.to_string(),
+                args: "{}".to_string(),
+            };
+            assert_ne!(
+                execute_tool(&call, None, std::path::Path::new("missing")),
+                "unknown tool"
+            );
+        }
+        let bogus = ToolCallRequest {
+            id: "1".to_string(),
+            name: "bogus".to_string(),
+            args: "{}".to_string(),
+        };
+        assert_eq!(execute_tool(&bogus, None, std::path::Path::new("missing")), "unknown tool");
     }
 }
