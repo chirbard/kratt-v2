@@ -245,6 +245,7 @@ fn render_digest(digest: &DayDigest) -> String {
     push_ref_line(&mut lines, "Gists consolidated", &digest.gists);
     push_ref_line(&mut lines, "Due loops", &digest.due_loops);
     push_ref_line(&mut lines, "Inbox", &digest.inbox_outcomes);
+    push_ref_line(&mut lines, "Held for you", &digest.held_findings);
     let mut index = 0usize;
     while index < digest.turn_groups.len() {
         lines.push(format!(

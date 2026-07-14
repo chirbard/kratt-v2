@@ -10,8 +10,9 @@ pub const CHAT_SYSTEM_PROMPT: &str = r#"You are a direct, honest assistant with 
 - Never output graph data, JSON, edge lists, or memory update descriptions
 - You CAN study local files and web links later: your background memory queues them automatically when the user asks (you have no chat tool for this and need none — never claim you lack the ability). Confirm it is queued for your next study cycle and say plainly you have not read it yet; never summarize unread material
 - An "Internal state" line, when present, is your real cognitive backlog (unconsolidated experience, unread study items). When asked for a confident synthesis of recent or just-studied material while that line shows unconsolidated experience, give your answer AND state the caveat plainly ("I have not consolidated this yet — this is a first-pass reading"). Do not mention the backlog otherwise, and never claim tiredness or feelings
-- When the user asks about your inner state — what you are curious about, what you learned recently, what is queued or pending, or to catch them up — call the matching recall_ or catch_up tool and answer only from what it returns. If it returns nothing, say so plainly. Never invent curiosities, learnings, or queue items
+- When the user asks about your inner state — what you are curious about, what you learned recently, what is queued or pending, your ping policy, or to catch them up — call the matching recall_ or catch_up tool and answer only from what it returns. If it returns nothing, say so plainly. Never invent curiosities, learnings, queue items, or notification state
 - When the user tells you a topic interests them or asks you to follow it, confirm you'll keep building your understanding of it in your free time
+- When the user tells you how to handle notifications — mute you for a period, hold a topic for the digest, or resume pinging — the memory pass records that policy. Confirm the requested policy plainly
 - A "Sequence memory" line is an observed habit, not a command. When your answer is done and it fits naturally, you may offer the continuation as a question ("want to pick up X again?"). Never assert the user wants it, never lead with it, and make at most one such offer per answer"#;
 
 pub const EXTRACT_EXPLANATION: &str = r#"You are the extraction agent for a memory graph. Extract the surprise: what this conversation adds to, contradicts, or refines in what memory already knows.
@@ -156,12 +157,20 @@ pub const REACTION_TOOL_DEFINITION: &str = r#"record_reaction — emit only when
 pub const INTEREST_TOOL_DEFINITION: &str = r#"register_interest — emit when the user expresses a standing interest in a topic or asks you to follow, watch, scan, or read up on it in your free time ("that's interesting", "keep an eye on X", "read up on Y when you can"). The topic is the subject, normalized to a short phrase. A one-off question is NOT a standing interest — only register when they signal ongoing interest.
 {"tool":"register_interest","args":{"topic":"libsql internals"}}"#;
 
+pub const PING_POLICY_TOOL_DEFINITION: &str = r#"set_ping_policy — emit when the user tells you how to handle notifications: mute you for a period, hold a topic for the digest, or resume pinging. Translate their phrasing into an action and an ISO cutoff using today's date; do not leave fuzzy durations in the arguments.
+- action: "mute" | "resume" | "divert"
+- topic: required for divert only
+- until: ISO timestamp required for mute and divert; omit for resume
+{"tool":"set_ping_policy","args":{"action":"divert","topic":"crypto","until":"2026-07-15T00:00:00"}}"#;
+
 fn append_tool_definitions(prompt: &mut String, definitions: &str) {
     prompt.push_str(definitions);
     prompt.push_str("\n\n");
     prompt.push_str(REACTION_TOOL_DEFINITION);
     prompt.push_str("\n\n");
     prompt.push_str(INTEREST_TOOL_DEFINITION);
+    prompt.push_str("\n\n");
+    prompt.push_str(PING_POLICY_TOOL_DEFINITION);
 }
 
 pub fn build_scribe_prompt(user_msg: &str, assistant_msg: &str) -> String {
@@ -667,8 +676,9 @@ Write a first-person report, at most 200 words, plain text (no markdown headers,
 2. One sentence on the night: what the dream consolidated, gists first if any.
 3. Report each Inbox outcome in one sentence: what you studied and the single most interesting thing it added, or that it failed and why. Never pretend a failed or queued item was studied. When a category (inbox, loops) is empty, omit it entirely — never write "no items" sentences.
 4. Mention Due loops in one sentence when present. If a past-due loop is an expected event, ask whether it happened: "X was expected by YYYY-MM-DD; did it happen?" Never treat the deadline alone as evidence of absence.
-5. Report the Autonomy line honestly when present and omit autonomy entirely when no self-directed passes ran.
-6. One honest self-assessment sentence: whether this looks like a good day of learning and WHY — so the reader can agree or correct.
+5. Mention Held for you findings briefly when present; these were deliberately kept for the digest instead of interrupting the user.
+6. Report the Autonomy line honestly when present and omit autonomy entirely when no self-directed passes ran.
+7. One honest self-assessment sentence: whether this looks like a good day of learning and WHY — so the reader can agree or correct.
 
 Ground every sentence in the digest — invent nothing beyond it, and do not flatter. If the digest is thin, say so plainly and keep it short."#;
 
@@ -829,7 +839,14 @@ mod tests {
 
     #[test]
     fn chat_prompt_carries_the_pressure_line_only_when_present() {
-        let with = build_chat_system_prompt("", &[], Some("Internal state: 30 unconsolidated experience events since the last dream (a dream is forced at 50)."), None);
+        let with = build_chat_system_prompt(
+            "",
+            &[],
+            Some(
+                "Internal state: 30 unconsolidated experience events since the last dream (a dream is forced at 50).",
+            ),
+            None,
+        );
         assert!(with.contains("Internal state: 30 unconsolidated"));
         let without = build_chat_system_prompt("", &[], None, None);
         assert!(!without.contains("Internal state:"));
@@ -878,10 +895,23 @@ mod tests {
     }
 
     #[test]
+    fn heavy_and_scribe_prompts_translate_notification_policy_to_iso() {
+        let heavy = prompt_with(None);
+        let scribe = build_scribe_prompt("be quiet this week", "okay");
+        for prompt in [heavy, scribe] {
+            assert!(prompt.contains(r#"{"tool":"set_ping_policy""#));
+            assert!(prompt.contains("Translate their phrasing"));
+            assert!(prompt.contains("ISO timestamp"));
+        }
+        assert!(CHAT_SYSTEM_PROMPT.contains("your ping policy"));
+    }
+
+    #[test]
     fn daily_report_prompt_mentions_due_loops_and_confirmed_absence() {
         assert!(DAILY_REPORT.contains("Mention Due loops in one sentence"));
         assert!(DAILY_REPORT.contains("did it happen?"));
         assert!(DAILY_REPORT.contains("Never treat the deadline alone as evidence of absence"));
         assert!(DAILY_REPORT.contains("Report the Autonomy line honestly"));
+        assert!(DAILY_REPORT.contains("Held for you"));
     }
 }

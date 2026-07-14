@@ -678,6 +678,10 @@ fn apply_dream_call<'scope, 'policy>(
             "register_interest denied: register_interest is not a dreaming tool".to_string(),
             false,
         )),
+        ToolCall::SetPingPolicy { .. } => Ok((
+            "set_ping_policy denied: set_ping_policy is not a dreaming tool".to_string(),
+            false,
+        )),
     }
 }
 

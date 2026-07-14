@@ -607,10 +607,7 @@ fn normalize_call(call: &ToolCall, confidence: f64) -> ToolCall {
             description: description.clone(),
         },
         ToolCall::RecordRule { rule } => ToolCall::RecordRule { rule: rule.clone() },
-        ToolCall::RecordOutcome { result, comment } => ToolCall::RecordOutcome {
-            result: result.clone(),
-            comment: comment.clone(),
-        },
+        ToolCall::RecordOutcome { .. } => normalize_record_outcome(call),
         ToolCall::RecordReaction { .. } => normalize_reaction(call),
         ToolCall::OpenLoop {
             intention,
@@ -632,6 +629,33 @@ fn normalize_call(call: &ToolCall, confidence: f64) -> ToolCall {
         },
         ToolCall::InboxAdd { .. } => normalize_inbox_add(call),
         ToolCall::RegisterInterest { .. } => normalize_interest(call),
+        ToolCall::SetPingPolicy { .. } => normalize_ping_policy(call),
+    }
+}
+
+fn normalize_record_outcome(call: &ToolCall) -> ToolCall {
+    let ToolCall::RecordOutcome { result, comment } = call else {
+        unreachable!("normalize_record_outcome called with non-outcome call");
+    };
+    ToolCall::RecordOutcome {
+        result: result.clone(),
+        comment: comment.clone(),
+    }
+}
+
+fn normalize_ping_policy(call: &ToolCall) -> ToolCall {
+    let ToolCall::SetPingPolicy {
+        action,
+        topic,
+        until,
+    } = call
+    else {
+        unreachable!("normalize_ping_policy called with non-policy call");
+    };
+    ToolCall::SetPingPolicy {
+        action: action.clone(),
+        topic: topic.clone(),
+        until: until.clone(),
     }
 }
 
@@ -818,7 +842,8 @@ fn apply_policy_overrides(cluster: &Cluster, calls: &[ToolCall], policy: &mut Sy
             | ToolCall::OpenLoop { .. }
             | ToolCall::CloseLoop { .. }
             | ToolCall::InboxAdd { .. }
-            | ToolCall::RegisterInterest { .. } => {}
+            | ToolCall::RegisterInterest { .. }
+            | ToolCall::SetPingPolicy { .. } => {}
         }
         idx += 1;
     }
@@ -881,7 +906,20 @@ fn tool_call_json(call: &ToolCall) -> serde_json::Value {
             json!({"tool":"inbox_add","args":{"source":source,"instruction":instruction}})
         }
         ToolCall::RegisterInterest { .. } => interest_tool_json(call),
+        ToolCall::SetPingPolicy { .. } => ping_policy_tool_json(call),
     }
+}
+
+fn ping_policy_tool_json(call: &ToolCall) -> serde_json::Value {
+    let ToolCall::SetPingPolicy {
+        action,
+        topic,
+        until,
+    } = call
+    else {
+        unreachable!("ping_policy_tool_json called with non-policy call");
+    };
+    json!({"tool":"set_ping_policy","args":{"action":action,"topic":topic,"until":until}})
 }
 
 fn interest_tool_json(call: &ToolCall) -> serde_json::Value {

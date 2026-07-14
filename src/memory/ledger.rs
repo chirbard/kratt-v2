@@ -367,6 +367,7 @@ pub struct DayDigest {
     // Live intentions whose due date has arrived; rendered for the report.
     pub due_loops: Vec<String>,
     pub inbox_outcomes: Vec<String>,
+    pub held_findings: Vec<String>,
     // gist edge refs ("source → target") — the night's crown output.
     pub gists: Vec<String>,
     // Up to 5 most-injected edges: what memory was actually used for.
@@ -431,6 +432,7 @@ impl DayDigest {
             && self.autonomy.actions == 0
             && self.due_loops.is_empty()
             && self.inbox_outcomes.is_empty()
+            && self.held_findings.is_empty()
             && self.top_injected.is_empty()
     }
 }
@@ -491,12 +493,32 @@ async fn window_digest_async(
     digest.dream_events = count_night_dream_events(conn, night).await?;
     digest.gists = load_night_gists(conn, night).await?;
     digest.inbox_outcomes = db::load_inbox_outcomes(conn, &night.from, &night.until).await?;
+    digest.held_findings = load_held_findings(conn, activity, night).await?;
     digest.autonomy = load_autonomy_summary(conn, activity, night).await?;
     let loop_items = db::load_due_loops_async(conn, today).await?;
     for loop_item in loop_items {
         digest.due_loops.push(loop_item.display());
     }
     Ok(digest)
+}
+
+async fn load_held_findings(
+    conn: &Connection,
+    activity: &NightWindow,
+    night: &NightWindow,
+) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+    let findings = db::unsurfaced_findings_in_windows(
+        conn,
+        (&activity.from, &activity.until),
+        (&night.from, &night.until),
+        5,
+    )
+    .await?;
+    let mut held = Vec::new();
+    for finding in findings {
+        held.push(format!("{} on {}", finding.title, finding.interest_topic));
+    }
+    Ok(held)
 }
 
 async fn load_autonomy_summary(
@@ -555,8 +577,8 @@ async fn count_autonomy_passes(
 // The reaction verb ("positive"/"negative") only when this outcome payload is a
 // reaction to something autonomy surfaced. A thumbs-up on an answer the user
 // asked for is not autonomy surfacing anything, so it must not count toward the
-// hit-rate. No surfacing exists until the proactive-ping slice, which stamps
-// "surfaced":true on those reactions; until then this returns None for all.
+// hit-rate. Proactive ping turns stamp "surfaced":true on their immediate
+// reactions; ordinary answer reactions remain false and do not enter this rate.
 fn surfaced_reaction_kind(payload: &str) -> Option<&'static str> {
     let Ok(value) = serde_json::from_str::<JsonValue>(payload) else {
         return None;
@@ -1564,6 +1586,7 @@ mod tests {
     }
 
     const SESSIONS_DDL: &str = "CREATE TABLE sessions (id TEXT PRIMARY KEY, session_type TEXT NOT NULL DEFAULT 'conversation', created_at TEXT NOT NULL DEFAULT '')";
+    const FINDINGS_DDL: &str = "CREATE TABLE findings (id INTEGER PRIMARY KEY, interest_topic TEXT, title TEXT, url TEXT, snippet TEXT, novelty REAL, found_at TEXT, status TEXT, surfaced_at TEXT)";
 
     const YESTERDAY: &str = "2026-07-10";
     const TODAY: &str = "2026-07-11";
@@ -1580,6 +1603,7 @@ mod tests {
         let _ = conn.execute(SESSIONS_DDL, ()).await;
         let _ = conn.execute(EDGES_DDL, ()).await;
         let _ = conn.execute(NODES_DDL, ()).await;
+        let _ = conn.execute(FINDINGS_DDL, ()).await;
         conn
     }
 
@@ -1832,7 +1856,6 @@ mod tests {
         let conn = db::block_on(digest_harness());
         db::block_on(async {
             let _ = conn.execute("INSERT INTO sessions (id, session_type, created_at) VALUES ('explore-1', 'exploration', '2026-07-10T02:00:00'), ('dream-1', 'dream', '2026-07-10T03:00:00'), ('chat-1', 'conversation', '2026-07-10T04:00:00'), ('news:2026-07-10', 'news', '2026-07-10T05:00:00')", ()).await;
-            let _ = conn.execute("CREATE TABLE findings (id INTEGER PRIMARY KEY, interest_topic TEXT, title TEXT, url TEXT, snippet TEXT, novelty REAL, found_at TEXT, status TEXT, surfaced_at TEXT)", ()).await;
             let _ = conn.execute("INSERT INTO findings (interest_topic, title, url, snippet, novelty, found_at, status, surfaced_at) VALUES ('Rust', 'Compiler news', 'https://example.com', '', 0.8, '2026-07-10T05:00:00', 'candidate', '')", ()).await;
         });
         db::block_on(insert_event(
@@ -1877,6 +1900,10 @@ mod tests {
         };
         assert!(line.contains("1 of 2 surfaced items useful"));
         assert!(line.contains("1 news finding on your interests"));
+        assert_eq!(
+            digest.held_findings,
+            vec!["Compiler news on Rust".to_string()]
+        );
     }
 
     #[test]
