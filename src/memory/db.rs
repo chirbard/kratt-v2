@@ -136,7 +136,7 @@ pub fn open_connection() -> Result<Connection, Box<dyn Error + Send + Sync>> {
 // call sites — sync must never break the app. Checkpoints afterwards to keep
 // the local WAL bounded (it grows quickly with embedding blobs).
 pub fn sync_push() -> Result<(), Box<dyn Error + Send + Sync>> {
-    match database() {
+    with_write_lock(|| match database() {
         DbHandle::Local(_) => Ok(()),
         DbHandle::Synced(database) => {
             runtime().block_on(database.push())?;
@@ -145,15 +145,15 @@ pub fn sync_push() -> Result<(), Box<dyn Error + Send + Sync>> {
             }
             Ok(())
         }
-    }
+    })
 }
 
 // Pull remote changes from Turso Cloud; returns whether anything changed.
 pub fn sync_pull() -> Result<bool, Box<dyn Error + Send + Sync>> {
-    match database() {
+    with_write_lock(|| match database() {
         DbHandle::Local(_) => Ok(false),
         DbHandle::Synced(database) => Ok(runtime().block_on(database.pull())?),
-    }
+    })
 }
 
 pub fn sync_enabled() -> bool {
@@ -326,10 +326,9 @@ async fn copy_table(
     Ok(copied)
 }
 
-// Turso aborts an open transaction when another connection commits — a
-// concurrent embed pass killed a consolidate transaction mid-flight
-// ("cannot commit - no transaction is active"). Background write passes
-// (memory agent, dream, explore, embed) serialize on this lock.
+// Turso sync and checkpoint operations mutate database-wide state and can
+// dissolve a transaction on another connection. Every write pass and every
+// sync operation must serialize on this lock.
 static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn acquire_write_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -337,6 +336,11 @@ pub fn acquire_write_lock() -> std::sync::MutexGuard<'static, ()> {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     }
+}
+
+fn with_write_lock<Output>(operation: impl FnOnce() -> Output) -> Output {
+    let _write_guard = acquire_write_lock();
+    operation()
 }
 
 async fn init_schema(
@@ -2388,13 +2392,39 @@ mod tests {
         block_on, count_new_embedding_neighbours_async, load_all_edges_semantic_async,
         load_due_loops, load_game_edges, load_loops_for_anchors,
         load_recent_attention_counts_async, load_session_game, load_task_chain,
-        load_unembedded_edges_async,
+        load_unembedded_edges_async, with_write_lock,
     };
     use turso::{Builder, Connection, params};
 
     const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', embedding BLOB, PRIMARY KEY (source, target))";
     const EVENTS_DDL: &str = "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')";
     const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
+
+    #[test]
+    fn sync_operation_waits_for_write_pass() {
+        let write_guard = super::acquire_write_lock();
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let (done_sender, done_receiver) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let _ = started_sender.send(());
+            with_write_lock(|| {
+                let _ = done_sender.send(());
+            });
+        });
+        assert!(started_receiver.recv().is_ok());
+        assert!(
+            done_receiver
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err()
+        );
+        drop(write_guard);
+        assert!(
+            done_receiver
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .is_ok()
+        );
+        assert!(handle.join().is_ok());
+    }
 
     async fn harness() -> Connection {
         let Ok(database) = Builder::new_local(":memory:").build().await else {

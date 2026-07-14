@@ -54,17 +54,17 @@ pub fn run_dream_pass(
     embed: Arc<dyn EmbeddingClient>,
     sender: std::sync::mpsc::Sender<DreamEvent>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let _write_guard = db::acquire_write_lock();
-    match execute_dream_pass(Arc::clone(&llm), Arc::clone(&embed), &sender) {
+    let result = {
+        let _write_guard = db::acquire_write_lock();
+        execute_dream_pass(Arc::clone(&llm), Arc::clone(&embed), &sender)
+    };
+    match result {
         Ok(edges_added) => {
             db::sync_push_best_effort("dream");
             let _ = sender.send(DreamEvent::Done { edges_added });
             Ok(())
         }
         Err(err) => {
-            // Not necessarily "graph unchanged": turso has been observed to
-            // dissolve a transaction mid-pass, auto-committing statements —
-            // the final COMMIT then fails but writes are already durable.
             send_log(
                 &sender,
                 "dream",
