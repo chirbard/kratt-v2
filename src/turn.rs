@@ -441,6 +441,10 @@ pub(crate) fn build_tools(has_search: bool) -> Value {
         "Recall up to five durable or self-derived topics you are interested in.",
     ));
     tools.push(simple_recall_tool(
+        "recall_ping_policy",
+        "Recall whether proactive pings are muted and which topics are held for the digest.",
+    ));
+    tools.push(simple_recall_tool(
         "recall_intentions",
         "Recall up to five real open or due intentions and what each is waiting on.",
     ));
@@ -575,6 +579,7 @@ fn execute_tool(
         "read_source" => execute_read_source(&call.args),
         "recall_curiosities" => execute_recall_curiosities(),
         "recall_interests" => execute_recall_interests(),
+        "recall_ping_policy" => execute_recall_ping_policy(),
         "recall_intentions" => execute_recall_intentions(),
         "recall_recent_learning" => execute_recall_recent_learning(&call.args),
         "recall_queue" => execute_recall_queue(),
@@ -691,6 +696,35 @@ fn render_interests(interests: Vec<memory::Interest>) -> String {
     lines.join("\n")
 }
 
+fn execute_recall_ping_policy() -> String {
+    let Ok(conn) = memory::open_connection() else {
+        return "Ping policy is unavailable.".to_string();
+    };
+    execute_recall_ping_policy_with(&conn, &crate::timeutil::timestamp_now())
+}
+
+fn execute_recall_ping_policy_with(conn: &turso::Connection, now: &str) -> String {
+    let policy = match memory::load_ping_policy(conn, now) {
+        Ok(policy) => policy,
+        Err(_) => return "Ping policy is unavailable.".to_string(),
+    };
+    render_ping_policy(&policy, now)
+}
+
+fn render_ping_policy(policy: &memory::PingPolicy, now: &str) -> String {
+    let mut lines = Vec::new();
+    if policy.muted_until.as_str() > now {
+        lines.push(format!("Pings are muted until {}.", policy.muted_until));
+    }
+    for (topic, until) in &policy.diverts {
+        lines.push(format!("{topic} is held for the digest until {until}."));
+    }
+    if lines.is_empty() {
+        return "Pinging is on; nothing is suppressed.".to_string();
+    }
+    lines.join("\n")
+}
+
 fn curiosity_age(opened: &str, today: &str) -> String {
     let opened_ts = format!("{}T00:00:00", opened.trim());
     let today_ts = format!("{}T00:00:00", today.trim());
@@ -794,11 +828,8 @@ fn execute_recall_queue() -> String {
 }
 
 fn execute_recall_queue_with(conn: &turso::Connection) -> String {
-    let items = memory::block_on(memory::load_inbox_snapshot_async(
-        conn,
-        INTROSPECTION_LIMIT,
-    ))
-    .unwrap_or_default();
+    let items = memory::block_on(memory::load_inbox_snapshot_async(conn, INTROSPECTION_LIMIT))
+        .unwrap_or_default();
     if items.is_empty() {
         return "Inbox is empty.".to_string();
     }
@@ -852,8 +883,8 @@ fn execute_catch_up_with(
         from: since.to_string(),
         until: until.to_string(),
     };
-    let digest = memory::block_on(memory::catch_up_digest_async(conn, &window, today))
-        .unwrap_or_default();
+    let digest =
+        memory::block_on(memory::catch_up_digest_async(conn, &window, today)).unwrap_or_default();
     render_catch_up(&digest)
 }
 
@@ -872,13 +903,16 @@ fn render_catch_up(digest: &memory::DayDigest) -> String {
         lines.push(format!("Dream gists: {}.", join_capped(&digest.gists)));
     }
     if !digest.inbox_outcomes.is_empty() {
-        lines.push(format!(
-            "Inbox: {}.",
-            join_capped(&digest.inbox_outcomes)
-        ));
+        lines.push(format!("Inbox: {}.", join_capped(&digest.inbox_outcomes)));
     }
     if !digest.due_loops.is_empty() {
         lines.push(format!("Due now: {}.", join_capped(&digest.due_loops)));
+    }
+    if !digest.held_findings.is_empty() {
+        lines.push(format!(
+            "Held for you: {}.",
+            join_capped(&digest.held_findings)
+        ));
     }
     lines.join("\n")
 }
@@ -937,9 +971,10 @@ fn parse_string_field(root: &Value, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MemorySections, assemble_memory_block, build_memory_events, build_tools,
-        catch_up_since, collect_anchor_ids, execute_catch_up_with, execute_recall_curiosities_with,
-        execute_recall_intentions_with, execute_recall_interests_with, execute_recall_queue_with,
+        MemorySections, assemble_memory_block, build_memory_events, build_tools, catch_up_since,
+        collect_anchor_ids, execute_catch_up_with, execute_recall_curiosities_with,
+        execute_recall_intentions_with, execute_recall_interests_with,
+        execute_recall_ping_policy_with, execute_recall_queue_with,
         execute_recall_recent_learning_with, execute_tool, parse_since_days,
     };
     use crate::api::ToolCallRequest;
@@ -959,6 +994,8 @@ mod tests {
             "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')",
             "CREATE TABLE sessions (id TEXT PRIMARY KEY, session_type TEXT NOT NULL DEFAULT 'conversation', created_at TEXT NOT NULL DEFAULT '')",
             "CREATE TABLE inbox (id INTEGER PRIMARY KEY AUTOINCREMENT, accepted_at TEXT NOT NULL, source TEXT NOT NULL, instruction TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'queued', resolved_at TEXT NOT NULL DEFAULT '', result TEXT NOT NULL DEFAULT '')",
+            "CREATE TABLE findings (id INTEGER PRIMARY KEY AUTOINCREMENT, interest_topic TEXT NOT NULL, title TEXT NOT NULL, url TEXT NOT NULL, snippet TEXT NOT NULL DEFAULT '', novelty REAL NOT NULL, found_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'candidate', surfaced_at TEXT NOT NULL DEFAULT '')",
+            "CREATE TABLE ping_policy (topic TEXT PRIMARY KEY, muted_until TEXT NOT NULL DEFAULT '', divert_until TEXT NOT NULL DEFAULT '')",
             "CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL)",
         ];
         for statement in statements {
@@ -999,6 +1036,27 @@ mod tests {
         assert_eq!(
             block,
             "## Game: chess\nthe rules\n\n\n## Current task (in order)\nply 1 (assistant): e4\n"
+        );
+    }
+
+    #[test]
+    fn recall_ping_policy_reports_default_mute_diverts_and_resumed_state() {
+        let conn = crate::memory::block_on(introspection_harness());
+        let now = "2026-07-14T12:00:00";
+        assert!(execute_recall_ping_policy_with(&conn, now).contains("9999-12-31"));
+        crate::memory::block_on(async {
+            let _ = conn.execute("INSERT INTO ping_policy (topic, muted_until, divert_until) VALUES ('', '', ''), ('Rust', '', '2026-07-15T00:00:00')", ()).await;
+        });
+        let diverted = execute_recall_ping_policy_with(&conn, now);
+        assert!(diverted.contains("Rust is held for the digest"));
+        crate::memory::block_on(async {
+            let _ = conn
+                .execute("DELETE FROM ping_policy WHERE topic = 'Rust'", ())
+                .await;
+        });
+        assert_eq!(
+            execute_recall_ping_policy_with(&conn, now),
+            "Pinging is on; nothing is suppressed."
         );
     }
 
@@ -1090,7 +1148,9 @@ mod tests {
         );
         crate::memory::block_on(async {
             let _ = conn.execute("INSERT INTO nodes VALUES ('note-1', 'note', 'Why does sleep improve recall?', '2026-07-12')", ()).await;
-            let _ = conn.execute("INSERT INTO nodes VALUES ('sleep', 'entity', '', '')", ()).await;
+            let _ = conn
+                .execute("INSERT INTO nodes VALUES ('sleep', 'entity', '', '')", ())
+                .await;
             let _ = conn.execute("INSERT INTO edges (source, target, content, date) VALUES ('note-1', 'sleep', 'curious about sleep', '2026-07-12')", ()).await;
         });
         let rendered = execute_recall_curiosities_with(&conn, "2026-07-14");
@@ -1122,7 +1182,9 @@ mod tests {
         );
         crate::memory::block_on(async {
             let _ = conn.execute("INSERT INTO nodes VALUES ('loop-1', 'loop', 'ask whether the deploy worked', '2026-07-14')", ()).await;
-            let _ = conn.execute("INSERT INTO nodes VALUES ('deploy', 'entity', '', '')", ()).await;
+            let _ = conn
+                .execute("INSERT INTO nodes VALUES ('deploy', 'entity', '', '')", ())
+                .await;
             let _ = conn.execute("INSERT INTO edges (source, target, content, date) VALUES ('loop-1', 'deploy', 'open loop: ask whether the deploy worked', '2026-07-13')", ()).await;
         });
         let rendered = execute_recall_intentions_with(&conn, "2026-07-14");
@@ -1276,6 +1338,9 @@ mod tests {
             name: "bogus".to_string(),
             args: "{}".to_string(),
         };
-        assert_eq!(execute_tool(&bogus, None, std::path::Path::new("missing")), "unknown tool");
+        assert_eq!(
+            execute_tool(&bogus, None, std::path::Path::new("missing")),
+            "unknown tool"
+        );
     }
 }

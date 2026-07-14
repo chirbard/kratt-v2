@@ -30,6 +30,7 @@ pub type SemanticEdgeRow = (
 pub type OpenCuriosityNoteRow = (String, String, String, String);
 
 pub(crate) const INTEREST_NEIGHBOUR_DISTANCE: f64 = 0.25; // replay-tunable.
+pub(crate) const DEFAULT_PING_MUTED_UNTIL: &str = "9999-12-31T23:59:59";
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Interest {
@@ -423,6 +424,16 @@ async fn create_base_tables(conn: &Connection) -> Result<(), Box<dyn Error + Sen
         (),
     )
     .await?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS ping_policy (topic TEXT PRIMARY KEY, muted_until TEXT NOT NULL DEFAULT '', divert_until TEXT NOT NULL DEFAULT '')",
+        (),
+    )
+    .await?;
+    conn.execute(
+        "INSERT OR IGNORE INTO ping_policy (topic, muted_until) VALUES ('', ?1)",
+        params![DEFAULT_PING_MUTED_UNTIL],
+    )
+    .await?;
     Ok(())
 }
 
@@ -593,7 +604,7 @@ pub struct InboxItem {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-#[allow(dead_code)] // Slice 4 drains this queue; slice 3 only writes and counts it.
+#[allow(dead_code)] // Full queue rows retain metadata beyond the ping renderer's fields.
 pub(crate) struct Finding {
     pub finding_id: i64,
     pub interest_topic: String,
@@ -604,6 +615,12 @@ pub(crate) struct Finding {
     pub found_at: String,
     pub status: String,
     pub surfaced_at: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct PingPolicy {
+    pub muted_until: String,
+    pub diverts: Vec<(String, String)>,
 }
 
 pub fn insert_inbox_item(
@@ -737,7 +754,6 @@ pub(crate) fn insert_finding(
     })
 }
 
-#[allow(dead_code)] // Public-to-memory queue reader reserved for the surfacing slice.
 pub(crate) fn unsurfaced_findings(
     conn: &Connection,
     limit: usize,
@@ -752,20 +768,147 @@ pub(crate) fn unsurfaced_findings(
             .await?;
         let mut findings = Vec::new();
         while let Some(row) = rows.next().await? {
-            findings.push(Finding {
-                finding_id: row.get::<i64>(0)?,
-                interest_topic: row.get::<String>(1)?,
-                title: row.get::<String>(2)?,
-                url: row.get::<String>(3)?,
-                snippet: row.get::<String>(4)?,
-                novelty: row.get::<f64>(5)?,
-                found_at: row.get::<String>(6)?,
-                status: row.get::<String>(7)?,
-                surfaced_at: row.get::<String>(8)?,
-            });
+            findings.push(finding_from_row(&row)?);
         }
         Ok(findings)
     })
+}
+
+pub(crate) async fn unsurfaced_findings_in_windows(
+    conn: &Connection,
+    first: (&str, &str),
+    second: (&str, &str),
+    limit: usize,
+) -> Result<Vec<Finding>, Box<dyn Error + Send + Sync>> {
+    let mut rows = conn
+        .query(
+            "SELECT id, interest_topic, title, url, snippet, novelty, found_at, status, surfaced_at
+             FROM findings WHERE status = 'candidate' AND
+             ((found_at >= ?1 AND found_at < ?2) OR (found_at >= ?3 AND found_at < ?4))
+             ORDER BY novelty DESC, found_at DESC LIMIT ?5",
+            params![first.0, first.1, second.0, second.1, limit as i64],
+        )
+        .await?;
+    let mut findings = Vec::new();
+    while let Some(row) = rows.next().await? {
+        findings.push(finding_from_row(&row)?);
+    }
+    Ok(findings)
+}
+
+fn finding_from_row(row: &turso::Row) -> Result<Finding, Box<dyn Error + Send + Sync>> {
+    Ok(Finding {
+        finding_id: row.get::<i64>(0)?,
+        interest_topic: row.get::<String>(1)?,
+        title: row.get::<String>(2)?,
+        url: row.get::<String>(3)?,
+        snippet: row.get::<String>(4)?,
+        novelty: row.get::<f64>(5)?,
+        found_at: row.get::<String>(6)?,
+        status: row.get::<String>(7)?,
+        surfaced_at: row.get::<String>(8)?,
+    })
+}
+
+pub(crate) fn set_ping_mute(
+    conn: &Connection,
+    until: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    block_on(async {
+        conn.execute(
+            "INSERT INTO ping_policy (topic, muted_until) VALUES ('', ?1)
+             ON CONFLICT(topic) DO UPDATE SET muted_until = excluded.muted_until",
+            params![until],
+        )
+        .await?;
+        Ok(())
+    })
+}
+
+pub(crate) fn resume_pings(conn: &Connection) -> Result<(), Box<dyn Error + Send + Sync>> {
+    set_ping_mute(conn, "")
+}
+
+pub(crate) fn divert_ping_topic(
+    conn: &Connection,
+    topic: &str,
+    until: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    block_on(async {
+        conn.execute(
+            "INSERT INTO ping_policy (topic, divert_until) VALUES (?1, ?2)
+             ON CONFLICT(topic) DO UPDATE SET divert_until = excluded.divert_until",
+            params![topic.trim(), until],
+        )
+        .await?;
+        Ok(())
+    })
+}
+
+pub(crate) fn load_ping_policy(
+    conn: &Connection,
+    now: &str,
+) -> Result<PingPolicy, Box<dyn Error + Send + Sync>> {
+    block_on(async {
+        let mut policy = PingPolicy {
+            muted_until: DEFAULT_PING_MUTED_UNTIL.to_string(),
+            diverts: Vec::new(),
+        };
+        let mut rows = conn
+            .query(
+                "SELECT topic, muted_until, divert_until FROM ping_policy",
+                (),
+            )
+            .await?;
+        while let Some(row) = rows.next().await? {
+            let topic = row.get::<String>(0)?;
+            if topic.is_empty() {
+                policy.muted_until = row.get::<String>(1)?;
+                continue;
+            }
+            let until = row.get::<String>(2)?;
+            if until.as_str() > now {
+                policy.diverts.push((topic, until));
+            }
+        }
+        Ok(policy)
+    })
+}
+
+pub(crate) fn mark_finding_surfaced(
+    conn: &Connection,
+    finding_id: i64,
+    session_id: &str,
+    turn_id: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let surfaced_at = timestamp_now();
+    begin_transaction(conn)?;
+    let result = block_on(async {
+        conn.execute(
+            "UPDATE findings SET status = 'surfaced', surfaced_at = ?1
+             WHERE id = ?2 AND status = 'candidate'",
+            params![surfaced_at.as_str(), finding_id],
+        )
+        .await?;
+        conn.execute(
+            "INSERT OR IGNORE INTO sessions (id, session_type, created_at) VALUES (?1, 'conversation', ?2)",
+            params![session_id, surfaced_at.as_str()],
+        )
+        .await?;
+        let payload = serde_json::json!({"finding_id": finding_id, "surfaced": true}).to_string();
+        conn.execute(
+            "INSERT INTO events (ts, session_id, turn_id, actor_type, actor_id, event_type, payload)
+             VALUES (?1, ?2, ?3, 'system', 'ping', 'surfaced', ?4)",
+            params![surfaced_at, session_id, turn_id, payload],
+        )
+        .await?;
+        Ok(())
+    });
+    if let Err(err) = result {
+        let _ = block_on(async { conn.execute("ROLLBACK", ()).await });
+        return Err(err);
+    }
+    commit_transaction(conn)
 }
 
 #[allow(dead_code)] // Single-window API is part of the findings queue contract.
@@ -3066,11 +3209,12 @@ pub(crate) fn int(val: Value) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        block_on, count_findings_in_window, count_new_embedding_neighbours_async, insert_finding,
-        insert_interest, interest_density_with, load_all_edges_semantic_async, load_due_loops,
-        load_game_edges, load_loops_for_anchors, load_recent_attention_counts_async,
-        load_session_game, load_task_chain, load_unembedded_edges_async, top_interests_with,
-        unsurfaced_findings, with_write_lock,
+        DEFAULT_PING_MUTED_UNTIL, block_on, count_findings_in_window,
+        count_new_embedding_neighbours_async, divert_ping_topic, insert_finding, insert_interest,
+        interest_density_with, load_all_edges_semantic_async, load_due_loops, load_game_edges,
+        load_loops_for_anchors, load_ping_policy, load_recent_attention_counts_async,
+        load_session_game, load_task_chain, load_unembedded_edges_async, mark_finding_surfaced,
+        resume_pings, set_ping_mute, top_interests_with, unsurfaced_findings, with_write_lock,
     };
     use crate::web::NewsItem;
     use turso::{Builder, Connection, params};
@@ -3079,12 +3223,42 @@ mod tests {
     const EVENTS_DDL: &str = "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')";
     const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
     const FINDINGS_DDL: &str = "CREATE TABLE findings (id INTEGER PRIMARY KEY AUTOINCREMENT, interest_topic TEXT NOT NULL, title TEXT NOT NULL, url TEXT NOT NULL, snippet TEXT NOT NULL DEFAULT '', novelty REAL NOT NULL, found_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'candidate', surfaced_at TEXT NOT NULL DEFAULT '')";
+    const PING_POLICY_DDL: &str = "CREATE TABLE ping_policy (topic TEXT PRIMARY KEY, muted_until TEXT NOT NULL DEFAULT '', divert_until TEXT NOT NULL DEFAULT '')";
+
+    #[test]
+    fn ping_policy_defaults_muted_and_expired_controls_rearm() {
+        let conn = block_on(harness());
+        block_on(async {
+            let _ = conn.execute(PING_POLICY_DDL, ()).await;
+        });
+        let now = "2026-07-14T12:00:00";
+        let initial = load_ping_policy(&conn, now).unwrap_or_default();
+        assert_eq!(initial.muted_until, DEFAULT_PING_MUTED_UNTIL);
+
+        assert!(resume_pings(&conn).is_ok());
+        assert_eq!(
+            load_ping_policy(&conn, now).unwrap_or_default().muted_until,
+            ""
+        );
+        assert!(set_ping_mute(&conn, "2026-07-15T00:00:00").is_ok());
+        let muted = load_ping_policy(&conn, now).unwrap_or_default();
+        assert!(muted.muted_until.as_str() > now);
+        assert!(divert_ping_topic(&conn, "Rust", "2026-07-15T00:00:00").is_ok());
+        assert!(divert_ping_topic(&conn, "Old", "2026-07-14T01:00:00").is_ok());
+        let policy = load_ping_policy(&conn, now).unwrap_or_default();
+        assert_eq!(
+            policy.diverts,
+            vec![("Rust".to_string(), "2026-07-15T00:00:00".to_string())]
+        );
+    }
 
     #[test]
     fn findings_queue_filters_status_and_counts_window() {
         let conn = block_on(harness());
         block_on(async {
             let _ = conn.execute(FINDINGS_DDL, ()).await;
+            let _ = conn.execute(EVENTS_DDL, ()).await;
+            let _ = conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, session_type TEXT NOT NULL DEFAULT 'conversation', created_at TEXT NOT NULL DEFAULT '')", ()).await;
         });
         let item = NewsItem {
             title: "A new compiler".to_string(),
@@ -3100,11 +3274,12 @@ mod tests {
         block_on(async {
             let _ = conn
                 .execute(
-                    "UPDATE findings SET found_at = '2026-07-14T02:00:00Z', status = 'surfaced' WHERE id = ?1",
+                    "UPDATE findings SET found_at = '2026-07-14T02:00:00Z' WHERE id = ?1",
                     params![finding_id],
                 )
                 .await;
         });
+        assert!(mark_finding_surfaced(&conn, finding_id, "tg-2026-07-14", "ping-1").is_ok());
         assert!(
             unsurfaced_findings(&conn, 10)
                 .unwrap_or_default()
@@ -3117,6 +3292,25 @@ mod tests {
         ))
         .unwrap_or(0);
         assert_eq!(count, 1);
+        assert_eq!(count_surfaced_events(&conn, "ping-1"), 1);
+    }
+
+    fn count_surfaced_events(conn: &Connection, turn_id: &str) -> i64 {
+        block_on(async {
+            let Ok(mut rows) = conn
+                .query(
+                    "SELECT COUNT(*) FROM events WHERE turn_id = ?1 AND event_type = 'surfaced'",
+                    params![turn_id],
+                )
+                .await
+            else {
+                return 0;
+            };
+            match rows.next().await {
+                Ok(Some(row)) => row.get::<i64>(0).unwrap_or(0),
+                _ => 0,
+            }
+        })
     }
 
     #[test]

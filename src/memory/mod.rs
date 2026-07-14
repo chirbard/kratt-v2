@@ -25,12 +25,12 @@ pub use db::{
     db_init, insert_message, last_sync_error, latest_session_id, read_message_context,
     register_session, search_messages_fts, sync_now, sync_pull_best_effort, sync_push_best_effort,
 };
-pub(crate) use db::{InboxItem, oldest_queued_inbox, open_connection, resolve_inbox_item};
+pub(crate) use db::{Finding, InboxItem, acquire_write_lock, oldest_queued_inbox, open_connection, resolve_inbox_item};
 pub(crate) use db::{
-    Interest, RecentLearning, block_on, conversation_boundary_async,
+    Interest, PingPolicy, RecentLearning, block_on, conversation_boundary_async,
     latest_assistant_message_timestamp_async, load_inbox_snapshot_async,
-    load_open_curiosity_notes_async, load_open_intentions_async, load_recent_learning_async,
-    top_interests,
+    load_open_curiosity_notes_async, load_open_intentions_async, load_ping_policy,
+    load_recent_learning_async, mark_finding_surfaced, top_interests, unsurfaced_findings,
 };
 #[cfg(test)]
 pub(crate) use db::{insert_interest, top_interests_with};

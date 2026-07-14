@@ -187,6 +187,11 @@ pub(crate) enum ToolCall {
     RegisterInterest {
         topic: String,
     },
+    SetPingPolicy {
+        action: String,
+        topic: String,
+        until: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,6 +249,9 @@ pub(crate) fn describe_tool_call(call: &ToolCall) -> String {
         ToolCall::RecordRule { rule } => format!("record_rule {rule}"),
         ToolCall::RecordOutcome { result, .. } => format!("record_outcome {result}"),
         ToolCall::RecordReaction { reaction, .. } => format!("record_reaction {reaction}"),
+        ToolCall::SetPingPolicy { action, topic, .. } => {
+            format!("set_ping_policy {action} {topic}")
+        }
         ToolCall::OpenLoop { intention, .. } => format!("open_loop {intention}"),
         ToolCall::CloseLoop {
             loop_id,
@@ -791,6 +799,7 @@ fn parse_single_tool(obj: &serde_json::Value) -> Option<ToolCall> {
         "close_loop" => parse_close_loop(args),
         "inbox_add" => parse_inbox_add(args),
         "register_interest" => parse_register_interest(args),
+        "set_ping_policy" => parse_set_ping_policy(args),
         _ => None,
     }
 }
@@ -819,6 +828,7 @@ pub(crate) fn parse_tool_call_request(call: &ToolCallRequest) -> Option<ToolCall
         "inbox_add" => parse_inbox_add(&args),
         "record_reaction" => parse_record_reaction(&args),
         "register_interest" => parse_register_interest(&args),
+        "set_ping_policy" => parse_set_ping_policy(&args),
         _ => None,
     }
 }
@@ -1066,6 +1076,26 @@ fn parse_record_reaction(args: &serde_json::Value) -> Option<ToolCall> {
     })
 }
 
+fn parse_set_ping_policy(args: &serde_json::Value) -> Option<ToolCall> {
+    let action = json_str(args, "action");
+    let topic = json_str(args, "topic");
+    let until = json_str(args, "until");
+    let valid = match action.as_str() {
+        "resume" => true,
+        "mute" => !until.is_empty(),
+        "divert" => !topic.is_empty() && !until.is_empty(),
+        _ => false,
+    };
+    if !valid {
+        return None;
+    }
+    Some(ToolCall::SetPingPolicy {
+        action,
+        topic,
+        until,
+    })
+}
+
 fn parse_open_loop(args: &serde_json::Value) -> Option<ToolCall> {
     let intention = json_str(args, "intention");
     let anchor = json_str(args, "anchor");
@@ -1277,7 +1307,28 @@ pub(crate) fn apply_tool_call<'scope>(
             apply_inbox_add_call(conn, options, &source, &instruction),
         ToolCall::RegisterInterest { topic } =>
             apply_register_interest_call(conn, options, &topic),
+        ToolCall::SetPingPolicy { action, topic, until } =>
+            apply_set_ping_policy_call(conn, options, &action, &topic, &until),
     }
+}
+
+fn apply_set_ping_policy_call<'scope>(
+    conn: &Connection,
+    options: &ApplyToolOptions<'scope>,
+    action: &str,
+    topic: &str,
+    until: &str,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    if !interest_seat_allowed(&options.actor.actor_id) {
+        return Ok("set_ping_policy denied: set_ping_policy is a scribe or heavy tool".to_string());
+    }
+    match action {
+        "mute" => db::set_ping_mute(conn, until)?,
+        "resume" => db::resume_pings(conn)?,
+        "divert" => db::divert_ping_topic(conn, topic, until)?,
+        _ => return Ok("set_ping_policy denied: unknown action".to_string()),
+    }
+    Ok(format!("set_ping_policy: {action}"))
 }
 
 fn apply_register_interest_call<'scope>(
@@ -1561,8 +1612,14 @@ fn apply_record_reaction_call<'scope>(
         return Ok("record_reaction denied: no previous turn in this session".to_string());
     };
     let score = reaction_score(reaction);
-    let payload =
-        serde_json::json!({"kind":"reaction","reaction":reaction,"comment":comment}).to_string();
+    let surfaced = turn_was_surfaced(conn, session_id, &target_turn)?;
+    let payload = serde_json::json!({
+        "kind":"reaction",
+        "reaction":reaction,
+        "comment":comment,
+        "surfaced":surfaced
+    })
+    .to_string();
     let summary = super::reinforce::record_turn_outcome_in_tx(
         conn,
         session_id,
@@ -1572,6 +1629,23 @@ fn apply_record_reaction_call<'scope>(
     )?;
     runlog::log("reaction", &summary);
     Ok(format!("record_reaction: {reaction} ({target_turn})"))
+}
+
+fn turn_was_surfaced(
+    conn: &Connection,
+    session_id: &str,
+    turn_id: &str,
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    db::block_on(async {
+        let mut rows = conn
+            .query(
+                "SELECT 1 FROM events WHERE session_id = ?1 AND turn_id = ?2
+                 AND event_type = 'surfaced' LIMIT 1",
+                turso::params![session_id, turn_id],
+            )
+            .await?;
+        Ok(rows.next().await?.is_some())
+    })
 }
 
 fn previous_turn(
@@ -1623,7 +1697,8 @@ pub(super) fn tool_call_touches_loop(
         | ToolCall::OpenLoop { .. }
         | ToolCall::CloseLoop { .. }
         | ToolCall::InboxAdd { .. }
-        | ToolCall::RegisterInterest { .. } => Ok(false),
+        | ToolCall::RegisterInterest { .. }
+        | ToolCall::SetPingPolicy { .. } => Ok(false),
     }
 }
 
@@ -2710,6 +2785,28 @@ mod tests {
             })
         }
 
+        fn outcome_payloads(conn: &turso::Connection) -> Vec<String> {
+            db::block_on(async {
+                let Ok(mut rows) = conn
+                    .query(
+                        "SELECT payload FROM events WHERE event_type = 'outcome' ORDER BY id",
+                        (),
+                    )
+                    .await
+                else {
+                    unreachable!("outcomes query")
+                };
+                let mut payloads = Vec::new();
+                while let Ok(Some(row)) = rows.next().await {
+                    let Ok(value) = row.get_value(0) else {
+                        unreachable!("payload value")
+                    };
+                    payloads.push(db::text(value));
+                }
+                payloads
+            })
+        }
+
         #[test]
         fn reaction_parse_accepts_binary_values_only() {
             for value in ["positive", "negative"] {
@@ -2743,6 +2840,36 @@ mod tests {
                 assert!(description.contains("denied"), "{phase}: {description}");
             }
             assert_eq!(outcome_turns(&conn), vec!["turn-latest"]);
+        }
+
+        #[test]
+        fn reaction_to_ping_is_stamped_surfaced_but_normal_reaction_is_not() {
+            let ping_conn = db::block_on(harness());
+            db::block_on(seed_reaction_edge(&ping_conn));
+            db::block_on(async {
+                let _ = ping_conn
+                    .execute(
+                        r#"INSERT INTO events (ts, session_id, turn_id, actor_type, actor_id, event_type, payload)
+                         VALUES ('', 'game-1', 'ping-1', 'system', 'ping', 'surfaced', '{"surfaced":true}')"#,
+                        (),
+                    )
+                    .await;
+            });
+            apply(
+                &ping_conn,
+                &options_for_phase("scribe"),
+                reaction("positive"),
+            );
+            assert!(outcome_payloads(&ping_conn)[0].contains(r#""surfaced":true"#));
+
+            let normal_conn = db::block_on(harness());
+            db::block_on(seed_reaction_edge(&normal_conn));
+            apply(
+                &normal_conn,
+                &options_for_phase("scribe"),
+                reaction("positive"),
+            );
+            assert!(outcome_payloads(&normal_conn)[0].contains(r#""surfaced":false"#));
         }
 
         #[test]
@@ -3048,6 +3175,72 @@ mod tests {
             assert!(
                 parse_tool_calls(r#"{"tool":"register_interest","args":{"topic":""}}"#).is_empty()
             );
+        }
+    }
+
+    mod ping_policy {
+        use super::super::{ApplyToolOptions, ToolCall, apply_tool_call, parse_tool_calls};
+        use crate::memory::db;
+        use crate::memory::ledger::{Actor, Event, EventContext};
+        use turso::Builder;
+
+        async fn harness() -> turso::Connection {
+            let Ok(database) = Builder::new_local(":memory:").build().await else {
+                unreachable!("in-memory database builds")
+            };
+            let Ok(conn) = database.connect() else {
+                unreachable!("in-memory database connects")
+            };
+            let _ = conn.execute("CREATE TABLE ping_policy (topic TEXT PRIMARY KEY, muted_until TEXT NOT NULL DEFAULT '', divert_until TEXT NOT NULL DEFAULT '')", ()).await;
+            conn
+        }
+
+        fn apply_policy(conn: &turso::Connection, phase: &str, call: ToolCall) -> String {
+            let options = ApplyToolOptions {
+                actor: Actor::new("system", phase),
+                context: EventContext::new("chat-1", "turn-1"),
+                source_message_id: "message-1",
+                event_payload: "",
+                confidence_cap: None,
+                default_memory_type: "semantic",
+            };
+            let mut events: Vec<Event> = Vec::new();
+            apply_tool_call(call, conn, &options, &mut events).unwrap_or_default()
+        }
+
+        fn resume() -> ToolCall {
+            ToolCall::SetPingPolicy {
+                action: "resume".to_string(),
+                topic: String::new(),
+                until: String::new(),
+            }
+        }
+
+        #[test]
+        fn policy_parser_rejects_unknown_and_incomplete_actions() {
+            assert!(matches!(
+                parse_tool_calls(r#"{"tool":"set_ping_policy","args":{"action":"resume"}}"#)
+                    .first(),
+                Some(ToolCall::SetPingPolicy { .. })
+            ));
+            for input in [
+                r#"{"tool":"set_ping_policy","args":{"action":"pause"}}"#,
+                r#"{"tool":"set_ping_policy","args":{"action":"mute"}}"#,
+                r#"{"tool":"set_ping_policy","args":{"action":"divert","until":"2026-07-15T00:00:00"}}"#,
+            ] {
+                assert!(parse_tool_calls(input).is_empty(), "{input}");
+            }
+        }
+
+        #[test]
+        fn policy_tool_is_seat_symmetric_and_denied_to_autonomous_seats() {
+            let conn = db::block_on(harness());
+            for phase in ["scribe", "extract", "consolidate"] {
+                assert!(apply_policy(&conn, phase, resume()).contains("set_ping_policy"));
+            }
+            for phase in ["consolidation", "ingest"] {
+                assert!(apply_policy(&conn, phase, resume()).contains("denied"));
+            }
         }
     }
 

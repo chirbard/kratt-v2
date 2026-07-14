@@ -1,5 +1,6 @@
 mod bot;
 mod night;
+mod ping;
 mod render;
 mod report;
 
@@ -78,6 +79,7 @@ pub fn run(
         Arc::clone(&seats.heavy),
         config.allowed_user_id,
     )?;
+    let mut ping = ping::PingCycle::new(config.allowed_user_id);
     let mut handler = LiveTurnHandler::new(chat_llm, seats, embed, search);
     let shutdown = install_shutdown_flag();
     let banner = "kratt telegram gateway ready — long polling (Ctrl-C to stop)";
@@ -88,6 +90,7 @@ pub fn run(
         transport: &transport,
         handler: &mut handler,
         report: &mut report,
+        ping: &mut ping,
         shutdown: &shutdown,
     };
     gateway.poll_loop(&mut ctx, &mut night);
@@ -148,6 +151,7 @@ struct PollCtx<'scope> {
     transport: &'scope dyn BotTransport,
     handler: &'scope mut dyn TurnHandler,
     report: &'scope mut report::ReportCycle,
+    ping: &'scope mut ping::PingCycle,
     shutdown: &'scope AtomicBool,
 }
 
@@ -168,6 +172,7 @@ impl Gateway {
             // re-evaluate next chance.
             if self.poll_once(ctx) {
                 night.maybe_run(ctx.shutdown);
+                ctx.ping.maybe_send(ctx.transport);
                 ctx.report.maybe_send(ctx.transport);
             } else {
                 night.mark_dirty();
@@ -420,7 +425,7 @@ fn session_path_for_id(session_id: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{DaySession, Gateway, PollCtx, TurnHandler, report};
+    use super::{DaySession, Gateway, PollCtx, TurnHandler, ping, report};
     use super::bot::BotTransport;
     use crate::api::{Chunk, LlmClient, TurnOutcome};
     use std::error::Error;
@@ -462,10 +467,12 @@ mod tests {
         report: &mut report::ReportCycle,
         stop: &AtomicBool,
     ) -> bool {
+        let mut ping = ping::PingCycle::new(42);
         let mut ctx = PollCtx {
             transport,
             handler,
             report,
+            ping: &mut ping,
             shutdown: stop,
         };
         gateway.poll_once(&mut ctx)
