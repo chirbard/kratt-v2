@@ -567,7 +567,7 @@ fn execute_tool(
         "recall_intentions" => execute_recall_intentions(),
         "recall_recent_learning" => execute_recall_recent_learning(&call.args),
         "recall_queue" => execute_recall_queue(),
-        "catch_up" => execute_catch_up(session_path),
+        "catch_up" => execute_catch_up(),
         _ => "unknown tool".to_string(),
     }
 }
@@ -776,21 +776,33 @@ fn execute_recall_queue_with(conn: &turso::Connection) -> String {
     lines.join("\n")
 }
 
-fn execute_catch_up(session_path: &Path) -> String {
+fn execute_catch_up() -> String {
     let Ok(conn) = memory::open_connection() else {
         return "Nothing has happened since we last talked.".to_string();
     };
-    let since = catch_up_since(&conn, session_path);
+    let since = catch_up_since(&conn);
     let until = crate::timeutil::timestamp_now();
     execute_catch_up_with(&conn, &since, &until, &crate::timeutil::today_iso())
 }
 
-fn catch_up_since(conn: &turso::Connection, session_path: &Path) -> String {
-    let recent = session::load_recent_entries(session_path, 1);
-    if let Some(entry) = recent.last()
-        && !entry.timestamp.trim().is_empty()
-    {
-        return entry.timestamp.clone();
+// An "away" gap: below this, consecutive messages are the same sitting and
+// there is nothing to catch up on; above it, the user stepped away and the
+// night/idle passes may have run.
+const CATCH_UP_GAP_SECONDS: i64 = 90 * 60; // replay-tunable.
+const CATCH_UP_SCAN_LIMIT: usize = 50;
+
+// Window start for "catch me up": the last message before the user stepped
+// away (cross-session, from the ledger — TUI writes one file per turn, so the
+// session file alone cannot see the gap). No away-gap → collapse to the last
+// message so the digest is honestly empty.
+fn catch_up_since(conn: &turso::Connection) -> String {
+    let boundary = memory::block_on(memory::conversation_boundary_async(
+        conn,
+        CATCH_UP_GAP_SECONDS,
+        CATCH_UP_SCAN_LIMIT,
+    ));
+    if let Ok(Some(since)) = boundary {
+        return since;
     }
     let prior = memory::block_on(memory::latest_assistant_message_timestamp_async(conn))
         .unwrap_or_default();
@@ -890,7 +902,7 @@ fn parse_string_field(root: &Value, key: &str) -> Option<String> {
 mod tests {
     use super::{
         MemorySections, assemble_memory_block, build_memory_events, build_tools,
-        collect_anchor_ids, execute_catch_up_with, execute_recall_curiosities_with,
+        catch_up_since, collect_anchor_ids, execute_catch_up_with, execute_recall_curiosities_with,
         execute_recall_intentions_with, execute_recall_queue_with,
         execute_recall_recent_learning_with, execute_tool, parse_since_days,
     };
@@ -1126,6 +1138,52 @@ mod tests {
         assert!(rendered.contains("2 dream events"));
         assert!(rendered.contains("Dream gists: gist → sleep"));
         assert!(rendered.contains("Inbox: paper.pdf: done"));
+    }
+
+    #[test]
+    fn catch_up_window_starts_at_the_last_message_before_an_away_gap() {
+        let conn = crate::memory::block_on(introspection_harness());
+        crate::memory::block_on(async {
+            // Prior sitting ends 08:00; a 15h gap; then the current burst.
+            for (idx, stamp) in [
+                "2026-07-13T07:59:00",
+                "2026-07-13T08:00:00",
+                "2026-07-14T09:15:00",
+                "2026-07-14T09:16:00",
+            ]
+            .iter()
+            .enumerate()
+            {
+                let _ = conn
+                    .execute(
+                        "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?1, 's', 'user', 'x', ?2)",
+                        turso::params![format!("m{idx}"), *stamp],
+                    )
+                    .await;
+            }
+        });
+        // Boundary is the last message before the gap, not the previous keystroke.
+        assert_eq!(catch_up_since(&conn), "2026-07-13T08:00:00");
+    }
+
+    #[test]
+    fn catch_up_window_collapses_when_conversation_is_continuous() {
+        let conn = crate::memory::block_on(introspection_harness());
+        crate::memory::block_on(async {
+            for (idx, stamp) in ["2026-07-14T09:15:00", "2026-07-14T09:16:00"]
+                .iter()
+                .enumerate()
+            {
+                let _ = conn
+                    .execute(
+                        "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?1, 's', 'assistant', 'x', ?2)",
+                        turso::params![format!("m{idx}"), *stamp],
+                    )
+                    .await;
+            }
+        });
+        // No away-gap → falls back to the latest message (empty window).
+        assert_eq!(catch_up_since(&conn), "2026-07-14T09:16:00");
     }
 
     #[test]

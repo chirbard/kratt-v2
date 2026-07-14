@@ -1982,6 +1982,40 @@ pub(crate) async fn load_inbox_snapshot_async(
     Ok(items)
 }
 
+// The start of the current conversation "burst": scan recent messages newest
+// first and return the timestamp on the older side of the first away-gap. That
+// is the last thing said before the user stepped away, so a catch-up window
+// from it spans whatever the background passes did overnight. None = no gap in
+// the scanned window (continuously active, or first-ever chat).
+pub(crate) async fn conversation_boundary_async(
+    conn: &Connection,
+    gap_seconds: i64,
+    scan_limit: usize,
+) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+    let mut rows = conn
+        .query(
+            "SELECT created_at FROM messages ORDER BY created_at DESC, rowid DESC LIMIT ?1",
+            params![scan_limit as i64],
+        )
+        .await?;
+    let mut stamps = Vec::new();
+    while let Some(row) = rows.next().await? {
+        stamps.push(text(row.get_value(0)?));
+    }
+    let mut index = 0usize;
+    while index + 1 < stamps.len() {
+        let newer = crate::timeutil::timestamp_to_epoch_seconds(&stamps[index]);
+        let older = crate::timeutil::timestamp_to_epoch_seconds(&stamps[index + 1]);
+        if let (Some(newer), Some(older)) = (newer, older)
+            && newer - older > gap_seconds
+        {
+            return Ok(Some(stamps[index + 1].clone()));
+        }
+        index += 1;
+    }
+    Ok(None)
+}
+
 pub(crate) async fn latest_assistant_message_timestamp_async(
     conn: &Connection,
 ) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
