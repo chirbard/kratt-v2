@@ -81,6 +81,7 @@ fn clone_search_client(app: &App) -> Option<Arc<dyn SearchClient>> {
 }
 
 fn run_stream_worker(job: StreamJob) {
+    let _turn_timer = runlog::time_step("chat", "turn total");
     let ctx = TurnContext {
         embed: &*job.embed,
         search: job.search.as_deref(),
@@ -110,7 +111,11 @@ fn stream_turns(
     let mut stats_agg = StatsAgg::new();
     let mut first_turn = true;
     loop {
-        match job.llm.stream_turn(messages, Some(tools), &job.sender) {
+        let outcome = {
+            let _stream_timer = runlog::time_step("chat", "LLM stream turn");
+            job.llm.stream_turn(messages, Some(tools), &job.sender)
+        };
+        match outcome {
             Ok(TurnOutcome::Done(stats)) => {
                 finish_stream(job, memory_build, stats, &mut stats_agg, first_turn);
                 return;

@@ -95,6 +95,7 @@ fn execute_ingestion_pass(
     request: (&Path, &str),
     sender: &Sender<IngestEvent>,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let _timer = runlog::time_step("ingest", "pass");
     let (path, focus) = request;
     validate_ingest_path(path)?;
     let _write_guard = db::acquire_write_lock();
@@ -134,6 +135,8 @@ fn execute_ingestion_pass(
     };
     for chunk_index in 0..chunks.len() {
         let chunk_number = chunk_index + 1;
+        let _chunk_timer =
+            runlog::time_step("ingest", format!("chunk {chunk_number}/{}", chunks.len()));
         let turn_id = format!("{session_id}:chunk-{chunk_number}");
         let source_message_id = db::insert_message(
             &session_id,
@@ -718,6 +721,7 @@ fn skim_chunks(
 ) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
     let mut summaries = Vec::new();
     for (index, chunk) in chunks.iter().enumerate() {
+        let _timer = runlog::time_step("ingest", format!("skim {}/{}", index + 1, chunks.len()));
         send_log(
             sender,
             "ingest",

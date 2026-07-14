@@ -107,6 +107,7 @@ pub(crate) fn run_turn_collecting(
     paths: (&Path, Option<&Path>),
     turn_id: &str,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let _turn_timer = runlog::time_step("chat", "turn total");
     let (session_path, prior_session_path) = paths;
     let ctx = TurnContext {
         embed: clients.embed,
@@ -121,7 +122,11 @@ pub(crate) fn run_turn_collecting(
     log_memory_context(&memory_build);
     let (sender, receiver) = channel::<Chunk>();
     loop {
-        match clients.llm.stream_turn(&messages, Some(&tools), &sender)? {
+        let outcome = {
+            let _stream_timer = runlog::time_step("chat", "LLM stream turn");
+            clients.llm.stream_turn(&messages, Some(&tools), &sender)?
+        };
+        match outcome {
             TurnOutcome::Done(_) => break,
             TurnOutcome::ToolCalls(calls) => {
                 execute_tool_turn(clients.search, session_path, &sender, &calls, &mut messages);
@@ -558,6 +563,7 @@ fn execute_tool(
     search: Option<&dyn SearchClient>,
     session_path: &Path,
 ) -> String {
+    let _timer = runlog::time_step("tool", call.name.clone());
     match call.name.as_str() {
         "search_web" => execute_search_web(&call.args, search),
         "search_history" => execute_search_history(&call.args),

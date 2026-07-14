@@ -148,6 +148,7 @@ pub fn sync_push() -> Result<(), Box<dyn Error + Send + Sync>> {
     with_write_lock(|| match database() {
         DbHandle::Local(_) => Ok(()),
         DbHandle::Synced(database) => {
+            let _timer = crate::runlog::time_step("sync", "push and checkpoint");
             runtime().block_on(database.push())?;
             if let Err(err) = runtime().block_on(database.checkpoint()) {
                 crate::runlog::log("sync", &format!("checkpoint failed: {err}"));
@@ -161,7 +162,10 @@ pub fn sync_push() -> Result<(), Box<dyn Error + Send + Sync>> {
 pub fn sync_pull() -> Result<bool, Box<dyn Error + Send + Sync>> {
     with_write_lock(|| match database() {
         DbHandle::Local(_) => Ok(false),
-        DbHandle::Synced(database) => Ok(runtime().block_on(database.pull())?),
+        DbHandle::Synced(database) => {
+            let _timer = crate::runlog::time_step("sync", "pull");
+            Ok(runtime().block_on(database.pull())?)
+        }
     })
 }
 

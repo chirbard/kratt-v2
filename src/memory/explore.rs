@@ -63,6 +63,7 @@ pub fn run_exploration_pass(
     search: Option<Arc<dyn SearchClient>>,
     sender: Sender<ExploreEvent>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let _timer = runlog::time_step("explore", "pass");
     match execute_exploration_pass(Arc::clone(&llm), Arc::clone(&embed), search, &sender) {
         Ok(events_recorded) => {
             db::sync_push_best_effort("explore");
@@ -284,6 +285,7 @@ fn run_agent_turn(
     tools: &Value,
     sender: &Sender<ExploreEvent>,
 ) -> Result<(usize, TurnOutcomeInfo), Box<dyn Error + Send + Sync>> {
+    let _timer = runlog::time_step("explore", format!("{agent_name} turn {}", turn_index + 1));
     send_log(
         sender,
         "explore",

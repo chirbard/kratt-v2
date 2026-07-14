@@ -54,6 +54,7 @@ pub fn run_dream_pass(
     embed: Arc<dyn EmbeddingClient>,
     sender: std::sync::mpsc::Sender<DreamEvent>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let _timer = runlog::time_step("dream", "pass");
     let result = {
         let _write_guard = db::acquire_write_lock();
         execute_dream_pass(Arc::clone(&llm), Arc::clone(&embed), &sender)
@@ -275,18 +276,24 @@ fn execute_dream_pass(
     let domain = run_domain_agents(Arc::clone(&llm), embed, &session_id, &global_toon, sender)?;
     let abstract_outputs =
         run_abstract_agents(Arc::clone(&llm), &session_id, &global_toon, &domain, sender)?;
-    let synthesis = synthesis::run_synthesis_stage(
-        Arc::clone(&llm),
-        &conn,
-        |text| send_log(sender, "synthesis", text),
-        |text| send_append(sender, "synthesis", text),
-    )?;
+    let synthesis = {
+        let _timer = runlog::time_step("synthesis", "stage");
+        synthesis::run_synthesis_stage(
+            Arc::clone(&llm),
+            &conn,
+            |text| send_log(sender, "synthesis", text),
+            |text| send_append(sender, "synthesis", text),
+        )?
+    };
     let all_ctx = consolidation_context(&domain, &abstract_outputs, &synthesis.proposal_text);
-    let consolidation = run_consolidation_agent(llm, &session_id, &global_toon, &all_ctx, sender)?;
-    let tool_calls = parse_tool_calls(&consolidation);
-    let source_id = format!("dream:{session_id}");
-    let edges_added =
-        apply_dream_tool_calls(&conn, tool_calls, &source_id, &synthesis.policy, sender)?;
+    let edges_added = {
+        let _timer = runlog::time_step("dream", "consolidation stage");
+        let consolidation =
+            run_consolidation_agent(llm, &session_id, &global_toon, &all_ctx, sender)?;
+        let tool_calls = parse_tool_calls(&consolidation);
+        let source_id = format!("dream:{session_id}");
+        apply_dream_tool_calls(&conn, tool_calls, &source_id, &synthesis.policy, sender)?
+    };
     send_log(
         sender,
         "dream",
@@ -504,6 +511,7 @@ fn run_dream_agent(
     session_id: &str,
     sender: &std::sync::mpsc::Sender<DreamEvent>,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let _timer = runlog::time_step("dream", format!("{phase} LLM"));
     send_log(sender, "dream", format!("{phase}: calling LLM…"));
     send_log(sender, phase, String::new());
     let output = match stream_collect(
