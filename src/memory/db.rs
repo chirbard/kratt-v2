@@ -418,6 +418,11 @@ async fn create_base_tables(conn: &Connection) -> Result<(), Box<dyn Error + Sen
         (),
     )
     .await?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS findings (id INTEGER PRIMARY KEY AUTOINCREMENT, interest_topic TEXT NOT NULL, title TEXT NOT NULL, url TEXT NOT NULL, snippet TEXT NOT NULL DEFAULT '', novelty REAL NOT NULL, found_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'candidate', surfaced_at TEXT NOT NULL DEFAULT '')",
+        (),
+    )
+    .await?;
     Ok(())
 }
 
@@ -587,6 +592,20 @@ pub struct InboxItem {
     pub instruction: String,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+#[allow(dead_code)] // Slice 4 drains this queue; slice 3 only writes and counts it.
+pub(crate) struct Finding {
+    pub finding_id: i64,
+    pub interest_topic: String,
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
+    pub novelty: f64,
+    pub found_at: String,
+    pub status: String,
+    pub surfaced_at: String,
+}
+
 pub fn insert_inbox_item(
     conn: &Connection,
     source: &str,
@@ -613,7 +632,9 @@ pub fn oldest_queued_inbox(
                 (),
             )
             .await?;
-        let Some(row) = rows.next().await? else { return Ok(None) };
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
         Ok(Some(InboxItem {
             item_id: row.get::<i64>(0)?,
             source: row.get::<String>(1)?,
@@ -679,11 +700,102 @@ pub fn resolve_inbox_item(
 }
 
 pub async fn count_queued_inbox(conn: &Connection) -> usize {
-    let Ok(mut rows) = conn.query("SELECT COUNT(*) FROM inbox WHERE status = 'queued'", ()).await else { return 0 };
+    let Ok(mut rows) = conn
+        .query("SELECT COUNT(*) FROM inbox WHERE status = 'queued'", ())
+        .await
+    else {
+        return 0;
+    };
     match rows.next().await {
         Ok(Some(row)) => row.get::<i64>(0).unwrap_or(0) as usize,
         _ => 0,
     }
+}
+
+pub(crate) fn insert_finding(
+    conn: &Connection,
+    interest_topic: &str,
+    item: &crate::web::NewsItem,
+    novelty: f64,
+) -> Result<i64, Box<dyn Error + Send + Sync>> {
+    let found_at = timestamp_now();
+    block_on(async {
+        conn.execute(
+            "INSERT INTO findings (interest_topic, title, url, snippet, novelty, found_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                interest_topic,
+                item.title.as_str(),
+                item.url.as_str(),
+                item.snippet.as_str(),
+                novelty,
+                found_at
+            ],
+        )
+        .await?;
+        Ok(conn.last_insert_rowid())
+    })
+}
+
+#[allow(dead_code)] // Public-to-memory queue reader reserved for the surfacing slice.
+pub(crate) fn unsurfaced_findings(
+    conn: &Connection,
+    limit: usize,
+) -> Result<Vec<Finding>, Box<dyn Error + Send + Sync>> {
+    block_on(async {
+        let mut rows = conn
+            .query(
+                "SELECT id, interest_topic, title, url, snippet, novelty, found_at, status, surfaced_at
+                 FROM findings WHERE status = 'candidate' ORDER BY novelty DESC, found_at DESC LIMIT ?1",
+                params![limit as i64],
+            )
+            .await?;
+        let mut findings = Vec::new();
+        while let Some(row) = rows.next().await? {
+            findings.push(Finding {
+                finding_id: row.get::<i64>(0)?,
+                interest_topic: row.get::<String>(1)?,
+                title: row.get::<String>(2)?,
+                url: row.get::<String>(3)?,
+                snippet: row.get::<String>(4)?,
+                novelty: row.get::<f64>(5)?,
+                found_at: row.get::<String>(6)?,
+                status: row.get::<String>(7)?,
+                surfaced_at: row.get::<String>(8)?,
+            });
+        }
+        Ok(findings)
+    })
+}
+
+#[allow(dead_code)] // Single-window API is part of the findings queue contract.
+pub(crate) async fn count_findings_in_window(
+    conn: &Connection,
+    from: &str,
+    until: &str,
+) -> Result<usize, Box<dyn Error + Send + Sync>> {
+    count_findings_in_windows(conn, from, until, from, until).await
+}
+
+pub(crate) async fn count_findings_in_windows(
+    conn: &Connection,
+    first_from: &str,
+    first_until: &str,
+    second_from: &str,
+    second_until: &str,
+) -> Result<usize, Box<dyn Error + Send + Sync>> {
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*) FROM findings
+             WHERE (found_at >= ?1 AND found_at < ?2)
+                OR (found_at >= ?3 AND found_at < ?4)",
+            params![first_from, first_until, second_from, second_until],
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(0);
+    };
+    Ok(row.get::<i64>(0)? as usize)
 }
 
 pub async fn load_inbox_outcomes(
@@ -1080,6 +1192,67 @@ pub fn write_edge(
                 source_message_id,
                 edge.memory_type.as_str(),
                 edge.origin_session.as_str(),
+            ],
+        )
+        .await?;
+        Ok(())
+    })
+}
+
+pub(crate) fn nearest_live_edge_similarity(
+    conn: &Connection,
+    vector: &[f64],
+) -> Result<Option<f64>, Box<dyn Error + Send + Sync>> {
+    let json_str = vector32_json(vector)?;
+    block_on(async {
+        let mut rows = conn
+            .query(
+                "SELECT vector_distance_cos(embedding, vector32(?1))
+                 FROM edges WHERE embedding IS NOT NULL AND expired_at IS NULL
+                 ORDER BY vector_distance_cos(embedding, vector32(?1)) LIMIT 1",
+                params![json_str],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        let distance = row.get::<f64>(0)?;
+        Ok(Some((1.0 - distance).clamp(-1.0, 1.0)))
+    })
+}
+
+pub(crate) fn record_news_graph_material(
+    conn: &Connection,
+    finding_id: i64,
+    interest: &Interest,
+    item: &crate::web::NewsItem,
+    embedding: &[f64],
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let timestamp = timestamp_now();
+    let today = crate::timeutil::today_iso();
+    let session_id = format!("news:{today}");
+    let target_id = format!("news-finding-{finding_id}");
+    let content = format!("{} — {}", item.title, item.snippet);
+    let json_str = vector32_json(embedding)?;
+    block_on(async {
+        conn.execute(
+            "INSERT OR REPLACE INTO nodes (id, node_type, body, date)
+             VALUES (?1, 'event', ?2, ?3)",
+            params![target_id.as_str(), item.title.as_str(), timestamp.as_str()],
+        )
+        .await?;
+        conn.execute(
+            "INSERT OR REPLACE INTO edges
+             (source, target, content, stability, confidence, importance, subject, date,
+              occurred_at, memory_type, origin_session, embedding)
+             VALUES (?1, ?2, ?3, 1.0, 0.7, 0.4, 0, ?4, ?4, 'episodic', ?5, vector32(?6))",
+            params![
+                interest.node_id.as_str(),
+                target_id.as_str(),
+                content.as_str(),
+                timestamp.as_str(),
+                session_id.as_str(),
+                json_str.as_str()
             ],
         )
         .await?;
@@ -1664,7 +1837,12 @@ pub fn load_loops_by_similarity(
     max_distance: f64,
     cap: usize,
 ) -> Result<Vec<OpenLoop>, Box<dyn Error + Send + Sync>> {
-    runtime().block_on(load_loops_by_similarity_async(conn, query_vec, max_distance, cap))
+    runtime().block_on(load_loops_by_similarity_async(
+        conn,
+        query_vec,
+        max_distance,
+        cap,
+    ))
 }
 
 async fn load_loops_by_similarity_async(
@@ -2191,6 +2369,20 @@ pub fn register_ingestion_session(session_id: &str, created_at: &str) {
             params![session_id, created_at],
         )
         .await;
+    });
+}
+
+pub(crate) fn register_news_session(session_id: &str, created_at: &str) {
+    let Ok(conn) = open_connection() else {
+        return;
+    };
+    runtime().block_on(async {
+        let _ = conn
+            .execute(
+                "INSERT OR IGNORE INTO sessions (id, session_type, created_at) VALUES (?1, 'news', ?2)",
+                params![session_id, created_at],
+            )
+            .await;
     });
 }
 
@@ -2874,16 +3066,58 @@ pub(crate) fn int(val: Value) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        block_on, count_new_embedding_neighbours_async, insert_interest, interest_density_with,
-        load_all_edges_semantic_async, load_due_loops, load_game_edges, load_loops_for_anchors,
-        load_recent_attention_counts_async, load_session_game, load_task_chain,
-        load_unembedded_edges_async, top_interests_with, with_write_lock,
+        block_on, count_findings_in_window, count_new_embedding_neighbours_async, insert_finding,
+        insert_interest, interest_density_with, load_all_edges_semantic_async, load_due_loops,
+        load_game_edges, load_loops_for_anchors, load_recent_attention_counts_async,
+        load_session_game, load_task_chain, load_unembedded_edges_async, top_interests_with,
+        unsurfaced_findings, with_write_lock,
     };
+    use crate::web::NewsItem;
     use turso::{Builder, Connection, params};
 
     const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', embedding BLOB, PRIMARY KEY (source, target))";
     const EVENTS_DDL: &str = "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')";
     const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
+    const FINDINGS_DDL: &str = "CREATE TABLE findings (id INTEGER PRIMARY KEY AUTOINCREMENT, interest_topic TEXT NOT NULL, title TEXT NOT NULL, url TEXT NOT NULL, snippet TEXT NOT NULL DEFAULT '', novelty REAL NOT NULL, found_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'candidate', surfaced_at TEXT NOT NULL DEFAULT '')";
+
+    #[test]
+    fn findings_queue_filters_status_and_counts_window() {
+        let conn = block_on(harness());
+        block_on(async {
+            let _ = conn.execute(FINDINGS_DDL, ()).await;
+        });
+        let item = NewsItem {
+            title: "A new compiler".to_string(),
+            url: "https://example.com/compiler".to_string(),
+            snippet: "Details".to_string(),
+        };
+        let Ok(finding_id) = insert_finding(&conn, "Rust", &item, 0.8) else {
+            unreachable!("finding inserts")
+        };
+        let candidates = unsurfaced_findings(&conn, 10).unwrap_or_default();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].finding_id, finding_id);
+        block_on(async {
+            let _ = conn
+                .execute(
+                    "UPDATE findings SET found_at = '2026-07-14T02:00:00Z', status = 'surfaced' WHERE id = ?1",
+                    params![finding_id],
+                )
+                .await;
+        });
+        assert!(
+            unsurfaced_findings(&conn, 10)
+                .unwrap_or_default()
+                .is_empty()
+        );
+        let count = block_on(count_findings_in_window(
+            &conn,
+            "2026-07-14T00:00:00Z",
+            "2026-07-15T00:00:00Z",
+        ))
+        .unwrap_or(0);
+        assert_eq!(count, 1);
+    }
 
     #[test]
     fn top_interests_unifies_registered_and_derived_regions_and_caps() {

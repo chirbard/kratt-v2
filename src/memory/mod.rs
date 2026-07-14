@@ -9,6 +9,7 @@ mod hygiene;
 mod ingest;
 mod ledger;
 mod loops;
+mod news;
 mod reinforce;
 mod routing;
 mod sequence;
@@ -37,6 +38,7 @@ pub use dream::{DreamEvent, run_dream_pass};
 pub use embed::{SemanticEdge, edges_to_toon, run_embed_pass, select_semantic_edges_routed};
 pub use explore::{ExploreEvent, run_exploration_pass};
 pub use ingest::{IngestEvent, run_focused_ingestion_pass, run_ingestion_pass};
+pub(crate) use news::run_news_scan;
 pub use ledger::{
     Actor, Attribution, DayDigest, EdgeRef, Event, EventContext, NightWindow, day_digest,
     newest_dream_session_id, recompute_positions, record_events, turn_attribution,

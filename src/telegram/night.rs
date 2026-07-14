@@ -35,7 +35,11 @@ impl DreamWindow {
     fn parse(raw: &str) -> Result<Self, String> {
         let (start_raw, end_raw) = match raw.split_once('-') {
             Some(parts) => parts,
-            None => return Err(format!("KRATT_DREAM_HOURS must be 'start-end', got '{raw}'")),
+            None => {
+                return Err(format!(
+                    "KRATT_DREAM_HOURS must be 'start-end', got '{raw}'"
+                ));
+            }
         };
         let start = parse_hour(start_raw.trim())?;
         let end = parse_hour(end_raw.trim())?;
@@ -85,6 +89,7 @@ struct NightGate {
     dirty: bool,
     dreamed_tonight: bool,
     studied_inbox_tonight: bool,
+    scanned_news_today: bool,
     last_curiosity_had_yield: Option<bool>,
 }
 
@@ -100,6 +105,7 @@ impl NightGate {
             dirty: true,
             dreamed_tonight: false,
             studied_inbox_tonight: false,
+            scanned_news_today: false,
             last_curiosity_had_yield: None,
         }
     }
@@ -114,6 +120,7 @@ impl NightGate {
             self.count = 0;
             self.dreamed_tonight = false;
             self.studied_inbox_tonight = false;
+            self.scanned_news_today = false;
             self.last_curiosity_had_yield = None;
             self.dirty = true;
         }
@@ -169,7 +176,10 @@ impl NightCycle {
     ) -> Result<Self, Box<dyn Error>> {
         let raw = std::env::var("KRATT_DREAM_HOURS").unwrap_or_else(|_| DEFAULT_DREAM_HOURS.into());
         let window = DreamWindow::parse(&raw)?;
-        runlog::log("tg", &format!("dream window {}-{}", window.start, window.end));
+        runlog::log(
+            "tg",
+            &format!("dream window {}-{}", window.start, window.end),
+        );
         let gate = NightGate::new(window, NIGHT_ACTION_COOLDOWN, MAX_NIGHT_ACTIONS);
         Ok(Self {
             gate,
@@ -229,6 +239,9 @@ impl NightCycle {
         if self.gate.studied_inbox_tonight {
             inputs.queued_inbox = 0;
         }
+        if self.gate.scanned_news_today {
+            inputs.news_scan_due = false;
+        }
         inputs.last_curiosity_had_yield = self.gate.last_curiosity_had_yield;
         let action = scheduler::decide(&inputs);
         scheduler::log_scheduler_decision(&action);
@@ -256,6 +269,7 @@ impl NightCycle {
                 let had_yield = self.run_explore();
                 self.gate.record_curiosity(now, had_yield);
             }
+            SchedulerAction::NewsScan { reason } => self.dispatch_news_scan(&reason, now),
             SchedulerAction::InboxStudy { reason } => {
                 runlog::log("tg", &format!("night action: inbox study ({reason})"));
                 self.run_inbox_study();
@@ -265,7 +279,10 @@ impl NightCycle {
             SchedulerAction::Ingest { path, reason } => {
                 runlog::log(
                     "tg",
-                    &format!("night action skipped: ingest deferred ({reason}, {})", path.display()),
+                    &format!(
+                        "night action skipped: ingest deferred ({reason}, {})",
+                        path.display()
+                    ),
                 );
                 self.gate.record_skipped(now);
             }
@@ -274,6 +291,13 @@ impl NightCycle {
                 self.gate.record_rest();
             }
         }
+    }
+
+    fn dispatch_news_scan(&mut self, reason: &str, now: Instant) {
+        runlog::log("tg", &format!("night action: news scan ({reason})"));
+        self.run_news_scan();
+        self.gate.scanned_news_today = true;
+        self.gate.record_action(now);
     }
 
     // Inline drain, same pattern as run_memory_to_completion: the pass drops
@@ -305,14 +329,32 @@ impl NightCycle {
         had_yield
     }
 
+    fn run_news_scan(&self) {
+        let summary = memory::run_news_scan(&*self.embed, self.search.as_deref());
+        runlog::log(
+            "news",
+            &format!(
+                "[autonomy] news scan — {} interests, {} novel findings",
+                summary.interests, summary.findings
+            ),
+        );
+    }
+
     fn run_inbox_study(&self) {
-        let Ok(conn) = memory::open_connection() else { return };
-        let Ok(Some(item)) = memory::oldest_queued_inbox(&conn) else { return };
+        let Ok(conn) = memory::open_connection() else {
+            return;
+        };
+        let Ok(Some(item)) = memory::oldest_queued_inbox(&conn) else {
+            return;
+        };
         let result = self.study_inbox_item(&item);
         match result {
             Ok(session) => {
                 let _ = memory::resolve_inbox_item(&conn, item.item_id, "done", &session);
-                runlog::log("inbox", &format!("studied: {} (session {session})", item.source));
+                runlog::log(
+                    "inbox",
+                    &format!("studied: {} (session {session})", item.source),
+                );
             }
             Err(reason) => {
                 let _ = memory::resolve_inbox_item(&conn, item.item_id, "failed", &reason);
@@ -323,21 +365,34 @@ impl NightCycle {
 
     fn study_inbox_item(&self, item: &memory::InboxItem) -> Result<String, String> {
         let path = if item.source.starts_with("http://") || item.source.starts_with("https://") {
-            let search = self.search.as_ref().ok_or("web extraction is unavailable")?;
+            let search = self
+                .search
+                .as_ref()
+                .ok_or("web extraction is unavailable")?;
             let text = search.extract_url(&item.source)?;
             let dir = std::path::PathBuf::from(crate::paths::data_file("inbox"));
-            if let Err(err) = std::fs::create_dir_all(&dir) { return Err(err.to_string()) }
+            if let Err(err) = std::fs::create_dir_all(&dir) {
+                return Err(err.to_string());
+            }
             let path = dir.join(format!("{}.txt", item.item_id));
-            if let Err(err) = std::fs::write(&path, text) { return Err(err.to_string()) }
+            if let Err(err) = std::fs::write(&path, text) {
+                return Err(err.to_string());
+            }
             path
         } else {
             std::path::PathBuf::from(&item.source)
         };
         let (sender, receiver) = std::sync::mpsc::channel::<IngestEvent>();
         let result = match memory::run_focused_ingestion_pass(
-            Arc::clone(&self.memory_llm), Arc::clone(&self.embed), self.search.clone(),
-            (&path, &item.instruction), sender,
-        ) { Ok(session) => Ok(session), Err(err) => Err(err.to_string()) };
+            Arc::clone(&self.memory_llm),
+            Arc::clone(&self.embed),
+            self.search.clone(),
+            (&path, &item.instruction),
+            sender,
+        ) {
+            Ok(session) => Ok(session),
+            Err(err) => Err(err.to_string()),
+        };
         for _event in receiver {}
         result
     }
@@ -478,6 +533,18 @@ mod tests {
     }
 
     #[test]
+    fn news_scan_latch_rearms_on_day_rollover() {
+        let mut gate = gate("3-6");
+        let base = Instant::now();
+        assert!(gate.should_evaluate(4, "2026-07-10", base));
+        gate.scanned_news_today = true;
+        assert!(gate.scanned_news_today);
+        let next = base + Duration::from_secs(1200);
+        assert!(gate.should_evaluate(4, "2026-07-11", next));
+        assert!(!gate.scanned_news_today);
+    }
+
+    #[test]
     fn empty_curiosity_consumes_a_slot_and_settles() {
         let mut gate = gate("3-6");
         let base = Instant::now();
@@ -497,6 +564,9 @@ mod tests {
         gate.record_skipped(base);
         assert_eq!(gate.count, 0, "cap not consumed");
         let soon = base + Duration::from_secs(60);
-        assert!(!gate.should_evaluate(4, "2026-07-10", soon), "cooldown consumed");
+        assert!(
+            !gate.should_evaluate(4, "2026-07-10", soon),
+            "cooldown consumed"
+        );
     }
 }

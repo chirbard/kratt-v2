@@ -592,7 +592,7 @@ fn run_scheduler(app: &mut App) {
     app.scheduler_idle_ticks = 0;
 
     // Gather once, decide from the same snapshot.
-    let inputs = scheduler::gather_inputs();
+    let inputs = tui_scheduler_inputs();
     let action = scheduler::decide(&inputs);
 
     // Log the decision
@@ -603,23 +603,34 @@ fn run_scheduler(app: &mut App) {
         scheduler::log_drift_info(&inputs.actor_positions);
     }
 
-    // Dispatch the action
+    dispatch_scheduler_action(app, action);
+
+    enforce_runaway_guard(app);
+
+    // Unpause scheduler - it will be paused again if another action starts
+    app.scheduler_paused = false;
+}
+
+fn dispatch_scheduler_action(app: &mut App, action: crate::memory::scheduler::SchedulerAction) {
+    use crate::memory::scheduler::SchedulerAction;
     match action {
-        scheduler::SchedulerAction::Dream { reason } => {
+        SchedulerAction::Dream { reason } => {
             crate::runlog::log("sched", &format!("dispatching dream: {}", reason));
             start_dream(app);
             app.scheduler_consecutive_actions += 1;
         }
-        scheduler::SchedulerAction::Explore { reason }
-        | scheduler::SchedulerAction::Curiosity { reason } => {
+        SchedulerAction::Explore { reason } | SchedulerAction::Curiosity { reason } => {
             crate::runlog::log("sched", &format!("dispatching exploration: {reason}"));
             start_exploration(app);
             app.scheduler_consecutive_actions += 1;
         }
-        scheduler::SchedulerAction::InboxStudy { reason } => {
+        SchedulerAction::InboxStudy { reason } => {
             crate::runlog::log("sched", &format!("inbox study is daemon-only: {reason}"));
         }
-        scheduler::SchedulerAction::Ingest { path, reason } => {
+        SchedulerAction::NewsScan { reason } => {
+            crate::runlog::log("sched", &format!("news scan is daemon-only: {reason}"));
+        }
+        SchedulerAction::Ingest { path, reason } => {
             crate::runlog::log(
                 "sched",
                 &format!("dispatching ingest: {} ({:?})", reason, path.display()),
@@ -627,18 +638,19 @@ fn run_scheduler(app: &mut App) {
             start_ingestion(app, path);
             app.scheduler_consecutive_actions += 1;
         }
-        scheduler::SchedulerAction::Rest { reason } => {
+        SchedulerAction::Rest { reason } => {
             crate::runlog::log("sched", &format!("resting: {}", reason));
             // Rest does not count toward the runaway guard: the guard bounds
             // API spend, and resting spends nothing — an idle evening of
             // Rest evaluations must not switch autonomous mode off.
         }
     }
+}
 
-    enforce_runaway_guard(app);
-
-    // Unpause scheduler - it will be paused again if another action starts
-    app.scheduler_paused = false;
+fn tui_scheduler_inputs() -> crate::memory::scheduler::SchedulerInputs {
+    let mut inputs = crate::memory::scheduler::gather_inputs();
+    inputs.news_scan_due = false;
+    inputs
 }
 
 // Runaway guard: bounds API spend by switching autonomous mode off after too
