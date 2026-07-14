@@ -363,6 +363,7 @@ pub struct DayDigest {
     pub updated: usize,
     pub pruned: usize,
     pub dream_events: usize,
+    pub autonomy: AutonomySummary,
     // Live intentions whose due date has arrived; rendered for the report.
     pub due_loops: Vec<String>,
     pub inbox_outcomes: Vec<String>,
@@ -377,6 +378,36 @@ pub struct DayDigest {
     pub turn_groups: Vec<String>,
 }
 
+#[derive(Default)]
+pub struct AutonomySummary {
+    pub actions: usize,
+    pub yielded: usize,
+    pub positive_reactions: usize,
+    pub negative_reactions: usize,
+}
+
+impl AutonomySummary {
+    pub fn line(&self) -> Option<String> {
+        if self.actions == 0 {
+            return None;
+        }
+        let pass_word = if self.actions == 1 { "pass" } else { "passes" };
+        let mut line = format!(
+            "Autonomy: Ran {} self-directed {} ({} added knowledge)",
+            self.actions, pass_word, self.yielded
+        );
+        let surfaced = self.positive_reactions + self.negative_reactions;
+        if surfaced > 0 {
+            line.push_str(&format!(
+                "; you found {} of {} surfaced items useful",
+                self.positive_reactions, surfaced
+            ));
+        }
+        line.push('.');
+        Some(line)
+    }
+}
+
 impl DayDigest {
     // A quiet day left no trace in the ledger — nothing to report on.
     pub fn is_quiet(&self) -> bool {
@@ -385,6 +416,7 @@ impl DayDigest {
             && self.updated == 0
             && self.pruned == 0
             && self.dream_events == 0
+            && self.autonomy.actions == 0
             && self.due_loops.is_empty()
             && self.inbox_outcomes.is_empty()
             && self.top_injected.is_empty()
@@ -447,11 +479,91 @@ async fn window_digest_async(
     digest.dream_events = count_night_dream_events(conn, night).await?;
     digest.gists = load_night_gists(conn, night).await?;
     digest.inbox_outcomes = db::load_inbox_outcomes(conn, &night.from, &night.until).await?;
+    digest.autonomy = load_autonomy_summary(conn, activity, night).await?;
     let loop_items = db::load_due_loops_async(conn, today).await?;
     for loop_item in loop_items {
         digest.due_loops.push(loop_item.display());
     }
     Ok(digest)
+}
+
+async fn load_autonomy_summary(
+    conn: &Connection,
+    activity: &NightWindow,
+    night: &NightWindow,
+) -> Result<AutonomySummary, Box<dyn Error + Send + Sync>> {
+    let (actions, yielded) = count_autonomy_passes(conn, activity, night).await?;
+    let (positive_reactions, negative_reactions) = count_reactions(conn, activity, night).await?;
+    Ok(AutonomySummary {
+        actions,
+        yielded,
+        positive_reactions,
+        negative_reactions,
+    })
+}
+
+async fn count_autonomy_passes(
+    conn: &Connection,
+    activity: &NightWindow,
+    night: &NightWindow,
+) -> Result<(usize, usize), Box<dyn Error + Send + Sync>> {
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN EXISTS (SELECT 1 FROM events ev WHERE ev.session_id = sessions.id AND ev.event_type = 'created') THEN 1 ELSE 0 END), 0) FROM sessions WHERE session_type IN ('exploration', 'dream', 'ingestion') AND ((created_at >= ?1 AND created_at < ?2) OR (created_at >= ?3 AND created_at < ?4))",
+            params![activity.from.as_str(), activity.until.as_str(), night.from.as_str(), night.until.as_str()],
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok((0, 0));
+    };
+    Ok((
+        db::real(row.get_value(0)?) as usize,
+        db::real(row.get_value(1)?) as usize,
+    ))
+}
+
+// The reaction verb ("positive"/"negative") only when this outcome payload is a
+// reaction to something autonomy surfaced. A thumbs-up on an answer the user
+// asked for is not autonomy surfacing anything, so it must not count toward the
+// hit-rate. No surfacing exists until the proactive-ping slice, which stamps
+// "surfaced":true on those reactions; until then this returns None for all.
+fn surfaced_reaction_kind(payload: &str) -> Option<&'static str> {
+    let Ok(value) = serde_json::from_str::<JsonValue>(payload) else {
+        return None;
+    };
+    let is_reaction = matches!(value.get("kind"), Some(kind) if kind.as_str() == Some("reaction"));
+    let is_surfaced = matches!(value.get("surfaced"), Some(flag) if flag.as_bool() == Some(true));
+    if !is_reaction || !is_surfaced {
+        return None;
+    }
+    match value.get("reaction") {
+        Some(reaction) if reaction.as_str() == Some("positive") => Some("positive"),
+        Some(reaction) if reaction.as_str() == Some("negative") => Some("negative"),
+        _ => None,
+    }
+}
+
+async fn count_reactions(
+    conn: &Connection,
+    activity: &NightWindow,
+    night: &NightWindow,
+) -> Result<(usize, usize), Box<dyn Error + Send + Sync>> {
+    let mut rows = conn
+        .query(
+            "SELECT payload FROM events WHERE event_type = 'outcome' AND ((ts >= ?1 AND ts < ?2) OR (ts >= ?3 AND ts < ?4))",
+            params![activity.from.as_str(), activity.until.as_str(), night.from.as_str(), night.until.as_str()],
+        )
+        .await?;
+    let mut positive = 0usize;
+    let mut negative = 0usize;
+    while let Some(row) = rows.next().await? {
+        match surfaced_reaction_kind(&db::text(row.get_value(0)?)) {
+            Some("positive") => positive += 1,
+            Some("negative") => negative += 1,
+            _ => {}
+        }
+    }
+    Ok((positive, negative))
 }
 
 fn day_window(day: &str) -> NightWindow {
@@ -1661,6 +1773,93 @@ mod tests {
         let digest = digest(&conn, YESTERDAY);
         assert_eq!(digest.top_injected.first(), Some(&"hot → node".to_string()));
         assert_eq!(digest.top_injected.len(), 2);
+    }
+
+    #[test]
+    fn only_surfaced_reactions_count_toward_the_hit_rate() {
+        // A plain chat reaction (no surfaced marker) must not count.
+        assert_eq!(
+            super::surfaced_reaction_kind(r#"{"kind":"reaction","reaction":"positive"}"#),
+            None
+        );
+        // A reaction to a surfaced item counts.
+        assert_eq!(
+            super::surfaced_reaction_kind(
+                r#"{"kind":"reaction","reaction":"negative","surfaced":true}"#
+            ),
+            Some("negative")
+        );
+        // A non-reaction outcome never counts.
+        assert_eq!(
+            super::surfaced_reaction_kind(r#"{"kind":"day_verdict","surfaced":true}"#),
+            None
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn digest_counts_autonomy_yield_and_reactions() {
+        let conn = db::block_on(digest_harness());
+        db::block_on(async {
+            let _ = conn.execute("INSERT INTO sessions (id, session_type, created_at) VALUES ('explore-1', 'exploration', '2026-07-10T02:00:00'), ('dream-1', 'dream', '2026-07-10T03:00:00'), ('chat-1', 'conversation', '2026-07-10T04:00:00')", ()).await;
+        });
+        db::block_on(insert_event(
+            &conn,
+            YESTERDAY,
+            "explore-1",
+            "",
+            "created",
+            "new",
+            "edge",
+            "",
+        ));
+        db::block_on(insert_event(
+            &conn,
+            YESTERDAY,
+            "chat-1",
+            "turn-1",
+            "outcome",
+            "",
+            "",
+            r#"{"kind":"reaction","reaction":"positive","surfaced":true}"#,
+        ));
+        db::block_on(insert_event(
+            &conn,
+            YESTERDAY,
+            "chat-1",
+            "turn-2",
+            "outcome",
+            "",
+            "",
+            r#"{"kind":"reaction","reaction":"negative","surfaced":true}"#,
+        ));
+
+        let digest = digest(&conn, YESTERDAY);
+        assert_eq!(digest.autonomy.actions, 2);
+        assert_eq!(digest.autonomy.yielded, 1);
+        assert_eq!(digest.autonomy.positive_reactions, 1);
+        assert_eq!(digest.autonomy.negative_reactions, 1);
+        let Some(line) = digest.autonomy.line() else {
+            unreachable!("non-empty autonomy renders")
+        };
+        assert!(line.contains("1 of 2 surfaced items useful"));
+    }
+
+    #[test]
+    fn autonomy_line_omits_hit_rate_without_reactions() {
+        let summary = super::AutonomySummary {
+            actions: 1,
+            yielded: 0,
+            ..super::AutonomySummary::default()
+        };
+        let Some(line) = summary.line() else {
+            unreachable!("one pass renders")
+        };
+        assert_eq!(
+            line,
+            "Autonomy: Ran 1 self-directed pass (0 added knowledge)."
+        );
+        assert!(super::AutonomySummary::default().line().is_none());
     }
 
     fn insert_digest_loop_cases(conn: &Connection) {

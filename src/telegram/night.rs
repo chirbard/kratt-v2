@@ -85,6 +85,7 @@ struct NightGate {
     dirty: bool,
     dreamed_tonight: bool,
     studied_inbox_tonight: bool,
+    last_curiosity_had_yield: Option<bool>,
 }
 
 impl NightGate {
@@ -99,6 +100,7 @@ impl NightGate {
             dirty: true,
             dreamed_tonight: false,
             studied_inbox_tonight: false,
+            last_curiosity_had_yield: None,
         }
     }
 
@@ -112,6 +114,7 @@ impl NightGate {
             self.count = 0;
             self.dreamed_tonight = false;
             self.studied_inbox_tonight = false;
+            self.last_curiosity_had_yield = None;
             self.dirty = true;
         }
         inside && self.dirty && self.cooldown_elapsed(now) && self.count < self.max_actions
@@ -128,6 +131,14 @@ impl NightGate {
     fn record_action(&mut self, now: Instant) {
         self.count += 1;
         self.last_action = Some(now);
+        self.last_curiosity_had_yield = None;
+    }
+
+    fn record_curiosity(&mut self, now: Instant, had_yield: bool) {
+        self.count += 1;
+        self.last_action = Some(now);
+        self.last_curiosity_had_yield = Some(had_yield);
+        self.dirty = had_yield;
     }
 
     // A skipped action (ingest, non-headless explore) consumes the cooldown so
@@ -189,6 +200,7 @@ impl NightCycle {
     // differ now, so the next idle poll inside the window re-evaluates.
     pub fn mark_dirty(&mut self) {
         self.gate.dirty = true;
+        self.gate.last_curiosity_had_yield = None;
     }
 
     // The nightly-dream guarantee: a brain dreams every night that anything
@@ -201,10 +213,11 @@ impl NightCycle {
         if !scheduler::has_unconsolidated_experience() {
             return false;
         }
-        runlog::log(
-            "tg",
-            "night action: dream (nightly guarantee: unconsolidated experience)",
-        );
+        let reason = "nightly guarantee: unconsolidated experience";
+        scheduler::log_scheduler_decision(&SchedulerAction::Dream {
+            reason: reason.to_string(),
+        });
+        runlog::log("tg", &format!("night action: dream ({reason})"));
         self.run_dream();
         self.gate.dreamed_tonight = true;
         self.gate.record_action(now);
@@ -216,6 +229,7 @@ impl NightCycle {
         if self.gate.studied_inbox_tonight {
             inputs.queued_inbox = 0;
         }
+        inputs.last_curiosity_had_yield = self.gate.last_curiosity_had_yield;
         let action = scheduler::decide(&inputs);
         scheduler::log_scheduler_decision(&action);
         if !matches!(action, SchedulerAction::Rest { .. }) {
@@ -236,6 +250,11 @@ impl NightCycle {
                 runlog::log("tg", &format!("night action: explore ({reason})"));
                 self.run_explore();
                 self.gate.record_action(now);
+            }
+            SchedulerAction::Curiosity { reason } => {
+                runlog::log("tg", &format!("night action: curiosity ({reason})"));
+                let had_yield = self.run_explore();
+                self.gate.record_curiosity(now, had_yield);
             }
             SchedulerAction::InboxStudy { reason } => {
                 runlog::log("tg", &format!("night action: inbox study ({reason})"));
@@ -269,7 +288,7 @@ impl NightCycle {
         for _event in receiver {}
     }
 
-    fn run_explore(&self) {
+    fn run_explore(&self) -> bool {
         let (sender, receiver) = std::sync::mpsc::channel::<ExploreEvent>();
         let llm = Arc::clone(&self.memory_llm);
         let embed = Arc::clone(&self.embed);
@@ -277,7 +296,13 @@ impl NightCycle {
         if let Err(err) = memory::run_exploration_pass(llm, embed, search, sender) {
             runlog::log("tg", &format!("night explore failed: {err}"));
         }
-        for _event in receiver {}
+        let mut had_yield = false;
+        for event in receiver {
+            if let ExploreEvent::Done { events_recorded } = event {
+                had_yield = events_recorded > 0;
+            }
+        }
+        had_yield
     }
 
     fn run_inbox_study(&self) {
@@ -450,6 +475,18 @@ mod tests {
         // Cooldown gates the timing, but the state is still dirty.
         let later = base + Duration::from_secs(1200);
         assert!(gate.should_evaluate(4, "2026-07-10", later));
+    }
+
+    #[test]
+    fn empty_curiosity_consumes_a_slot_and_settles() {
+        let mut gate = gate("3-6");
+        let base = Instant::now();
+        assert!(gate.should_evaluate(4, "2026-07-10", base));
+        gate.record_curiosity(base, false);
+        assert_eq!(gate.count, 1);
+        let later = base + Duration::from_secs(1200);
+        assert!(!gate.should_evaluate(4, "2026-07-10", later));
+        assert_eq!(gate.last_curiosity_had_yield, Some(false));
     }
 
     #[test]
