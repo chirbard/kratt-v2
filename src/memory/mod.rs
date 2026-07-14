@@ -25,6 +25,11 @@ pub use db::{
     register_session, search_messages_fts, sync_now, sync_pull_best_effort, sync_push_best_effort,
 };
 pub(crate) use db::{InboxItem, oldest_queued_inbox, open_connection, resolve_inbox_item};
+pub(crate) use db::{
+    RecentLearning, block_on, latest_assistant_message_timestamp_async,
+    load_inbox_snapshot_async, load_open_curiosity_notes_async, load_open_intentions_async,
+    load_recent_learning_async,
+};
 pub use dream::{DreamEvent, run_dream_pass};
 pub use embed::{SemanticEdge, edges_to_toon, run_embed_pass, select_semantic_edges_routed};
 pub use explore::{ExploreEvent, run_exploration_pass};
@@ -33,6 +38,7 @@ pub use ledger::{
     Actor, Attribution, DayDigest, EdgeRef, Event, EventContext, NightWindow, day_digest,
     newest_dream_session_id, recompute_positions, record_events, turn_attribution,
 };
+pub(crate) use ledger::catch_up_digest_async;
 pub(crate) use loops::{OpenLoops, load_open_loops};
 #[allow(unused_imports)]
 pub use reinforce::{record_move_outcome, record_outcome};

@@ -29,6 +29,15 @@ pub type SemanticEdgeRow = (
 
 pub type OpenCuriosityNoteRow = (String, String, String, String);
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RecentLearning {
+    pub content: String,
+    pub source: String,
+    pub target: String,
+    pub event_type: String,
+    pub timestamp: String,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct RegionTransition {
     pub target: String,
@@ -1865,7 +1874,7 @@ pub fn load_open_curiosity_notes(limit: usize) -> Vec<OpenCuriosityNoteRow> {
         .unwrap_or_default()
 }
 
-async fn load_open_curiosity_notes_async(
+pub(crate) async fn load_open_curiosity_notes_async(
     conn: &Connection,
     limit: usize,
 ) -> Result<Vec<OpenCuriosityNoteRow>, Box<dyn Error + Send + Sync>> {
@@ -1896,6 +1905,96 @@ async fn load_open_curiosity_notes_async(
         ));
     }
     Ok(notes)
+}
+
+pub(crate) async fn load_open_intentions_async(
+    conn: &Connection,
+    today: &str,
+    limit: usize,
+) -> Result<Vec<OpenLoop>, Box<dyn Error + Send + Sync>> {
+    let query = format!(
+        "{OPEN_LOOP_SELECT} WHERE n.node_type = 'loop' AND e.memory_type = 'semantic' AND e.content LIKE 'open loop:%' AND e.expired_at IS NULL ORDER BY (n.date != '' AND n.date <= ?1) DESC, e.date DESC, e.rowid DESC LIMIT ?2"
+    );
+    let rows = conn.query(&query, params![today, limit as i64]).await?;
+    collect_open_loops(rows).await
+}
+
+pub(crate) async fn load_recent_learning_async(
+    conn: &Connection,
+    since_days: usize,
+    limit: usize,
+) -> Result<Vec<RecentLearning>, Box<dyn Error + Send + Sync>> {
+    let modifier = format!("-{} days", since_days.min(7));
+    let mut rows = conn
+        .query(
+            "SELECT ed.content, ev.source, ev.target, ev.event_type, MAX(ev.ts)
+             FROM events ev
+             JOIN edges ed ON ed.source = ev.source AND ed.target = ev.target
+             WHERE ev.event_type IN ('created', 'reinforced')
+               AND ev.source != '' AND ev.target != ''
+               AND ed.expired_at IS NULL
+               AND julianday(ev.ts) >= julianday(date('now'), ?1)
+             GROUP BY ed.source, ed.target, ed.content, ev.event_type
+             ORDER BY MAX(ev.ts) DESC, MAX(ev.id) DESC
+             LIMIT ?2",
+            params![modifier, limit as i64],
+        )
+        .await?;
+    let mut learning = Vec::new();
+    while let Some(row) = rows.next().await? {
+        learning.push(RecentLearning {
+            content: text(row.get_value(0)?),
+            source: text(row.get_value(1)?),
+            target: text(row.get_value(2)?),
+            event_type: text(row.get_value(3)?),
+            timestamp: text(row.get_value(4)?),
+        });
+    }
+    Ok(learning)
+}
+
+pub(crate) async fn load_inbox_snapshot_async(
+    conn: &Connection,
+    limit: usize,
+) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+    let mut rows = conn
+        .query(
+            "SELECT source, status, result FROM inbox
+             WHERE status IN ('queued', 'done', 'failed')
+             ORDER BY (status = 'queued') DESC,
+                      CASE WHEN status = 'queued' THEN accepted_at ELSE resolved_at END DESC,
+                      id DESC
+             LIMIT ?1",
+            params![limit as i64],
+        )
+        .await?;
+    let mut items = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let source = text(row.get_value(0)?);
+        let status = text(row.get_value(1)?);
+        let result = text(row.get_value(2)?);
+        if status == "failed" && !result.is_empty() {
+            items.push(format!("{source}: failed ({result})"));
+        } else {
+            items.push(format!("{source}: {status}"));
+        }
+    }
+    Ok(items)
+}
+
+pub(crate) async fn latest_assistant_message_timestamp_async(
+    conn: &Connection,
+) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+    let mut rows = conn
+        .query(
+            "SELECT created_at FROM messages WHERE role = 'assistant' ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (),
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(None);
+    };
+    Ok(Some(text(row.get_value(0)?)))
 }
 
 pub fn count_new_embedding_neighbours(
