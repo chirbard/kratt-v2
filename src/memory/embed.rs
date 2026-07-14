@@ -80,18 +80,21 @@ pub fn run_embed_pass(
     embed: Arc<dyn EmbeddingClient>,
     sender: &std::sync::mpsc::Sender<MemoryEvent>,
 ) {
-    let _write_guard = db::acquire_write_lock();
-    let pending = db::load_unembedded_edges();
-    let mut start = 0usize;
-    let mut embedded = 0usize;
-    while start < pending.len() {
-        let end = (start + EMBED_BATCH).min(pending.len());
-        match embed_batch(&*embed, &pending[start..end]) {
-            Ok(count) => embedded += count,
-            Err(err) => send_log(sender, "embed", format!("batch failed — {err}")),
+    let embedded = {
+        let _write_guard = db::acquire_write_lock();
+        let pending = db::load_unembedded_edges();
+        let mut start = 0usize;
+        let mut embedded = 0usize;
+        while start < pending.len() {
+            let end = (start + EMBED_BATCH).min(pending.len());
+            match embed_batch(&*embed, &pending[start..end]) {
+                Ok(count) => embedded += count,
+                Err(err) => send_log(sender, "embed", format!("batch failed — {err}")),
+            }
+            start = end;
         }
-        start = end;
-    }
+        embedded
+    };
     if embedded > 0 {
         db::sync_push_best_effort("embed");
     }

@@ -87,21 +87,25 @@ fn apply_outcome(
     payload: &str,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
     let clamped_score = outcome_score.clamp(-1.0, 1.0);
-    let _write_guard = db::acquire_write_lock();
-    let conn = db::open_connection()?;
-    db::begin_transaction(&conn)?;
-    match run_reinforcement(&conn, session_id, turn_id, clamped_score, payload) {
-        Ok(summary) => {
-            db::commit_transaction(&conn)?;
-            db::sync_push_best_effort("reinforce");
-            crate::runlog::log("reinforce", &summary);
-            Ok(summary)
+    let result = {
+        let _write_guard = db::acquire_write_lock();
+        let conn = db::open_connection()?;
+        db::begin_transaction(&conn)?;
+        match run_reinforcement(&conn, session_id, turn_id, clamped_score, payload) {
+            Ok(summary) => {
+                db::commit_transaction(&conn)?;
+                Ok(summary)
+            }
+            Err(err) => {
+                let _ = db::block_on(async { conn.execute("ROLLBACK", ()).await });
+                Err(err)
+            }
         }
-        Err(err) => {
-            let _ = db::block_on(async { conn.execute("ROLLBACK", ()).await });
-            Err(err)
-        }
-    }
+    };
+    let summary = result?;
+    db::sync_push_best_effort("reinforce");
+    crate::runlog::log("reinforce", &summary);
+    Ok(summary)
 }
 
 fn run_reinforcement(

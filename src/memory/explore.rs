@@ -73,9 +73,6 @@ pub fn run_exploration_pass(
             send_log(
                 &sender,
                 "explore",
-                // Observed turso beta bug: transactions can dissolve mid-pass
-                // (statements auto-commit, final COMMIT fails) — writes may
-                // have landed despite the error. See backlog.
                 format!("pass failed — writes may be partial: {err}"),
             );
             let _ = sender.send(ExploreEvent::Done { events_recorded: 0 });
