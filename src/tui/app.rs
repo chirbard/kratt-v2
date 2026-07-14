@@ -610,8 +610,9 @@ fn run_scheduler(app: &mut App) {
             start_dream(app);
             app.scheduler_consecutive_actions += 1;
         }
-        scheduler::SchedulerAction::Explore { reason } => {
-            crate::runlog::log("sched", &format!("dispatching explore: {}", reason));
+        scheduler::SchedulerAction::Explore { reason }
+        | scheduler::SchedulerAction::Curiosity { reason } => {
+            crate::runlog::log("sched", &format!("dispatching exploration: {reason}"));
             start_exploration(app);
             app.scheduler_consecutive_actions += 1;
         }

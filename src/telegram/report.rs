@@ -239,6 +239,9 @@ fn render_digest(digest: &DayDigest) -> String {
         digest.created, digest.updated, digest.pruned
     ));
     lines.push(format!("Overnight dream events: {}", digest.dream_events));
+    if let Some(line) = digest.autonomy.line() {
+        lines.push(line);
+    }
     push_ref_line(&mut lines, "Gists consolidated", &digest.gists);
     push_ref_line(&mut lines, "Due loops", &digest.due_loops);
     push_ref_line(&mut lines, "Inbox", &digest.inbox_outcomes);
@@ -424,5 +427,15 @@ mod tests {
         assert!(text.contains(
             "Due loops: ask about the file (due 2026-07-10); check the service (due 2026-07-11)"
         ));
+    }
+
+    #[test]
+    fn render_includes_autonomy_only_when_non_empty() {
+        let empty = render_digest(&DayDigest::default());
+        assert!(!empty.contains("Autonomy:"));
+        let mut digest = DayDigest::default();
+        digest.autonomy.actions = 2;
+        digest.autonomy.yielded = 1;
+        assert!(render_digest(&digest).contains("Autonomy: Ran 2 self-directed passes"));
     }
 }

@@ -21,6 +21,7 @@ const DRIFT_WARN_DISTANCE: f64 = 0.10;
 pub enum SchedulerAction {
     Dream { reason: String },
     Explore { reason: String },
+    Curiosity { reason: String },
     InboxStudy { reason: String },
     Ingest { path: PathBuf, reason: String },
     Rest { reason: String },
@@ -35,6 +36,7 @@ pub struct SchedulerInputs {
     pub open_curiosity_notes_count: usize,
     pub coldest_edge_age_days: Option<i64>,
     pub actor_positions: Vec<(String, String, Option<Vec<f64>>)>, // (actor_type, actor_id, position)
+    pub last_curiosity_had_yield: Option<bool>,
 }
 
 /// Gather all inputs from the database for scheduler decision
@@ -61,6 +63,7 @@ async fn gather_inputs_async(conn: &Connection) -> SchedulerInputs {
         open_curiosity_notes_count,
         coldest_edge_age_days,
         actor_positions,
+        last_curiosity_had_yield: None,
     }
 }
 
@@ -124,6 +127,11 @@ pub fn decide(inputs: &SchedulerInputs) -> SchedulerAction {
     }
     if let Some(action) = check_cold_region(inputs) {
         return action;
+    }
+    if inputs.last_curiosity_had_yield != Some(false) {
+        return SchedulerAction::Curiosity {
+            reason: "idle — curiosity exploration".to_string(),
+        };
     }
     rest_action(inputs)
 }
@@ -283,22 +291,25 @@ fn log_drift_warning(distance: f64, actor_a: &str, actor_b: &str) {
 pub fn log_scheduler_decision(action: &SchedulerAction) {
     match action {
         SchedulerAction::Dream { reason } => {
-            crate::runlog::log("sched", &format!("dream: {}", reason));
+            crate::runlog::log("sched", &format!("[autonomy] dream — {reason}"));
         }
         SchedulerAction::Explore { reason } => {
-            crate::runlog::log("sched", &format!("explore: {}", reason));
+            crate::runlog::log("sched", &format!("[autonomy] explore — {reason}"));
+        }
+        SchedulerAction::Curiosity { reason } => {
+            crate::runlog::log("sched", &format!("[autonomy] curiosity — {reason}"));
         }
         SchedulerAction::InboxStudy { reason } => {
-            crate::runlog::log("sched", &format!("inbox study: {reason}"));
+            crate::runlog::log("sched", &format!("[autonomy] inbox study — {reason}"));
         }
         SchedulerAction::Ingest { path, reason } => {
             crate::runlog::log(
                 "sched",
-                &format!("ingest: {} ({:?})", reason, path.display()),
+                &format!("[autonomy] ingest — {reason} ({:?})", path.display()),
             );
         }
         SchedulerAction::Rest { reason } => {
-            crate::runlog::log("sched", &format!("rest: {}", reason));
+            crate::runlog::log("sched", &format!("[autonomy] rest — {reason}"));
         }
     }
 }
@@ -586,6 +597,7 @@ mod tests {
             open_curiosity_notes_count: 0,
             coldest_edge_age_days: Some(20),
             actor_positions: vec![],
+            last_curiosity_had_yield: None,
         };
         let action = decide(&inputs);
         match action {
@@ -614,6 +626,7 @@ mod tests {
             open_curiosity_notes_count: 0,
             coldest_edge_age_days: Some(5),
             actor_positions: vec![],
+            last_curiosity_had_yield: None,
         };
         let action = decide(&inputs);
 
@@ -638,6 +651,7 @@ mod tests {
             open_curiosity_notes_count: 5,
             coldest_edge_age_days: Some(5),
             actor_positions: vec![],
+            last_curiosity_had_yield: None,
         };
         let action = decide(&inputs);
         match action {
@@ -657,6 +671,7 @@ mod tests {
             open_curiosity_notes_count: 0,
             coldest_edge_age_days: Some(15), // > COLD_REGION_DAYS (14)
             actor_positions: vec![],
+            last_curiosity_had_yield: None,
         };
         let action = decide(&inputs);
         match action {
@@ -669,7 +684,7 @@ mod tests {
     }
 
     #[test]
-    fn test_decide_rest_when_no_visit_data() {
+    fn test_decide_curiosity_when_no_visit_data() {
         let inputs = SchedulerInputs {
             acquisition_debt: 10,
             queued_inbox: 0,
@@ -677,16 +692,17 @@ mod tests {
             open_curiosity_notes_count: 0,
             coldest_edge_age_days: None, // no edge_actor_views rows yet
             actor_positions: vec![],
+            last_curiosity_had_yield: None,
         };
         let action = decide(&inputs);
         match action {
-            SchedulerAction::Rest { .. } => {}
-            _ => panic!("Expected Rest action, got {:?}", action),
+            SchedulerAction::Curiosity { .. } => {}
+            _ => panic!("Expected Curiosity action, got {:?}", action),
         }
     }
 
     #[test]
-    fn test_decide_rest_when_nothing_to_do() {
+    fn test_decide_curiosity_when_nothing_to_do() {
         let inputs = SchedulerInputs {
             acquisition_debt: 10,
             queued_inbox: 0,
@@ -694,15 +710,22 @@ mod tests {
             open_curiosity_notes_count: 0,
             coldest_edge_age_days: Some(5),
             actor_positions: vec![],
+            last_curiosity_had_yield: None,
         };
         let action = decide(&inputs);
         match action {
-            SchedulerAction::Rest { reason } => {
-                assert!(reason.contains("10"));
-                assert!(reason.contains("0"));
-            }
-            _ => panic!("Expected Rest action, got {:?}", action),
+            SchedulerAction::Curiosity { reason } => assert!(reason.contains("idle")),
+            _ => panic!("Expected Curiosity action, got {:?}", action),
         }
+    }
+
+    #[test]
+    fn test_decide_rest_after_empty_curiosity() {
+        let inputs = SchedulerInputs {
+            last_curiosity_had_yield: Some(false),
+            ..SchedulerInputs::default()
+        };
+        assert!(matches!(decide(&inputs), SchedulerAction::Rest { .. }));
     }
 
     #[test]
@@ -715,6 +738,7 @@ mod tests {
             open_curiosity_notes_count: 0,
             coldest_edge_age_days: Some(5),
             actor_positions: vec![],
+            last_curiosity_had_yield: None,
         };
         let action = decide(&inputs);
         match action {
@@ -732,7 +756,9 @@ mod tests {
         };
         assert_eq!(
             decide(&inputs),
-            SchedulerAction::InboxStudy { reason: "2 inbox items queued".to_string() }
+            SchedulerAction::InboxStudy {
+                reason: "2 inbox items queued".to_string()
+            }
         );
     }
 
@@ -776,6 +802,7 @@ mod tests {
             open_curiosity_notes_count: 5,
             coldest_edge_age_days: Some(5),
             actor_positions: vec![],
+            last_curiosity_had_yield: None,
         };
         // Note: This test assumes the file exists. In a real scenario,
         // the decision function checks file existence, but for this test

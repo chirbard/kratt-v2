@@ -661,7 +661,8 @@ Write a first-person report, at most 200 words, plain text (no markdown headers,
 2. One sentence on the night: what the dream consolidated, gists first if any.
 3. Report each Inbox outcome in one sentence: what you studied and the single most interesting thing it added, or that it failed and why. Never pretend a failed or queued item was studied. When a category (inbox, loops) is empty, omit it entirely — never write "no items" sentences.
 4. Mention Due loops in one sentence when present. If a past-due loop is an expected event, ask whether it happened: "X was expected by YYYY-MM-DD; did it happen?" Never treat the deadline alone as evidence of absence.
-5. One honest self-assessment sentence: whether this looks like a good day of learning and WHY — so the reader can agree or correct.
+5. Report the Autonomy line honestly when present and omit autonomy entirely when no self-directed passes ran.
+6. One honest self-assessment sentence: whether this looks like a good day of learning and WHY — so the reader can agree or correct.
 
 Ground every sentence in the digest — invent nothing beyond it, and do not flatter. If the digest is thin, say so plainly and keep it short."#;
 
@@ -864,5 +865,6 @@ mod tests {
         assert!(DAILY_REPORT.contains("Mention Due loops in one sentence"));
         assert!(DAILY_REPORT.contains("did it happen?"));
         assert!(DAILY_REPORT.contains("Never treat the deadline alone as evidence of absence"));
+        assert!(DAILY_REPORT.contains("Report the Autonomy line honestly"));
     }
 }
