@@ -14,4 +14,4 @@ serde_json = "1.0.150"
 signal-hook = "0.4.4"
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 toon = "0.1"
-turso = { version = "0.6.1", features = ["fts", "sync"] }
+turso = { version = "0.7.0", features = ["fts", "sync"] }
