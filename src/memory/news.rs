@@ -9,7 +9,7 @@ use crate::web::{NewsItem, SearchClient};
 
 use super::db::{self, Interest};
 use super::embed;
-use super::graph::{PROVENANCE_USER_CONFIRMED, PROVENANCE_WEB_CONFIRMED, provenance_ceiling};
+use super::graph::{PROVENANCE_USER_CONFIRMED, PROVENANCE_WEB_CONFIRMED, edge_ceiling};
 use super::ledger::{self, Actor, EdgeRef, Event, EventContext};
 
 const NEWS_INTEREST_COUNT: usize = 3; // replay-tunable.
@@ -213,7 +213,7 @@ fn promoted_confidence(confidence: f64, from_tier: &str, to_tier: &str) -> f64 {
     } else {
         confidence.max(CORROBORATION_CONFIDENCE_FLOOR)
     };
-    db::round2(proposed.min(provenance_ceiling(to_tier)))
+    db::round2(proposed.min(edge_ceiling(to_tier, None)))
 }
 
 fn write_promotion<'edge>(
@@ -224,7 +224,9 @@ fn write_promotion<'edge>(
     db::begin_transaction(conn)?;
     let result = db::block_on(async {
         conn.execute(
-            "UPDATE edges SET provenance = ?1, confidence = ?2, stability = ?3
+            // Corroboration replaces a derived edge's inherited cap with the
+            // web-confirmed tier cap.
+            "UPDATE edges SET provenance = ?1, confidence = ?2, stability = ?3, ceiling = NULL
              WHERE source = ?4 AND target = ?5 AND expired_at IS NULL",
             params![
                 update.provenance,
@@ -296,7 +298,15 @@ mod tests {
     fn near_result_promotes_and_distant_result_is_recorded() {
         let conn = db::block_on(test_connection());
         seed_test_graph(&conn);
-        set_known_edge(&conn, "dreamed", 0.2, 0.4);
+        set_known_edge(&conn, "synthesized", 0.2, 0.4);
+        db::block_on(async {
+            let _ = conn
+                .execute(
+                    "UPDATE edges SET ceiling = 0.25 WHERE source = 'known' AND target = 'fact'",
+                    (),
+                )
+                .await;
+        });
         let interest = Interest {
             node_id: "rust".to_string(),
             topic: "Rust".to_string(),
@@ -334,7 +344,7 @@ mod tests {
             );
             let Ok(mut promoted) = conn
                 .query(
-                    "SELECT provenance, confidence, stability FROM edges
+                    "SELECT provenance, confidence, stability, ceiling FROM edges
                      WHERE source = 'known' AND target = 'fact'",
                     (),
                 )
@@ -357,6 +367,10 @@ mod tests {
                 db::real(row.get_value(2).unwrap_or(turso::Value::Null)),
                 0.5
             );
+            assert!(matches!(
+                row.get_value(3).unwrap_or(turso::Value::Real(1.0)),
+                turso::Value::Null
+            ));
             let Ok(mut events) = conn
                 .query(
                     "SELECT payload FROM events WHERE event_type = 'promoted'",
@@ -370,7 +384,7 @@ mod tests {
                 unreachable!("promotion event exists")
             };
             let payload = db::text(event.get_value(0).unwrap_or(turso::Value::Null));
-            assert!(payload.contains(r#""from":"dreamed""#), "{payload}");
+            assert!(payload.contains(r#""from":"synthesized""#), "{payload}");
             assert!(payload.contains(r#""to":"web-confirmed""#), "{payload}");
         });
     }
@@ -450,7 +464,7 @@ mod tests {
     fn seed_test_graph(conn: &Connection) {
         db::block_on(async {
             let _ = conn.execute("CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')", ()).await;
-            let _ = conn.execute("CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', embedding BLOB, PRIMARY KEY (source, target))", ()).await;
+            let _ = conn.execute("CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', ceiling REAL, embedding BLOB, PRIMARY KEY (source, target))", ()).await;
             let _ = conn.execute("CREATE TABLE findings (id INTEGER PRIMARY KEY AUTOINCREMENT, interest_topic TEXT NOT NULL, title TEXT NOT NULL, url TEXT NOT NULL, snippet TEXT NOT NULL DEFAULT '', novelty REAL NOT NULL, found_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'candidate', surfaced_at TEXT NOT NULL DEFAULT '')", ()).await;
             let _ = conn.execute("CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')", ()).await;
             let _ = conn.execute("CREATE TABLE edge_actor_views (actor_type TEXT NOT NULL, actor_id TEXT NOT NULL, source TEXT NOT NULL, target TEXT NOT NULL, views REAL NOT NULL DEFAULT 0, last_visited_at TEXT NOT NULL, PRIMARY KEY (actor_type, actor_id, source, target))", ()).await;

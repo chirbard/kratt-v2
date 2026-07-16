@@ -204,7 +204,8 @@ upsert_edge — create or update a directed edge.
 - importance: 1.0 must load with source, 0.0 supplementary
 - subject: true only on fact nodes; set importance=1.0
 - date: always today's date
-{"tool":"upsert_edge","args":{"source":"string","target":"string","content":"string","stability":0.0,"confidence":0.0,"importance":0.0,"subject":false,"date":"YYYY-MM-DD"}}
+- when you create an edge by combining existing edges from your context rather than from what the user said, pass inferred_from with the supporting edge refs; edges taken from the user's own words never need it
+{"tool":"upsert_edge","args":{"source":"string","target":"string","content":"string","stability":0.0,"confidence":0.0,"importance":0.0,"subject":false,"date":"YYYY-MM-DD","inferred_from":[["support-source","support-target"]]}}
 
 delete_node — remove a node.
 {"tool":"delete_node","args":{"name":"string"}}

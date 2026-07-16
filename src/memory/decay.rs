@@ -107,6 +107,7 @@ mod tests {
             memory_type: memory_type.to_string(),
             origin_session: String::new(),
             provenance: "legacy".to_string(),
+            ceiling: None,
         }
     }
 

@@ -16,7 +16,7 @@ use crate::web::SearchClient;
 use super::agent::{self, ApplyToolOptions, ToolCall};
 use super::db;
 use super::embed::{self, SemanticEdge};
-use super::graph::{Edge, Node, PROVENANCE_WEB_SURFACED, normalize_id, provenance_ceiling};
+use super::graph::{Edge, Node, PROVENANCE_WEB_SURFACED, edge_ceiling, normalize_id};
 use super::ledger::{self, Actor, EdgeRef, Event, EventContext};
 
 const INGEST_CHUNK_CHARS: usize = 4000; // replay-tunable.
@@ -396,7 +396,7 @@ fn apply_ingest_mutation<'scope>(
         context: EventContext::new(study.session_id, study.turn_id),
         source_message_id: study.source_message_id,
         event_payload: &payload,
-        confidence_cap: Some(provenance_ceiling(PROVENANCE_WEB_SURFACED)),
+        confidence_cap: Some(edge_ceiling(PROVENANCE_WEB_SURFACED, None)),
         provenance: PROVENANCE_WEB_SURFACED,
         default_memory_type: "semantic",
     };
@@ -537,6 +537,7 @@ fn execute_note_curiosity<'scope>(
         memory_type: "semantic".to_string(),
         origin_session: String::new(),
         provenance: PROVENANCE_WEB_SURFACED.to_string(),
+        ceiling: None,
     };
     let existed = db::load_edge(study.conn, &edge.source, &edge.target)?.is_some();
     db::write_edge(study.conn, &edge, study.source_message_id)?;
@@ -591,6 +592,7 @@ fn record_skipped_chunk(
             memory_type: "semantic".to_string(),
             origin_session: String::new(),
             provenance: PROVENANCE_WEB_SURFACED.to_string(),
+            ceiling: None,
         };
         let existed = db::load_edge(conn, &edge.source, &edge.target)?.is_some();
         db::write_edge(conn, &edge, source_message_id)?;

@@ -10,7 +10,7 @@ use std::error::Error;
 use turso::{Connection, params};
 
 use super::db;
-use super::graph::provenance_ceiling;
+use super::graph::edge_ceiling;
 use super::ledger::{self, Actor, EdgeRef, Event, EventContext};
 
 // Enough examples to recognise the pattern in a log line, not a full dump.
@@ -187,15 +187,17 @@ async fn load_clamped_weights(
 ) -> Result<Vec<(String, String, f64, f64, f64)>, Box<dyn Error + Send + Sync>> {
     let mut rows = conn
         .query(
-            "SELECT source, target, confidence, stability, importance, provenance
+            "SELECT source, target, confidence, stability, importance, provenance, ceiling
              FROM edges
              WHERE confidence < 0 OR confidence > 1
-                OR confidence > CASE provenance
-                    WHEN 'user-confirmed' THEN 1.0
-                    WHEN 'web-confirmed' THEN 0.8
-                    WHEN 'dreamed' THEN 0.25
-                    ELSE 0.5
-                END
+                OR confidence > COALESCE(ceiling, CASE provenance
+                       WHEN 'user-confirmed' THEN 1.0
+                       WHEN 'web-confirmed' THEN 0.8
+                       WHEN 'dreamed' THEN 0.25
+                       WHEN 'inferred' THEN 0.25
+                       WHEN 'synthesized' THEN 0.25
+                       ELSE 0.5
+                   END)
                 OR stability < 0 OR stability > 1
                 OR importance < 0 OR importance > 1",
             (),
@@ -204,10 +206,15 @@ async fn load_clamped_weights(
     let mut clamped: Vec<(String, String, f64, f64, f64)> = Vec::new();
     while let Some(row) = rows.next().await? {
         let provenance = db::text(row.get_value(5)?);
+        let ceiling = match row.get_value(6)? {
+            turso::Value::Real(value) => Some(value),
+            turso::Value::Integer(value) => Some(value as f64),
+            _ => None,
+        };
         clamped.push((
             db::text(row.get_value(0)?),
             db::text(row.get_value(1)?),
-            clamp_unit(db::real(row.get_value(2)?)).min(provenance_ceiling(&provenance)),
+            clamp_unit(db::real(row.get_value(2)?)).min(edge_ceiling(&provenance, ceiling)),
             clamp_unit(db::real(row.get_value(3)?)),
             clamp_unit(db::real(row.get_value(4)?)),
         ));
@@ -367,7 +374,7 @@ mod tests {
     use turso::{Builder, Connection, params};
 
     const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
-    const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', embedding BLOB, PRIMARY KEY (source, target))";
+    const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', ceiling REAL, embedding BLOB, PRIMARY KEY (source, target))";
     const EVENTS_DDL: &str = "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')";
     // record_events_in_tx also writes actor views and positions.
     const VIEWS_DDL: &str = "CREATE TABLE edge_actor_views (actor_type TEXT NOT NULL, actor_id TEXT NOT NULL, source TEXT NOT NULL, target TEXT NOT NULL, views REAL NOT NULL DEFAULT 0, last_visited_at TEXT NOT NULL, PRIMARY KEY (actor_type, actor_id, source, target))";
@@ -560,6 +567,26 @@ mod tests {
         assert_eq!(
             db::block_on(edge_weights(&conn, "carol", "berlin")),
             (0.5, 0.5, 0.5)
+        );
+    }
+
+    #[test]
+    fn derived_edge_is_clamped_to_its_own_ceiling() {
+        let conn = db::block_on(harness());
+        db::block_on(add_node(&conn, "summary", "entity"));
+        db::block_on(add_node(&conn, "topic", "entity"));
+        db::block_on(add_edge(&conn, "summary", "topic", None));
+        let _ = db::block_on(conn.execute(
+            "UPDATE edges SET confidence = 0.9, provenance = 'synthesized', ceiling = 0.72
+             WHERE source = 'summary'",
+            (),
+        ));
+
+        let report = hygiene(&conn);
+        assert_eq!(report.clamped_edges, 1);
+        assert_eq!(
+            db::block_on(edge_weights(&conn, "summary", "topic")).0,
+            0.72
         );
     }
 

@@ -10,7 +10,7 @@ use turso::{Builder, Connection, Database, Value, params};
 
 use super::graph::{
     Edge, Graph, Node, PROVENANCE_DREAMED, PROVENANCE_LEGACY, PROVENANCE_USER_CONFIRMED,
-    PROVENANCE_WEB_SURFACED, load_from_toon, normalize_id, provenance_ceiling,
+    PROVENANCE_WEB_SURFACED, edge_ceiling, load_from_toon, normalize_id,
 };
 use super::loops::OpenLoop;
 
@@ -676,6 +676,7 @@ async fn add_edge_columns(conn: &Connection) {
     add_edge_time_columns(conn).await;
     add_edge_memory_type_columns(conn).await;
     add_edge_epistemics_column(conn).await;
+    add_edge_ceiling_column(conn).await;
 }
 
 async fn add_edge_epistemics_column(conn: &Connection) {
@@ -684,6 +685,12 @@ async fn add_edge_epistemics_column(conn: &Connection) {
             "ALTER TABLE edges ADD COLUMN provenance TEXT NOT NULL DEFAULT ''",
             (),
         )
+        .await;
+}
+
+async fn add_edge_ceiling_column(conn: &Connection) {
+    let _ = conn
+        .execute("ALTER TABLE edges ADD COLUMN ceiling REAL", ())
         .await;
 }
 
@@ -737,7 +744,7 @@ async fn backfill_one_edge(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let (source, target, origin_session, confidence) = edge;
     let provenance = provenance_from_origin_session(&origin_session);
-    let clamped = clamped_confidence(confidence, provenance);
+    let clamped = clamped_confidence(confidence, provenance, None);
     conn.execute(
         "UPDATE edges SET provenance = ?1, confidence = ?2
          WHERE source = ?3 AND target = ?4 AND provenance = ''",
@@ -773,7 +780,7 @@ fn count_backfill(summary: &mut EpistemicsBackfill, provenance: &str, confidence
         PROVENANCE_USER_CONFIRMED => summary.user += 1,
         _ => summary.legacy += 1,
     }
-    if confidence > provenance_ceiling(provenance) {
+    if confidence > edge_ceiling(provenance, None) {
         summary.clamped += 1;
     }
 }
@@ -1341,7 +1348,7 @@ async fn load_nodes(conn: &Connection, graph: &mut Graph) {
 async fn load_edges(conn: &Connection, graph: &mut Graph) {
     let Ok(mut rows) = conn
         .query(
-            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session, provenance FROM edges",
+            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session, provenance, ceiling FROM edges",
             (),
         )
         .await
@@ -1349,33 +1356,9 @@ async fn load_edges(conn: &Connection, graph: &mut Graph) {
         return;
     };
     while let Ok(Some(row)) = rows.next().await {
-        let (Ok(src), Ok(tgt), Ok(content), Ok(stab), Ok(conf), Ok(imp), Ok(subj), Ok(date)) = (
-            row.get_value(0),
-            row.get_value(1),
-            row.get_value(2),
-            row.get_value(3),
-            row.get_value(4),
-            row.get_value(5),
-            row.get_value(6),
-            row.get_value(7),
-        ) else {
-            continue;
-        };
-        graph.edges.push(Edge {
-            source: normalize_id(&text(src)),
-            target: normalize_id(&text(tgt)),
-            content: text(content),
-            stability: real(stab),
-            confidence: real(conf),
-            importance: real(imp),
-            subject: int(subj) != 0,
-            date: text(date),
-            occurred_at: optional_text(row.get_value(8).ok()),
-            expired_at: optional_text(row.get_value(9).ok()),
-            memory_type: text_or(row.get_value(10), "semantic"),
-            origin_session: text_or(row.get_value(11), ""),
-            provenance: text_or(row.get_value(12), PROVENANCE_LEGACY),
-        });
+        if let Some(edge) = parse_edge_row(&row) {
+            graph.edges.push(edge);
+        }
     }
 }
 
@@ -1631,8 +1614,8 @@ pub(crate) fn round2(value: f64) -> f64 {
     (value * 100.0).round() / 100.0
 }
 
-fn clamped_confidence(confidence: f64, provenance: &str) -> f64 {
-    round2(confidence.min(provenance_ceiling(provenance)))
+fn clamped_confidence(confidence: f64, provenance: &str, ceiling: Option<f64>) -> f64 {
+    round2(confidence.min(edge_ceiling(provenance, ceiling)))
 }
 
 pub fn write_edge(
@@ -1642,13 +1625,13 @@ pub fn write_edge(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     runtime().block_on(async {
         conn.execute(
-            "INSERT OR REPLACE INTO edges (source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, source_message_id, memory_type, origin_session, provenance) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "INSERT OR REPLACE INTO edges (source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, source_message_id, memory_type, origin_session, provenance, ceiling) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 edge.source.as_str(),
                 edge.target.as_str(),
                 edge.content.as_str(),
                 round2(edge.stability),
-                clamped_confidence(edge.confidence, &edge.provenance),
+                clamped_confidence(edge.confidence, &edge.provenance, edge.ceiling),
                 round2(edge.importance),
                 edge.subject as i64,
                 edge.date.as_str(),
@@ -1658,6 +1641,7 @@ pub fn write_edge(
                 edge.memory_type.as_str(),
                 edge.origin_session.as_str(),
                 edge.provenance.as_str(),
+                edge.ceiling,
             ],
         )
         .await?;
@@ -1848,7 +1832,7 @@ pub fn load_game_edges(
     runtime().block_on(async {
         let mut rows = conn
             .query(
-                "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session, provenance FROM edges WHERE (source = ?1 OR target = ?1) AND memory_type = 'semantic' AND expired_at IS NULL ORDER BY confidence DESC LIMIT ?2",
+                "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session, provenance, ceiling FROM edges WHERE (source = ?1 OR target = ?1) AND memory_type = 'semantic' AND expired_at IS NULL ORDER BY confidence DESC LIMIT ?2",
                 params![game_id, cap as i64],
             )
             .await?;
@@ -2017,7 +2001,7 @@ pub fn load_task_chain(
     runtime().block_on(async {
         let mut rows = conn
             .query(
-                "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session, provenance FROM edges WHERE source = ?1 AND target LIKE ?2 AND memory_type = 'episodic' AND expired_at IS NULL ORDER BY target DESC LIMIT ?3",
+                "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session, provenance, ceiling FROM edges WHERE source = ?1 AND target LIKE ?2 AND memory_type = 'episodic' AND expired_at IS NULL ORDER BY target DESC LIMIT ?3",
                 params![hub_id.as_str(), pattern.as_str(), cap as i64],
             )
             .await?;
@@ -2057,7 +2041,7 @@ async fn update_edge_confidence_async(
         .execute(
             "UPDATE edges SET confidence = ?1 WHERE source = ?2 AND target = ?3 AND expired_at IS NULL",
             params![
-                clamped_confidence(confidence, &edge.provenance),
+                clamped_confidence(confidence, &edge.provenance, edge.ceiling),
                 source,
                 target
             ],
@@ -2073,7 +2057,7 @@ async fn load_edge_async(
 ) -> Result<Option<Edge>, Box<dyn Error + Send + Sync>> {
     let mut rows = conn
         .query(
-            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session, provenance FROM edges WHERE source = ?1 AND target = ?2 LIMIT 1",
+            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session, provenance, ceiling FROM edges WHERE source = ?1 AND target = ?2 LIMIT 1",
             params![source, target],
         )
         .await?;
@@ -2115,7 +2099,7 @@ async fn load_edges_for_node_async(
 ) -> Result<Vec<Edge>, Box<dyn Error + Send + Sync>> {
     let mut rows = conn
         .query(
-            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session, provenance FROM edges WHERE source = ?1 OR target = ?1",
+            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session, provenance, ceiling FROM edges WHERE source = ?1 OR target = ?1",
             params![node_id],
         )
         .await?;
@@ -2353,7 +2337,7 @@ async fn query_edges_ann(
 ) -> Result<Vec<SemanticEdgeRow>, Box<dyn Error + Send + Sync>> {
     execute_semantic_query(
         conn,
-        "SELECT e.source, e.target, e.content, e.stability, e.confidence, e.importance, e.subject, e.date, e.occurred_at, e.expired_at, e.memory_type, e.origin_session, e.provenance, vector_extract(e.embedding) FROM vector_top_k('edges_vec', vector32(?1), ?2) AS vt JOIN edges AS e ON e.rowid = vt.id LEFT JOIN nodes AS source_node ON source_node.id = e.source LEFT JOIN nodes AS target_node ON target_node.id = e.target WHERE e.expired_at IS NULL AND COALESCE(source_node.node_type, '') NOT IN ('loop', 'interest') AND COALESCE(target_node.node_type, '') NOT IN ('loop', 'interest')",
+        "SELECT e.source, e.target, e.content, e.stability, e.confidence, e.importance, e.subject, e.date, e.occurred_at, e.expired_at, e.memory_type, e.origin_session, e.provenance, e.ceiling, vector_extract(e.embedding) FROM vector_top_k('edges_vec', vector32(?1), ?2) AS vt JOIN edges AS e ON e.rowid = vt.id LEFT JOIN nodes AS source_node ON source_node.id = e.source LEFT JOIN nodes AS target_node ON target_node.id = e.target WHERE e.expired_at IS NULL AND COALESCE(source_node.node_type, '') NOT IN ('loop', 'interest') AND COALESCE(target_node.node_type, '') NOT IN ('loop', 'interest')",
         json_str,
         limit,
     )
@@ -2367,7 +2351,7 @@ async fn query_edges_scan(
 ) -> Result<Vec<SemanticEdgeRow>, Box<dyn Error + Send + Sync>> {
     execute_semantic_query(
         conn,
-        "SELECT e.source, e.target, e.content, e.stability, e.confidence, e.importance, e.subject, e.date, e.occurred_at, e.expired_at, e.memory_type, e.origin_session, e.provenance, vector_extract(e.embedding) FROM edges e LEFT JOIN nodes source_node ON source_node.id = e.source LEFT JOIN nodes target_node ON target_node.id = e.target WHERE e.embedding IS NOT NULL AND e.expired_at IS NULL AND COALESCE(source_node.node_type, '') NOT IN ('loop', 'interest') AND COALESCE(target_node.node_type, '') NOT IN ('loop', 'interest') ORDER BY vector_distance_cos(e.embedding, vector32(?1)) LIMIT ?2",
+        "SELECT e.source, e.target, e.content, e.stability, e.confidence, e.importance, e.subject, e.date, e.occurred_at, e.expired_at, e.memory_type, e.origin_session, e.provenance, e.ceiling, vector_extract(e.embedding) FROM edges e LEFT JOIN nodes source_node ON source_node.id = e.source LEFT JOIN nodes target_node ON target_node.id = e.target WHERE e.embedding IS NOT NULL AND e.expired_at IS NULL AND COALESCE(source_node.node_type, '') NOT IN ('loop', 'interest') AND COALESCE(target_node.node_type, '') NOT IN ('loop', 'interest') ORDER BY vector_distance_cos(e.embedding, vector32(?1)) LIMIT ?2",
         json_str,
         limit,
     )
@@ -2393,7 +2377,7 @@ async fn execute_semantic_query(
 
 fn parse_semantic_edge_row(row: &turso::Row) -> Option<SemanticEdgeRow> {
     let edge = parse_edge_row(row)?;
-    let embedding = parse_optional_vector32(row.get_value(13).ok());
+    let embedding = parse_optional_vector32(row.get_value(14).ok());
     Some((
         edge.source,
         edge.target,
@@ -2422,7 +2406,7 @@ pub fn load_all_edges_semantic() -> Vec<SemanticEdgeRow> {
 async fn load_all_edges_semantic_async(conn: &Connection) -> Vec<SemanticEdgeRow> {
     let Ok(mut rows) = conn
         .query(
-            "SELECT e.source, e.target, e.content, e.stability, e.confidence, e.importance, e.subject, e.date, e.occurred_at, e.expired_at, e.memory_type, e.origin_session, e.provenance, CASE WHEN e.embedding IS NULL THEN NULL ELSE vector_extract(e.embedding) END FROM edges e LEFT JOIN nodes source_node ON source_node.id = e.source LEFT JOIN nodes target_node ON target_node.id = e.target WHERE e.expired_at IS NULL AND COALESCE(source_node.node_type, '') NOT IN ('loop', 'interest') AND COALESCE(target_node.node_type, '') NOT IN ('loop', 'interest')",
+            "SELECT e.source, e.target, e.content, e.stability, e.confidence, e.importance, e.subject, e.date, e.occurred_at, e.expired_at, e.memory_type, e.origin_session, e.provenance, e.ceiling, CASE WHEN e.embedding IS NULL THEN NULL ELSE vector_extract(e.embedding) END FROM edges e LEFT JOIN nodes source_node ON source_node.id = e.source LEFT JOIN nodes target_node ON target_node.id = e.target WHERE e.expired_at IS NULL AND COALESCE(source_node.node_type, '') NOT IN ('loop', 'interest') AND COALESCE(target_node.node_type, '') NOT IN ('loop', 'interest')",
             (),
         )
         .await
@@ -2784,13 +2768,13 @@ async fn insert_graph_edge(
     edge: &Edge,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     conn.execute(
-        "INSERT INTO edges (source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, source_message_id, memory_type, origin_session, provenance) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "INSERT INTO edges (source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, source_message_id, memory_type, origin_session, provenance, ceiling) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             edge.source.as_str(),
             edge.target.as_str(),
             edge.content.as_str(),
             round2(edge.stability),
-            clamped_confidence(edge.confidence, &edge.provenance),
+            clamped_confidence(edge.confidence, &edge.provenance, edge.ceiling),
             round2(edge.importance),
             edge.subject as i64,
             edge.date.as_str(),
@@ -2800,6 +2784,7 @@ async fn insert_graph_edge(
             edge.memory_type.as_str(),
             edge.origin_session.as_str(),
             edge.provenance.as_str(),
+            edge.ceiling,
         ],
     )
     .await?;
@@ -3504,6 +3489,7 @@ pub(super) fn parse_edge_row(row: &turso::Row) -> Option<Edge> {
         memory_type: text_or(row.get_value(10), "semantic"),
         origin_session: text_or(row.get_value(11), ""),
         provenance: text_or(row.get_value(12), PROVENANCE_LEGACY),
+        ceiling: optional_real(row.get_value(13).ok()),
     })
 }
 
@@ -3517,6 +3503,15 @@ fn text_or(value: Result<Value, turso::Error>, default: &str) -> String {
 fn optional_text(value: Option<Value>) -> Option<String> {
     match value? {
         Value::Text(string) => Some(string),
+        Value::Null => None,
+        _ => None,
+    }
+}
+
+fn optional_real(value: Option<Value>) -> Option<f64> {
+    match value? {
+        Value::Real(number) => Some(number),
+        Value::Integer(number) => Some(number as f64),
         Value::Null => None,
         _ => None,
     }
@@ -3555,13 +3550,14 @@ pub(crate) fn int(val: Value) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_PING_MUTED_UNTIL, backfill_edge_epistemics, block_on, count_findings_in_window,
-        count_new_embedding_neighbours_async, divert_ping_topic, insert_finding, insert_interest,
-        interest_density_with, load_all_edges_semantic_async, load_due_loops, load_game_edges,
-        load_loops_for_anchors, load_ping_policy, load_recent_attention_counts_async,
-        load_session_game, load_task_chain, load_unembedded_edges_async, mark_finding_surfaced,
-        recover_replica_once, resume_pings, set_ping_mute, top_interests_with, unsurfaced_findings,
-        update_edge_confidence, with_write_lock, write_edge,
+        DEFAULT_PING_MUTED_UNTIL, add_edge_ceiling_column, backfill_edge_epistemics, block_on,
+        count_findings_in_window, count_new_embedding_neighbours_async, divert_ping_topic,
+        insert_finding, insert_interest, interest_density_with, load_all_edges_semantic_async,
+        load_due_loops, load_game_edges, load_loops_for_anchors, load_ping_policy,
+        load_recent_attention_counts_async, load_session_game, load_task_chain,
+        load_unembedded_edges_async, mark_finding_surfaced, recover_replica_once, resume_pings,
+        set_ping_mute, top_interests_with, unsurfaced_findings, update_edge_confidence,
+        with_write_lock, write_edge,
     };
     use crate::memory::graph::Edge;
     use crate::web::NewsItem;
@@ -3569,7 +3565,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use turso::{Builder, Connection, params};
 
-    const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', embedding BLOB, PRIMARY KEY (source, target))";
+    const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', ceiling REAL, embedding BLOB, PRIMARY KEY (source, target))";
     const EVENTS_DDL: &str = "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')";
     const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
     const FINDINGS_DDL: &str = "CREATE TABLE findings (id INTEGER PRIMARY KEY AUTOINCREMENT, interest_topic TEXT NOT NULL, title TEXT NOT NULL, url TEXT NOT NULL, snippet TEXT NOT NULL DEFAULT '', novelty REAL NOT NULL, found_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'candidate', surfaced_at TEXT NOT NULL DEFAULT '')";
@@ -3853,6 +3849,7 @@ mod tests {
             memory_type: "semantic".to_string(),
             origin_session: String::new(),
             provenance: provenance.to_string(),
+            ceiling: None,
         }
     }
 
@@ -3877,6 +3874,36 @@ mod tests {
             unreachable!("updated edge loads")
         };
         assert_eq!(updated.confidence, 0.25);
+    }
+
+    #[test]
+    fn writes_obey_a_derived_edges_own_ceiling() {
+        let conn = block_on(harness());
+        let mut edge = epistemic_edge("synthesis", "synthesized", 0.9);
+        edge.ceiling = Some(0.72);
+        assert!(write_edge(&conn, &edge, "").is_ok());
+        let Ok(Some(stored)) = super::load_edge(&conn, "synthesis", "target") else {
+            unreachable!("derived edge loads")
+        };
+        assert_eq!(stored.confidence, 0.72);
+        assert_eq!(stored.ceiling, Some(0.72));
+    }
+
+    #[test]
+    fn ceiling_migration_is_idempotent_and_leaves_existing_edges_null() {
+        let conn = block_on(migration_harness());
+        block_on(add_edge_ceiling_column(&conn));
+        block_on(add_edge_ceiling_column(&conn));
+        let result = block_on(async {
+            let mut rows = conn
+                .query("SELECT ceiling FROM edges WHERE source = 'dream'", ())
+                .await?;
+            rows.next().await
+        });
+        assert!(matches!(
+            result,
+            Ok(Some(row)) if matches!(row.get_value(0), Ok(turso::Value::Null))
+        ));
     }
 
     #[test]
