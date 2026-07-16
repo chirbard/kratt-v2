@@ -36,10 +36,16 @@ struct Choice {
 }
 
 #[derive(Deserialize)]
+struct PromptTokensDetails {
+    cached_tokens: Option<u32>,
+}
+
+#[derive(Deserialize)]
 struct Usage {
     prompt_tokens: Option<u32>,
     completion_tokens: Option<u32>,
     cost: Option<f64>,
+    prompt_tokens_details: Option<PromptTokensDetails>,
 }
 
 #[derive(Deserialize)]
@@ -61,6 +67,8 @@ struct StreamState {
     tokens_in: u32,
     tokens_out: u32,
     cost_usd: Option<f64>,
+    cached_tokens: Option<u32>,
+    saw_prompt_tokens: bool,
     tool_calls: Vec<ToolCallAcc>,
     finish_reason: Option<String>,
 }
@@ -130,8 +138,30 @@ impl LlmClient for OpenRouterClient {
         sender: &Sender<Chunk>,
     ) -> Result<TurnOutcome, Box<dyn std::error::Error + Send + Sync>> {
         let resp = make_request_messages(&self.api_key, &self.model, &self.url, messages, tools)?;
-        stream_response(resp, sender)
+        stream_response(resp, sender, request_area(messages))
     }
+}
+
+fn request_area(messages: &[Value]) -> &'static str {
+    for message in messages {
+        let role = match message.get("role") {
+            Some(value) => value.as_str(),
+            None => None,
+        };
+        if role == Some("system") {
+            return "chat";
+        }
+    }
+    for message in messages {
+        let content = match message.get("content") {
+            Some(value) => value.as_str().unwrap_or(""),
+            None => "",
+        };
+        if content.contains("## Current memory graph") {
+            return "dream";
+        }
+    }
+    "mem"
 }
 
 fn build_stream_messages(prompt: String, system: Option<String>) -> Vec<Value> {
@@ -185,6 +215,7 @@ fn insert_tools(body: &mut Value, tool_defs: &Value) {
 fn stream_response(
     resp: reqwest::blocking::Response,
     sender: &Sender<Chunk>,
+    area: &'static str,
 ) -> Result<TurnOutcome, Box<dyn std::error::Error + Send + Sync>> {
     let mut state = StreamState {
         start: Instant::now(),
@@ -192,6 +223,8 @@ fn stream_response(
         tokens_in: 0,
         tokens_out: 0,
         cost_usd: None,
+        cached_tokens: None,
+        saw_prompt_tokens: false,
         tool_calls: Vec::new(),
         finish_reason: None,
     };
@@ -206,7 +239,23 @@ fn stream_response(
             break;
         }
     }
+    log_cached_usage(area, &state);
     Ok(build_turn_outcome(state))
+}
+
+fn log_cached_usage(area: &str, state: &StreamState) {
+    let Some(line) = cached_usage_line(state) else {
+        return;
+    };
+    crate::runlog::log(area, &line);
+}
+
+fn cached_usage_line(state: &StreamState) -> Option<String> {
+    let cached = state.cached_tokens?;
+    if !state.saw_prompt_tokens {
+        return None;
+    }
+    Some(format!("cached {cached}/{} prompt tokens", state.tokens_in))
 }
 
 fn process_line(
@@ -341,12 +390,18 @@ fn record_ttft(state: &mut StreamState) {
 fn apply_usage(usage: Usage, state: &mut StreamState) {
     if let Some(tok_in) = usage.prompt_tokens {
         state.tokens_in = tok_in;
+        state.saw_prompt_tokens = true;
     }
     if let Some(tok_out) = usage.completion_tokens {
         state.tokens_out = tok_out;
     }
     if let Some(cost) = usage.cost {
         state.cost_usd = Some(cost);
+    }
+    if let Some(details) = usage.prompt_tokens_details
+        && let Some(cached) = details.cached_tokens
+    {
+        state.cached_tokens = Some(cached);
     }
 }
 
@@ -374,4 +429,72 @@ fn build_tool_call_requests(tool_calls: &[ToolCallAcc]) -> Vec<ToolCallRequest> 
         });
     }
     calls
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use serde_json::json;
+
+    use super::{StreamState, apply_usage, cached_usage_line, request_area};
+
+    fn stream_state() -> StreamState {
+        StreamState {
+            start: Instant::now(),
+            ttft: None,
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: None,
+            cached_tokens: None,
+            saw_prompt_tokens: false,
+            tool_calls: Vec::new(),
+            finish_reason: None,
+        }
+    }
+
+    #[test]
+    fn cached_prompt_tokens_are_parsed_when_reported() {
+        let usage_result = serde_json::from_value(json!({
+            "prompt_tokens": 1200,
+            "completion_tokens": 40,
+            "prompt_tokens_details": {"cached_tokens": 900}
+        }));
+        let Ok(usage) = usage_result else {
+            unreachable!("usage fixture parses");
+        };
+        let mut state = stream_state();
+        apply_usage(usage, &mut state);
+        assert_eq!(
+            cached_usage_line(&state).as_deref(),
+            Some("cached 900/1200 prompt tokens")
+        );
+    }
+
+    #[test]
+    fn absent_cached_token_details_produce_no_log_line() {
+        let usage_result = serde_json::from_value(json!({"prompt_tokens": 1200}));
+        let Ok(usage) = usage_result else {
+            unreachable!("usage fixture without details parses");
+        };
+        let mut state = stream_state();
+        apply_usage(usage, &mut state);
+        assert!(cached_usage_line(&state).is_none());
+    }
+
+    #[test]
+    fn request_area_distinguishes_chat_memory_and_dream_calls() {
+        let chat = vec![
+            json!({"role": "system", "content": "chat rules"}),
+            json!({"role": "user", "content": "hello"}),
+        ];
+        let memory = vec![json!({"role": "user", "content": "## Your role\nextract"})];
+        let dream = vec![json!({
+            "role": "user",
+            "content": "## Current memory graph\nnodes: []"
+        })];
+        assert_eq!(request_area(&chat), "chat");
+        assert_eq!(request_area(&memory), "mem");
+        assert_eq!(request_area(&dream), "dream");
+    }
 }

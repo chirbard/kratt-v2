@@ -77,8 +77,12 @@ When unsure, answer CHAT."#;
 // chat in the same session is not forced into the episodic path.
 const ACTIVE_TASK_HINT: &str = "\n\nThis session has an ongoing task with moves already recorded. If this turn contains a new move — even wrapped in discussion — answer TASK. Discussion ABOUT the task with no new move in it (rules, legality, corrections, questions) is knowledge, not a move: answer CHAT.";
 
+const AGENT_SYSTEM_FRAMING: &str = "You are one agent in a memory system; the rules below are shared by all agents, and your specific role is defined in the `## Your role` section near the end.";
+
 pub fn build_classify_prompt(user_msg: &str, assistant_msg: &str, active_task: bool) -> String {
     let mut prompt = String::new();
+    prompt.push_str(AGENT_SYSTEM_FRAMING);
+    prompt.push_str("\n\n## Your role\n\n");
     prompt.push_str(CLASSIFY_TURN);
     if active_task {
         prompt.push_str(ACTIVE_TASK_HINT);
@@ -174,15 +178,34 @@ fn append_tool_definitions(prompt: &mut String, definitions: &str) {
     prompt.push_str(PING_POLICY_TOOL_DEFINITION);
 }
 
-pub fn build_scribe_prompt(user_msg: &str, assistant_msg: &str) -> String {
-    let mut prompt = String::new();
-    prompt.push_str(SCRIBE_EXPLANATION);
-    prompt.push_str("\n\n**Today's date: ");
-    prompt.push_str(&today_iso());
-    prompt.push_str("**\n\n");
+fn push_shared_agent_head(prompt: &mut String, definitions: &str, include_memory_rules: bool) {
+    prompt.push_str(AGENT_SYSTEM_FRAMING);
+    prompt.push_str("\n\n");
     prompt.push_str(JSON_OUTPUT_RULES);
     prompt.push_str("\n\n");
-    append_tool_definitions(&mut prompt, SCRIBE_TOOL_DEFINITIONS);
+    append_tool_definitions(prompt, definitions);
+    if include_memory_rules {
+        prompt.push_str("\n\n");
+        prompt.push_str(MEMORY_RULES);
+    }
+}
+
+fn push_prompt_date(prompt: &mut String) {
+    prompt.push_str("\n\n**Today's date: ");
+    prompt.push_str(&today_iso());
+    prompt.push_str("**");
+}
+
+fn push_role(prompt: &mut String, explanation: &str) {
+    prompt.push_str("\n\n## Your role\n\n");
+    prompt.push_str(explanation);
+}
+
+pub fn build_scribe_prompt(user_msg: &str, assistant_msg: &str) -> String {
+    let mut prompt = String::new();
+    push_shared_agent_head(&mut prompt, SCRIBE_TOOL_DEFINITIONS, false);
+    push_prompt_date(&mut prompt);
+    push_role(&mut prompt, SCRIBE_EXPLANATION);
     prompt.push_str("\n\n## Exchange to record\n\nUser: ");
     prompt.push_str(user_msg);
     prompt.push_str("\nAssistant: ");
@@ -281,19 +304,12 @@ pub struct AgentPrompt<'scope> {
 
 pub fn build_agent_prompt(input: &AgentPrompt) -> String {
     let mut prompt = String::new();
-    prompt.push_str(input.explanation);
-    prompt.push_str("\n\n**Today's date: ");
-    prompt.push_str(&today_iso());
-    prompt.push_str("**");
-    prompt.push_str("\n\n");
-    prompt.push_str(JSON_OUTPUT_RULES);
-    prompt.push_str("\n\n");
-    append_tool_definitions(&mut prompt, TOOL_DEFINITIONS);
-    prompt.push_str("\n\n");
-    prompt.push_str(MEMORY_RULES);
+    push_shared_agent_head(&mut prompt, TOOL_DEFINITIONS, true);
+    push_prompt_date(&mut prompt);
     prompt.push_str("\n\n## Current memory state\n\n");
     prompt.push_str(input.toon);
     push_injected_section(&mut prompt, input.injected_toon);
+    push_role(&mut prompt, input.explanation);
     if let Some(game) = input.active_game {
         prompt.push_str("\n\n## Active game\n\nThis session is playing: ");
         prompt.push_str(game);
@@ -334,19 +350,29 @@ pub fn build_continue_prompt(
     applied: &[String],
 ) -> String {
     let mut prompt = String::new();
-    prompt.push_str(explanation);
-    prompt.push_str("\n\n");
+    push_shared_agent_head(&mut prompt, TOOL_DEFINITIONS, true);
+    push_prompt_date(&mut prompt);
+    push_role(&mut prompt, explanation);
+    push_exchange(&mut prompt, "being processed", user_msg, assistant_msg);
+    push_continue_tail(&mut prompt, "Already applied", applied);
+    prompt
+}
+
+fn push_exchange(prompt: &mut String, label: &str, user_msg: &str, assistant_msg: &str) {
+    prompt.push_str("\n\n## Exchange ");
+    prompt.push_str(label);
+    prompt.push_str("\n\nUser: ");
+    prompt.push_str(user_msg);
+    prompt.push_str("\nAssistant: ");
+    prompt.push_str(assistant_msg);
+}
+
+fn push_continue_tail(prompt: &mut String, heading: &str, applied: &[String]) {
+    prompt.push_str("\n\n## Continue pass\n\n");
     prompt.push_str(CONTINUE_PASS);
-    prompt.push_str("\n\n**Today's date: ");
-    prompt.push_str(&today_iso());
-    prompt.push_str("**");
+    prompt.push_str("\n\n## ");
+    prompt.push_str(heading);
     prompt.push_str("\n\n");
-    prompt.push_str(JSON_OUTPUT_RULES);
-    prompt.push_str("\n\n");
-    append_tool_definitions(&mut prompt, TOOL_DEFINITIONS);
-    prompt.push_str("\n\n");
-    prompt.push_str(MEMORY_RULES);
-    prompt.push_str("\n\n## Already applied\n\n");
     if applied.is_empty() {
         prompt.push_str("(nothing)");
     }
@@ -355,11 +381,6 @@ pub fn build_continue_prompt(
         prompt.push_str(description);
         prompt.push('\n');
     }
-    prompt.push_str("\n## Exchange being processed\n\nUser: ");
-    prompt.push_str(user_msg);
-    prompt.push_str("\nAssistant: ");
-    prompt.push_str(assistant_msg);
-    prompt
 }
 
 pub const DREAM_BIOLOGIST: &str = r#"You are a biologist analyzing a knowledge graph. You have deep expertise in biology, ecology, and living systems. You know nothing about the domain the graph describes — you see only biological patterns.
@@ -468,28 +489,11 @@ pub fn build_scribe_continue_prompt(
     applied: &[String],
 ) -> String {
     let mut prompt = String::new();
-    prompt.push_str(explanation);
-    prompt.push_str("\n\n");
-    prompt.push_str(CONTINUE_PASS);
-    prompt.push_str("\n\n**Today's date: ");
-    prompt.push_str(&today_iso());
-    prompt.push_str("**\n\n");
-    prompt.push_str(JSON_OUTPUT_RULES);
-    prompt.push_str("\n\n");
-    append_tool_definitions(&mut prompt, SCRIBE_TOOL_DEFINITIONS);
-    prompt.push_str("\n\n## Already recorded\n\n");
-    if applied.is_empty() {
-        prompt.push_str("(nothing)");
-    }
-    for description in applied {
-        prompt.push_str("- ");
-        prompt.push_str(description);
-        prompt.push('\n');
-    }
-    prompt.push_str("\n## Exchange being recorded\n\nUser: ");
-    prompt.push_str(user_msg);
-    prompt.push_str("\nAssistant: ");
-    prompt.push_str(assistant_msg);
+    push_shared_agent_head(&mut prompt, SCRIBE_TOOL_DEFINITIONS, false);
+    push_prompt_date(&mut prompt);
+    push_role(&mut prompt, explanation);
+    push_exchange(&mut prompt, "to record", user_msg, assistant_msg);
+    push_continue_tail(&mut prompt, "Already recorded", applied);
     prompt
 }
 
@@ -653,17 +657,11 @@ pub fn build_ingestion_prompt(
 
 pub fn build_dream_prompt(explanation: &str, toon: &str, context: Option<&str>) -> String {
     let mut prompt = String::new();
-    prompt.push_str(explanation);
-    prompt.push_str("\n\n**Today's date: ");
-    prompt.push_str(&today_iso());
-    prompt.push_str("**\n\n");
-    prompt.push_str(JSON_OUTPUT_RULES);
-    prompt.push_str("\n\n");
-    append_tool_definitions(&mut prompt, TOOL_DEFINITIONS);
-    prompt.push_str("\n\n");
-    prompt.push_str(MEMORY_RULES);
+    push_shared_agent_head(&mut prompt, TOOL_DEFINITIONS, true);
+    push_prompt_date(&mut prompt);
     prompt.push_str("\n\n## Current memory graph\n\n");
     prompt.push_str(toon);
+    push_role(&mut prompt, explanation);
     if let Some(ctx) = context {
         prompt.push_str("\n\n## Proposals from previous agents\n\n");
         prompt.push_str(ctx);
@@ -697,8 +695,13 @@ pub fn build_chat_system_prompt(
     recent_entries: &[RecentEntry],
     pressure: Option<&str>,
     sequence: Option<&str>,
+    style_hint: Option<&str>,
 ) -> String {
     let mut prompt = String::from(CHAT_SYSTEM_PROMPT);
+    if let Some(hint) = style_hint {
+        prompt.push_str("\n\n");
+        prompt.push_str(hint);
+    }
     prompt.push_str("\nToday's date is ");
     prompt.push_str(&today_iso());
     prompt.push('.');
@@ -797,8 +800,10 @@ mod tests {
     }
 
     use super::{
-        AgentPrompt, CHAT_SYSTEM_PROMPT, DAILY_REPORT, EXTRACT_EXPLANATION, build_agent_prompt,
-        build_chat_system_prompt, build_continue_prompt, build_scribe_prompt,
+        AgentPrompt, CHAT_SYSTEM_PROMPT, CONSOLIDATE_EXPLANATION, CONTINUE_PASS, DAILY_REPORT,
+        DREAM_BIOLOGIST, EXTRACT_EXPLANATION, JSON_OUTPUT_RULES, SCRIBE_EXPLANATION,
+        build_agent_prompt, build_chat_system_prompt, build_classify_prompt, build_continue_prompt,
+        build_dream_prompt, build_scribe_continue_prompt, build_scribe_prompt,
     };
 
     const INJECTED_HEADING: &str = "## Beliefs injected into this turn";
@@ -813,6 +818,127 @@ mod tests {
             injected_toon,
             active_game: None,
         })
+    }
+
+    fn position(prompt: &str, needle: &str) -> usize {
+        prompt.find(needle).unwrap_or(usize::MAX)
+    }
+
+    fn common_prefix_len(left: &str, right: &str) -> usize {
+        let left_bytes = left.as_bytes();
+        let right_bytes = right.as_bytes();
+        let limit = left_bytes.len().min(right_bytes.len());
+        for index in 0..limit {
+            if left_bytes[index] != right_bytes[index] {
+                return index;
+            }
+        }
+        limit
+    }
+
+    #[test]
+    fn heavy_prompt_orders_shared_graph_before_role_and_exchange() {
+        let prompt = prompt_with(Some("injected edge"));
+        assert!(
+            position(&prompt, JSON_OUTPUT_RULES) < position(&prompt, "## Current memory state")
+        );
+        assert!(
+            position(&prompt, "## Current memory state")
+                < position(&prompt, "\n\n## Your role\n\n")
+        );
+        assert!(
+            position(&prompt, "\n\n## Your role\n\n") < position(&prompt, "## Exchange to process")
+        );
+    }
+
+    #[test]
+    fn extract_and_consolidate_share_prefix_through_graph_toon() {
+        let toon = "nodes: [shared graph]\nedges: [a -> b]";
+        let extract = build_agent_prompt(&AgentPrompt {
+            explanation: EXTRACT_EXPLANATION,
+            toon,
+            user_msg: "user",
+            assistant_msg: "assistant",
+            diff_text: None,
+            injected_toon: None,
+            active_game: None,
+        });
+        let consolidate = build_agent_prompt(&AgentPrompt {
+            explanation: CONSOLIDATE_EXPLANATION,
+            toon,
+            user_msg: "user",
+            assistant_msg: "assistant",
+            diff_text: Some("+ a -> b"),
+            injected_toon: None,
+            active_game: None,
+        });
+        let toon_end = position(&extract, toon) + toon.len();
+        assert!(common_prefix_len(&extract, &consolidate) >= toon_end);
+    }
+
+    #[test]
+    fn dream_prompt_orders_shared_graph_before_role_and_context() {
+        let prompt = build_dream_prompt(DREAM_BIOLOGIST, "shared toon", Some("prior proposals"));
+        assert!(
+            position(&prompt, JSON_OUTPUT_RULES) < position(&prompt, "## Current memory graph")
+        );
+        assert!(
+            position(&prompt, "## Current memory graph")
+                < position(&prompt, "\n\n## Your role\n\n")
+        );
+        assert!(
+            position(&prompt, "\n\n## Your role\n\n")
+                < position(&prompt, "## Proposals from previous agents")
+        );
+    }
+
+    #[test]
+    fn scribe_and_classifier_put_role_after_the_shared_framing() {
+        let scribe = build_scribe_prompt("user", "assistant");
+        assert!(position(&scribe, JSON_OUTPUT_RULES) < position(&scribe, "\n\n## Your role\n\n"));
+        assert!(
+            position(&scribe, "\n\n## Your role\n\n") < position(&scribe, "## Exchange to record")
+        );
+        let classify = build_classify_prompt("user", "assistant", false);
+        assert!(classify.starts_with(super::AGENT_SYSTEM_FRAMING));
+        assert!(position(&classify, "\n\n## Your role\n\n") < position(&classify, "## Exchange"));
+    }
+
+    #[test]
+    fn scribe_continue_extends_first_prompt_after_the_exchange() {
+        let initial = build_scribe_prompt("user", "assistant");
+        let applied = vec!["record_move: e4".to_string()];
+        let continuation =
+            build_scribe_continue_prompt(SCRIBE_EXPLANATION, "user", "assistant", &applied);
+        assert!(continuation.starts_with(&initial));
+        assert!(
+            position(&continuation, "## Exchange to record")
+                < position(&continuation, CONTINUE_PASS)
+        );
+        assert!(
+            position(&continuation, CONTINUE_PASS) < position(&continuation, "## Already recorded")
+        );
+    }
+
+    #[test]
+    fn heavy_continue_keeps_applied_calls_at_the_tail() {
+        let applied = vec!["upsert_edge: a -> b".to_string()];
+        let prompt = build_continue_prompt(EXTRACT_EXPLANATION, "user", "assistant", &applied);
+        assert!(
+            position(&prompt, "## Exchange being processed") < position(&prompt, CONTINUE_PASS)
+        );
+        assert!(position(&prompt, CONTINUE_PASS) < position(&prompt, "## Already applied"));
+        assert!(prompt.trim_end().ends_with("upsert_edge: a -> b"));
+    }
+
+    #[test]
+    fn chat_style_hint_is_static_head_content() {
+        let hint = "Keep replies narrow enough for a phone.";
+        let with = build_chat_system_prompt("remembered fact", &[], None, None, Some(hint));
+        assert!(position(&with, hint) < position(&with, "Today's date is"));
+        assert!(position(&with, hint) < position(&with, "\n\n<memory>\n"));
+        let without = build_chat_system_prompt("remembered fact", &[], None, None, None);
+        assert!(!without.contains(hint));
     }
 
     #[test]
@@ -848,18 +974,19 @@ mod tests {
                 "Internal state: 30 unconsolidated experience events since the last dream (a dream is forced at 50).",
             ),
             None,
+            None,
         );
         assert!(with.contains("Internal state: 30 unconsolidated"));
-        let without = build_chat_system_prompt("", &[], None, None);
+        let without = build_chat_system_prompt("", &[], None, None, None);
         assert!(!without.contains("Internal state:"));
     }
 
     #[test]
     fn chat_prompt_carries_the_sequence_line_only_when_present() {
         let line = "Sequence memory: after rust, this user has previously moved on to sqlite (unprompted continuations: 2.0).";
-        let with = build_chat_system_prompt("", &[], None, Some(line));
+        let with = build_chat_system_prompt("", &[], None, Some(line), None);
         assert!(with.contains(line));
-        let without = build_chat_system_prompt("", &[], None, None);
+        let without = build_chat_system_prompt("", &[], None, None, None);
         assert!(!without.contains("Sequence memory:"));
     }
 
