@@ -76,16 +76,13 @@ pub(crate) fn prepare_stream_context(
     if let Some(line) = &pressure {
         crate::runlog::log("chat", &format!("pressure: {line}"));
     }
-    let mut system = prompts::build_chat_system_prompt(
+    let system = prompts::build_chat_system_prompt(
         &memory.block,
         &recent_entries,
         pressure.as_deref(),
         sequence.as_deref(),
+        ctx.style_hint,
     );
-    if let Some(hint) = ctx.style_hint {
-        system.push_str("\n\n");
-        system.push_str(hint);
-    }
     let system_opt = if system.is_empty() {
         None
     } else {
