@@ -74,10 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Some(Arc::new(web::new_search_client(tavily_key)))
     };
-    memory::sync_pull_best_effort();
-    if let Err(err) = memory::db_init() {
-        eprintln!("warning: db init failed: {err}");
-    }
+    initialize_database()?;
     let (embed_tx, _embed_rx) = std::sync::mpsc::channel::<memory::MemoryEvent>();
     memory::run_embed_pass(Arc::clone(&embed), &embed_tx);
     // Same binary, two faces: --telegram runs the headless gateway daemon, no
@@ -90,6 +87,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     memory::sync_push_best_effort("app exit");
     result
+}
+
+fn initialize_database() -> Result<(), Box<dyn std::error::Error>> {
+    if let Err(err) = memory::startup_database() {
+        return Err(format!("startup database recovery failed: {err}").into());
+    }
+    if let Err(err) = memory::db_init() {
+        return Err(format!("db init failed: {err}").into());
+    }
+    Ok(())
 }
 
 fn telegram_mode() -> bool {

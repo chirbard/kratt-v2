@@ -23,7 +23,7 @@ pub use agent::{MemoryEvent, MemorySeats, run_memory_agent};
 pub(crate) use agent::{classify_reply_label, describe_tool_call, parse_tool_calls};
 pub use db::{
     db_init, insert_message, last_sync_error, latest_session_id, read_message_context,
-    register_session, search_messages_fts, sync_now, sync_pull_best_effort, sync_push_best_effort,
+    register_session, search_messages_fts, startup_database, sync_now, sync_push_best_effort,
 };
 pub(crate) use db::{Finding, InboxItem, acquire_write_lock, oldest_queued_inbox, open_connection, resolve_inbox_item};
 pub(crate) use db::{
