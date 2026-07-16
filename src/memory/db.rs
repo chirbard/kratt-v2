@@ -10,7 +10,7 @@ use turso::{Builder, Connection, Database, Value, params};
 
 use super::graph::{
     Edge, Graph, Node, PROVENANCE_DREAMED, PROVENANCE_LEGACY, PROVENANCE_USER_CONFIRMED,
-    PROVENANCE_WEB_SURFACED, edge_ceiling, load_from_toon, normalize_id,
+    PROVENANCE_WEB_SURFACED, edge_ceiling, load_from_toon, normalize_id, stability_seed_max,
 };
 use super::loops::OpenLoop;
 
@@ -1696,6 +1696,7 @@ pub(crate) fn record_news_graph_material(
     let target_id = format!("news-finding-{finding_id}");
     let content = format!("{} — {}", item.title, item.snippet);
     let json_str = vector32_json(embedding)?;
+    let stability = stability_seed_max(PROVENANCE_WEB_SURFACED);
     block_on(async {
         conn.execute(
             "INSERT OR REPLACE INTO nodes (id, node_type, body, date)
@@ -1707,11 +1708,12 @@ pub(crate) fn record_news_graph_material(
             "INSERT OR REPLACE INTO edges
              (source, target, content, stability, confidence, importance, subject, date,
               occurred_at, memory_type, origin_session, provenance, embedding)
-             VALUES (?1, ?2, ?3, 1.0, 0.5, 0.4, 0, ?4, ?4, 'episodic', ?5, 'web-surfaced', vector32(?6))",
+             VALUES (?1, ?2, ?3, ?4, 0.5, 0.4, 0, ?5, ?5, 'episodic', ?6, 'web-surfaced', vector32(?7))",
             params![
                 interest.node_id.as_str(),
                 target_id.as_str(),
                 content.as_str(),
+                stability,
                 timestamp.as_str(),
                 session_id.as_str(),
                 json_str.as_str()
@@ -2017,6 +2019,7 @@ pub fn load_task_chain(
     })
 }
 
+#[allow(dead_code)]
 pub fn update_edge_confidence(
     conn: &Connection,
     source: &str,
@@ -2028,6 +2031,30 @@ pub fn update_edge_confidence(
     ))
 }
 
+pub fn update_edge_reinforcement(
+    conn: &Connection,
+    edge: &Edge,
+    confidence: f64,
+    stability: f64,
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    runtime().block_on(async {
+        let changed = conn
+            .execute(
+                "UPDATE edges SET confidence = ?1, stability = ?2
+                 WHERE source = ?3 AND target = ?4 AND expired_at IS NULL",
+                params![
+                    clamped_confidence(confidence, &edge.provenance, edge.ceiling),
+                    round2(stability.clamp(0.0, 1.0)),
+                    edge.source.as_str(),
+                    edge.target.as_str()
+                ],
+            )
+            .await?;
+        Ok(changed > 0)
+    })
+}
+
+#[allow(dead_code)]
 async fn update_edge_confidence_async(
     conn: &Connection,
     source: &str,

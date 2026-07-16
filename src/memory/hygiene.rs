@@ -5,6 +5,7 @@
 // graph's reversible tombstone.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::error::Error;
 
 use turso::{Connection, params};
@@ -15,6 +16,11 @@ use super::ledger::{self, Actor, EdgeRef, Event, EventContext};
 
 // Enough examples to recognise the pattern in a log line, not a full dump.
 const MAX_REPORTED_EXAMPLES: usize = 10; // replay-tunable
+const W_INTEREST: f64 = 0.4; // replay-tunable.
+const W_RECENCY: f64 = 0.4; // replay-tunable.
+const W_DENSITY: f64 = 0.2; // replay-tunable.
+const RECENCY_HALF_LIFE_DAYS: f64 = 14.0; // replay-tunable.
+const DENSITY_SATURATION: usize = 10; // replay-tunable.
 
 #[derive(Default)]
 pub struct HygieneReport {
@@ -109,7 +115,166 @@ async fn apply_fixes(
     report.expired_orphan_edges = expire_orphan_edges(conn, &mut events).await?;
     report.clamped_edges = clamp_edge_weights(conn).await?;
     fix_subject_edges(conn, report).await?;
+    run_importance_pass(conn).await?;
     ledger::record_events_in_tx(conn, &events).await
+}
+
+struct ImportanceSignal {
+    source: String,
+    target: String,
+    embedding: Option<Vec<f64>>,
+    days_since_touch: Option<f64>,
+}
+
+pub(crate) async fn run_importance_pass(
+    conn: &Connection,
+) -> Result<usize, Box<dyn Error + Send + Sync>> {
+    let interests = load_interest_embeddings(conn).await?;
+    let signals = load_importance_signals(conn).await?;
+    let _timer =
+        crate::runlog::time_step("importance", format!("recomputed {} edges", signals.len()));
+    for signal in &signals {
+        let alignment = max_alignment(signal.embedding.as_deref(), &interests);
+        let recency = match signal.days_since_touch {
+            Some(days) => recency_score(days),
+            None => 0.0,
+        };
+        let density = neighbourhood_density(signal, &signals);
+        let importance = importance_score(alignment, recency, density);
+        conn.execute(
+            "UPDATE edges SET importance = ?1
+             WHERE source = ?2 AND target = ?3 AND expired_at IS NULL",
+            params![importance, signal.source.as_str(), signal.target.as_str()],
+        )
+        .await?;
+    }
+    Ok(signals.len())
+}
+
+async fn load_interest_embeddings(
+    conn: &Connection,
+) -> Result<Vec<Vec<f64>>, Box<dyn Error + Send + Sync>> {
+    let interests = db::top_interests_with(conn, usize::MAX).await?;
+    let mut ids: HashSet<String> = HashSet::new();
+    for interest in interests {
+        ids.insert(interest.node_id);
+    }
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut rows = conn
+        .query(
+            "SELECT id, vector_extract(embedding) FROM nodes WHERE embedding IS NOT NULL",
+            (),
+        )
+        .await?;
+    let mut embeddings = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let node_id = db::text(row.get_value(0)?);
+        if !ids.contains(&node_id) {
+            continue;
+        }
+        let vector_text = db::text(row.get_value(1)?);
+        if let Ok(vector) = db::parse_vector32_json(&vector_text) {
+            embeddings.push(vector);
+        }
+    }
+    Ok(embeddings)
+}
+
+async fn load_importance_signals(
+    conn: &Connection,
+) -> Result<Vec<ImportanceSignal>, Box<dyn Error + Send + Sync>> {
+    let mut rows = conn
+        .query(
+            "SELECT e.source, e.target,
+                    CASE WHEN e.embedding IS NULL THEN '' ELSE vector_extract(e.embedding) END,
+                    julianday('now') - julianday(MAX(ev.ts))
+             FROM edges e
+             LEFT JOIN events ev ON ev.source = e.source AND ev.target = e.target
+                  AND ev.event_type IN ('reinforced', 'injected', 'created')
+             WHERE e.expired_at IS NULL
+             GROUP BY e.source, e.target, e.embedding",
+            (),
+        )
+        .await?;
+    let mut signals = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let vector_text = db::text(row.get_value(2)?);
+        let embedding = db::parse_vector32_json(&vector_text).ok();
+        let days_since_touch = match row.get_value(3)? {
+            turso::Value::Real(value) => Some(value.max(0.0)),
+            turso::Value::Integer(value) => Some((value as f64).max(0.0)),
+            _ => None,
+        };
+        signals.push(ImportanceSignal {
+            source: db::text(row.get_value(0)?),
+            target: db::text(row.get_value(1)?),
+            embedding,
+            days_since_touch,
+        });
+    }
+    Ok(signals)
+}
+
+fn max_alignment(edge: Option<&[f64]>, interests: &[Vec<f64>]) -> f64 {
+    let Some(edge_embedding) = edge else {
+        return 0.0;
+    };
+    let mut alignment: f64 = 0.0;
+    for interest in interests {
+        alignment = alignment.max(cosine_similarity(edge_embedding, interest).max(0.0));
+    }
+    alignment.min(1.0)
+}
+
+fn neighbourhood_density(signal: &ImportanceSignal, signals: &[ImportanceSignal]) -> f64 {
+    let Some(edge_embedding) = signal.embedding.as_deref() else {
+        return 0.0;
+    };
+    let mut neighbours = 0usize;
+    for candidate in signals {
+        if candidate.source == signal.source && candidate.target == signal.target {
+            continue;
+        }
+        let Some(candidate_embedding) = candidate.embedding.as_deref() else {
+            continue;
+        };
+        let distance = 1.0 - cosine_similarity(edge_embedding, candidate_embedding);
+        if distance <= db::INTEREST_NEIGHBOUR_DISTANCE {
+            neighbours += 1;
+        }
+    }
+    neighbours.min(DENSITY_SATURATION) as f64 / DENSITY_SATURATION as f64
+}
+
+fn cosine_similarity(left: &[f64], right: &[f64]) -> f64 {
+    if left.len() != right.len() || left.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0;
+    let mut left_norm = 0.0;
+    let mut right_norm = 0.0;
+    let mut index = 0usize;
+    while index < left.len() {
+        dot += left[index] * right[index];
+        left_norm += left[index] * left[index];
+        right_norm += right[index] * right[index];
+        index += 1;
+    }
+    let denominator = left_norm.sqrt() * right_norm.sqrt();
+    if denominator == 0.0 {
+        return 0.0;
+    }
+    dot / denominator
+}
+
+fn recency_score(days_since_touch: f64) -> f64 {
+    (-days_since_touch.max(0.0) / RECENCY_HALF_LIFE_DAYS).exp()
+}
+
+fn importance_score(alignment: f64, recency: f64, density: f64) -> f64 {
+    db::round2((W_INTEREST * alignment + W_RECENCY * recency + W_DENSITY * density).clamp(0.0, 1.0))
 }
 
 async fn collect_reports(
@@ -369,11 +534,14 @@ async fn count_sessionless_episodic(
 
 #[cfg(test)]
 mod tests {
-    use super::{HygieneReport, collapse_separators, run_hygiene};
+    use super::{
+        HygieneReport, collapse_separators, importance_score, recency_score, run_hygiene,
+        run_importance_pass,
+    };
     use crate::memory::db;
     use turso::{Builder, Connection, params};
 
-    const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
+    const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '', origin TEXT NOT NULL DEFAULT '', embedding BLOB)";
     const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', ceiling REAL, embedding BLOB, PRIMARY KEY (source, target))";
     const EVENTS_DDL: &str = "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')";
     // record_events_in_tx also writes actor views and positions.
@@ -500,6 +668,69 @@ mod tests {
     }
 
     #[test]
+    fn importance_blend_and_recency_follow_the_declared_formula() {
+        assert_eq!(importance_score(0.0, 0.0, 0.0), 0.0);
+        assert_eq!(importance_score(1.0, 1.0, 1.0), 1.0);
+        assert_eq!(importance_score(1.0, 0.0, 0.0), 0.4);
+        assert!((recency_score(14.0) - (-1.0_f64).exp()).abs() < 1e-9);
+        assert_eq!(importance_score(0.0, recency_score(0.0), 0.0), 0.4);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn importance_pass_combines_interest_recency_and_missing_embeddings() {
+        let conn = db::block_on(harness());
+        db::block_on(async {
+            for node_id in [
+                "interest-rust",
+                "near",
+                "near-target",
+                "far",
+                "far-target",
+                "plain",
+                "plain-target",
+            ] {
+                add_node(&conn, node_id, "entity").await;
+            }
+            let _ = conn
+                .execute(
+                    "UPDATE nodes SET node_type = 'interest', body = 'Rust', origin = 'user',
+                         embedding = vector32('[1.0,0.0]') WHERE id = 'interest-rust'",
+                    (),
+                )
+                .await;
+            let _ = conn
+                .execute(
+                    "INSERT INTO edges (source, target, embedding)
+                     VALUES ('near', 'near-target', vector32('[1.0,0.0]')),
+                            ('far', 'far-target', vector32('[0.0,1.0]')),
+                            ('plain', 'plain-target', NULL)",
+                    (),
+                )
+                .await;
+            let _ = conn
+                .execute(
+                    "INSERT INTO events (ts, event_type, source, target)
+                     VALUES (datetime('now'), 'created', 'near', 'near-target'),
+                            (datetime('now', '-60 days'), 'created', 'far', 'far-target'),
+                            (datetime('now'), 'injected', 'plain', 'plain-target')",
+                    (),
+                )
+                .await;
+            let count = run_importance_pass(&conn).await.unwrap_or_default();
+            assert_eq!(count, 3);
+        });
+        let near = db::block_on(edge_weights(&conn, "near", "near-target")).2;
+        let far = db::block_on(edge_weights(&conn, "far", "far-target")).2;
+        let plain = db::block_on(edge_weights(&conn, "plain", "plain-target")).2;
+        assert!(near > plain);
+        assert!(plain > far);
+        assert_eq!(plain, 0.4);
+        assert_eq!(near, db::round2(near));
+        assert_eq!(far, db::round2(far));
+    }
+
+    #[test]
     fn orphan_edges_are_expired_and_intact_edges_are_left_alone() {
         let conn = db::block_on(harness());
         db::block_on(add_node(&conn, "alice", "entity"));
@@ -540,7 +771,7 @@ mod tests {
         assert!(db::block_on(expired_at_of(&conn, "ask-about-backup", "backup")).is_none());
         assert_eq!(
             db::block_on(edge_weights(&conn, "ask-about-backup", "backup")),
-            (0.9, 0.9, 1.0)
+            (0.9, 0.9, 0.0)
         );
     }
 
@@ -561,12 +792,12 @@ mod tests {
         assert_eq!(report.clamped_edges, 1);
         assert_eq!(
             db::block_on(edge_weights(&conn, "alice", "berlin")),
-            (0.5, 0.0, 0.5)
+            (0.5, 0.0, 0.0)
         );
-        // In-range edge untouched.
+        // Confidence and stability were already in range; salience is recomputed.
         assert_eq!(
             db::block_on(edge_weights(&conn, "carol", "berlin")),
-            (0.5, 0.5, 0.5)
+            (0.5, 0.5, 0.0)
         );
     }
 
@@ -602,7 +833,7 @@ mod tests {
         assert!(report.ambiguous_subject_facts.is_empty());
         assert_eq!(
             db::block_on(subject_of(&conn, "fact-moved", "alice")),
-            (1, 1.0)
+            (1, 0.0)
         );
     }
 
@@ -623,7 +854,7 @@ mod tests {
         );
         assert_eq!(
             db::block_on(subject_of(&conn, "fact-moved", "alice")),
-            (0, 0.5)
+            (0, 0.0)
         );
     }
 
@@ -638,10 +869,10 @@ mod tests {
         let report = hygiene(&conn);
         assert_eq!(report.fixed_subject_edges, 0);
         assert!(report.ambiguous_subject_facts.is_empty());
-        // importance stays at its original value — no corrective write happened.
+        // Subject state stays untouched; nightly salience is still recomputed.
         assert_eq!(
             db::block_on(subject_of(&conn, "fact-moved", "alice")),
-            (1, 0.5)
+            (1, 0.0)
         );
     }
 

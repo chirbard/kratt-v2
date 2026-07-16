@@ -444,7 +444,7 @@ pub const DREAM_CONSOLIDATION: &str = r#"You are the final decision-maker for a 
 You have received proposals from: biologist, historian, economist, child, connector, skeptic, and lateral agents.
 
 Rules:
-- Dream edges are hypotheses, not facts. Set confidence no higher than 0.25. Set stability to 0.3 or lower.
+- Dream edges are hypotheses, not facts. Set confidence no higher than 0.25. Set stability to 0.15 or lower.
 - Prefer precision over coverage. Five solid edges beat twenty speculative ones.
 - If proposals conflict, pick the most defensible or discard both.
 - If the skeptic proposed lower confidence on an existing edge, apply it.

@@ -43,6 +43,15 @@ pub const PROVENANCE_LEGACY: &str = "legacy";
 pub const INFERENCE_DISCOUNT: f64 = 0.9; // replay-tunable.
 pub const SYNTHESIS_DISCOUNT: f64 = 0.9; // replay-tunable.
 
+pub fn stability_seed_max(provenance: &str) -> f64 {
+    match provenance {
+        PROVENANCE_USER_CONFIRMED | PROVENANCE_WEB_CONFIRMED => 0.5, // replay-tunable.
+        PROVENANCE_WEB_SURFACED | PROVENANCE_INFERRED | PROVENANCE_SYNTHESIZED => 0.3, // replay-tunable.
+        PROVENANCE_DREAMED => 0.15, // replay-tunable.
+        _ => 0.3,                   // replay-tunable: legacy and unknown.
+    }
+}
+
 pub fn provenance_ceiling(tier: &str) -> f64 {
     match tier {
         PROVENANCE_USER_CONFIRMED => 1.0, // replay-tunable.
@@ -290,7 +299,8 @@ mod tests {
     use super::{
         PROVENANCE_DREAMED, PROVENANCE_INFERRED, PROVENANCE_LEGACY, PROVENANCE_SYNTHESIZED,
         PROVENANCE_USER_CONFIRMED, PROVENANCE_WEB_CONFIRMED, PROVENANCE_WEB_SURFACED, edge_ceiling,
-        inferred_ceiling, normalize_memory_type, provenance_ceiling, synthesized_ceiling,
+        inferred_ceiling, normalize_memory_type, provenance_ceiling, stability_seed_max,
+        synthesized_ceiling,
     };
 
     #[test]
@@ -322,6 +332,19 @@ mod tests {
         assert_eq!(provenance_ceiling(PROVENANCE_LEGACY), 0.5);
         assert_eq!(provenance_ceiling(""), 0.5);
         assert_eq!(provenance_ceiling("future-tier"), 0.5);
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn provenance_tiers_have_stability_seed_maxima() {
+        assert_eq!(stability_seed_max(PROVENANCE_USER_CONFIRMED), 0.5);
+        assert_eq!(stability_seed_max(PROVENANCE_WEB_CONFIRMED), 0.5);
+        assert_eq!(stability_seed_max(PROVENANCE_WEB_SURFACED), 0.3);
+        assert_eq!(stability_seed_max(PROVENANCE_INFERRED), 0.3);
+        assert_eq!(stability_seed_max(PROVENANCE_SYNTHESIZED), 0.3);
+        assert_eq!(stability_seed_max(PROVENANCE_DREAMED), 0.15);
+        assert_eq!(stability_seed_max(PROVENANCE_LEGACY), 0.3);
+        assert_eq!(stability_seed_max("future-tier"), 0.3);
     }
 
     #[test]

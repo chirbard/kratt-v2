@@ -15,7 +15,7 @@ use super::decay;
 use super::embed::SemanticEdge;
 use super::graph::{
     Edge, Node, PROVENANCE_INFERRED, PROVENANCE_USER_CONFIRMED, graph_to_json, inferred_ceiling,
-    normalize_id,
+    normalize_id, stability_seed_max,
 };
 use super::ledger::{self, Actor, EdgeRef, Event, EventContext};
 
@@ -2166,6 +2166,7 @@ fn apply_upsert_edge<'scope>(
     } else if let Some(stored) = &existing {
         edge.ceiling = stored.ceiling;
     }
+    apply_stability_policy(conn, &existing, options, &mut edge)?;
     db::write_edge(conn, &edge, options.source_message_id)?;
     let event = if options.event_payload.is_empty() {
         Event::upsert(
@@ -2185,6 +2186,47 @@ fn apply_upsert_edge<'scope>(
     };
     events.push(event);
     Ok(format!("upsert_edge: {} → {}", edge.source, edge.target))
+}
+
+const REPEAT_STABILITY_BONUS: f64 = 0.05; // replay-tunable.
+
+fn apply_stability_policy<'scope>(
+    conn: &Connection,
+    existing: &Option<Edge>,
+    options: &ApplyToolOptions<'scope>,
+    edge: &mut Edge,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let loop_anchor = edge_is_loop_anchor(conn, edge)?;
+    let Some(stored) = existing else {
+        if !loop_anchor {
+            edge.stability = edge.stability.min(stability_seed_max(&edge.provenance));
+        }
+        return Ok(());
+    };
+    if loop_anchor || stored.stability >= 1.0 {
+        edge.stability = stored.stability;
+        return Ok(());
+    }
+    if memory_pass_actor(&options.actor.actor_id) && stored.expired_at.is_none() {
+        edge.stability = (edge.stability + REPEAT_STABILITY_BONUS).min(1.0);
+    } else {
+        edge.stability = stored.stability;
+    }
+    Ok(())
+}
+
+fn memory_pass_actor(actor_id: &str) -> bool {
+    matches!(actor_id, "scribe" | "extract" | "consolidate")
+}
+
+fn edge_is_loop_anchor(
+    conn: &Connection,
+    edge: &Edge,
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    let Some(source) = db::load_node(conn, &edge.source)? else {
+        return Ok(false);
+    };
+    Ok(source.node_type == "loop")
 }
 
 // Dreaming's promotion path: an episodic edge that kept being reinforced or
@@ -2616,6 +2658,7 @@ mod tests {
         };
         assert_eq!(edge.provenance, "user-confirmed");
         assert_eq!(edge.confidence, 0.9);
+        assert_eq!(edge.stability, 0.85);
     }
 
     #[test]
@@ -2689,6 +2732,7 @@ mod tests {
         assert_eq!(stored.provenance, "inferred");
         assert_eq!(stored.ceiling, Some(0.81));
         assert_eq!(stored.confidence, 0.81);
+        assert_eq!(stored.stability, 0.3);
 
         let fallback = ToolCall::UpsertEdge {
             source: "fallback".to_string(),
@@ -2708,6 +2752,7 @@ mod tests {
         };
         assert_eq!(stored.provenance, "user-confirmed");
         assert_eq!(stored.ceiling, None);
+        assert_eq!(stored.stability, 0.5);
     }
 
     mod record_move {
@@ -2988,7 +3033,7 @@ mod tests {
             assert!(description.contains("record_rule"), "{description}");
             let rule_edge = edge(&conn, "game-chess", "the-king-moves-one-square");
             assert!((rule_edge.confidence - 0.9).abs() < 1e-9);
-            assert!((rule_edge.stability - 0.9).abs() < 1e-9);
+            assert!((rule_edge.stability - 0.5).abs() < 1e-9);
             assert_eq!(rule_edge.memory_type, "semantic");
         }
 
