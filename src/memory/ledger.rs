@@ -171,6 +171,16 @@ impl Event {
         )
     }
 
+    pub fn promoted(actor: Actor, edge: EdgeRef, context: EventContext, payload: String) -> Self {
+        Self::new(
+            actor,
+            "promoted",
+            edge,
+            context,
+            EventBody::new(1.0, payload),
+        )
+    }
+
     pub fn sequence(
         event_type: &str,
         edge: EdgeRef,
@@ -384,6 +394,7 @@ pub struct AutonomySummary {
     pub actions: usize,
     pub yielded: usize,
     pub news_findings: usize,
+    pub promoted: usize,
     pub positive_reactions: usize,
     pub negative_reactions: usize,
 }
@@ -408,6 +419,14 @@ impl AutonomySummary {
                 "; {} news {} on your interests",
                 self.news_findings, finding_word
             ));
+        }
+        if self.promoted > 0 {
+            let belief_word = if self.promoted == 1 {
+                "belief"
+            } else {
+                "beliefs"
+            };
+            line.push_str(&format!("; {} promoted {}", self.promoted, belief_word));
         }
         let surfaced = self.positive_reactions + self.negative_reactions;
         if surfaced > 0 {
@@ -529,13 +548,37 @@ async fn load_autonomy_summary(
     let (actions, yielded) = count_autonomy_passes(conn, activity, night).await?;
     let (positive_reactions, negative_reactions) = count_reactions(conn, activity, night).await?;
     let news_findings = count_window_findings(conn, activity, night).await;
+    let promoted = count_event_type_windows(conn, activity, night, "promoted").await?;
     Ok(AutonomySummary {
         actions,
         yielded,
         news_findings,
+        promoted,
         positive_reactions,
         negative_reactions,
     })
+}
+
+async fn count_event_type_windows(
+    conn: &Connection,
+    activity: &NightWindow,
+    night: &NightWindow,
+    event_type: &str,
+) -> Result<usize, Box<dyn Error + Send + Sync>> {
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*) FROM events WHERE event_type = ?1
+             AND ((ts >= ?2 AND ts < ?3) OR (ts >= ?4 AND ts < ?5))",
+            params![
+                event_type,
+                activity.from.as_str(),
+                activity.until.as_str(),
+                night.from.as_str(),
+                night.until.as_str()
+            ],
+        )
+        .await?;
+    count_from(&mut rows).await
 }
 
 async fn count_window_findings(
@@ -1852,7 +1895,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
     fn digest_counts_autonomy_yield_and_reactions() {
         let conn = db::block_on(digest_harness());
         db::block_on(async {
@@ -1889,11 +1932,22 @@ mod tests {
             "",
             r#"{"kind":"reaction","reaction":"negative","surfaced":true}"#,
         ));
+        db::block_on(insert_event(
+            &conn,
+            YESTERDAY,
+            "news:2026-07-10",
+            "",
+            "promoted",
+            "known",
+            "fact",
+            r#"{"from":"legacy","to":"web-confirmed"}"#,
+        ));
 
         let digest = digest(&conn, YESTERDAY);
         assert_eq!(digest.autonomy.actions, 3);
         assert_eq!(digest.autonomy.yielded, 1);
         assert_eq!(digest.autonomy.news_findings, 1);
+        assert_eq!(digest.autonomy.promoted, 1);
         assert_eq!(digest.autonomy.positive_reactions, 1);
         assert_eq!(digest.autonomy.negative_reactions, 1);
         let Some(line) = digest.autonomy.line() else {
@@ -1901,6 +1955,7 @@ mod tests {
         };
         assert!(line.contains("1 of 2 surfaced items useful"));
         assert!(line.contains("1 news finding on your interests"));
+        assert!(line.contains("1 promoted belief"));
         assert_eq!(
             digest.held_findings,
             vec!["Compiler news on Rust".to_string()]

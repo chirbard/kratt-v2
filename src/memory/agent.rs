@@ -2069,6 +2069,9 @@ fn apply_upsert_edge<'scope>(
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
     let existing = db::load_edge(conn, &edge.source, &edge.target)?;
     edge.provenance = match &existing {
+        Some(_) if options.provenance == PROVENANCE_USER_CONFIRMED => {
+            PROVENANCE_USER_CONFIRMED.to_string()
+        }
         Some(stored) => stored.provenance.clone(),
         None => options.provenance.to_string(),
     };
@@ -2435,6 +2438,71 @@ mod tests {
         let wrapped = r#"Here are the extracted facts: {"tools":[{"tool":"delete_edge","args":{"source":"a","target":"b"}}]} done."#;
         let calls = parse_tool_calls(wrapped);
         assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn memory_upsert_restamps_an_existing_legacy_edge_as_user_confirmed() {
+        use super::{ApplyToolOptions, apply_tool_call};
+        use crate::memory::db;
+        use crate::memory::graph::Edge;
+        use crate::memory::ledger::{Actor, Event, EventContext};
+        use turso::Builder;
+
+        let conn = db::block_on(async {
+            let Ok(database) = Builder::new_local(":memory:").build().await else {
+                unreachable!("in-memory database builds")
+            };
+            let Ok(conn) = database.connect() else {
+                unreachable!("in-memory database connects")
+            };
+            let _ = conn.execute("CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')", ()).await;
+            let _ = conn.execute("CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', PRIMARY KEY (source, target))", ()).await;
+            conn
+        });
+        let legacy = Edge {
+            source: "rust".to_string(),
+            target: "memory".to_string(),
+            content: "old claim".to_string(),
+            stability: 0.4,
+            confidence: 0.5,
+            importance: 0.4,
+            subject: false,
+            date: String::new(),
+            occurred_at: None,
+            expired_at: None,
+            memory_type: "semantic".to_string(),
+            origin_session: String::new(),
+            provenance: "legacy".to_string(),
+        };
+        assert!(db::write_edge(&conn, &legacy, "old").is_ok());
+        let call = ToolCall::UpsertEdge {
+            source: "rust".to_string(),
+            target: "memory".to_string(),
+            content: "user restated claim".to_string(),
+            stability: 0.8,
+            confidence: 0.9,
+            importance: 0.7,
+            subject: false,
+            date: String::new(),
+            memory_type: Some("semantic".to_string()),
+        };
+        let options = ApplyToolOptions {
+            actor: Actor::new("system", "extract"),
+            context: EventContext::new("chat-1", "turn-1"),
+            source_message_id: "chat-1:user:1",
+            event_payload: "",
+            confidence_cap: None,
+            provenance: "user-confirmed",
+            default_memory_type: "semantic",
+        };
+        let mut events: Vec<Event> = Vec::new();
+        assert!(apply_tool_call(call, &conn, &options, &mut events).is_ok());
+        let Ok(Some(edge)) = db::load_edge(&conn, "rust", "memory") else {
+            unreachable!("re-upserted edge exists")
+        };
+        assert_eq!(edge.provenance, "user-confirmed");
+        assert_eq!(edge.confidence, 0.9);
     }
 
     mod record_move {
