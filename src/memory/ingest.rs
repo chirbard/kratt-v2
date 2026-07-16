@@ -16,13 +16,11 @@ use crate::web::SearchClient;
 use super::agent::{self, ApplyToolOptions, ToolCall};
 use super::db;
 use super::embed::{self, SemanticEdge};
-use super::graph::{Edge, Node, normalize_id};
+use super::graph::{Edge, Node, PROVENANCE_WEB_SURFACED, normalize_id, provenance_ceiling};
 use super::ledger::{self, Actor, EdgeRef, Event, EventContext};
 
 const INGEST_CHUNK_CHARS: usize = 4000; // replay-tunable.
 const INGEST_MAX_FULL_CHUNKS: usize = 25; // replay-tunable.
-const INGEST_DOC_CONFIDENCE_CAP: f64 = 0.75; // replay-tunable.
-const INGEST_WEB_CONFIDENCE_CAP: f64 = 0.5; // replay-tunable.
 const INGEST_SEARCH_BUDGET_DIVISOR: usize = 4; // replay-tunable.
 const INGEST_MAX_TOOL_ROUNDS: usize = 8; // replay-tunable.
 // Graph context per chunk: the full retrieval pool (up to 150 edges) drowns
@@ -393,16 +391,13 @@ fn apply_ingest_mutation<'scope>(
     study: &mut ChunkStudyContext<'scope>,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
     let payload = study.provenance_payload();
-    let confidence_cap = match study.provenance {
-        MutationProvenance::Document => Some(INGEST_DOC_CONFIDENCE_CAP),
-        MutationProvenance::Web { .. } => Some(INGEST_WEB_CONFIDENCE_CAP),
-    };
     let options = ApplyToolOptions {
         actor: Actor::new("agent", "ingestor"),
         context: EventContext::new(study.session_id, study.turn_id),
         source_message_id: study.source_message_id,
         event_payload: &payload,
-        confidence_cap,
+        confidence_cap: Some(provenance_ceiling(PROVENANCE_WEB_SURFACED)),
+        provenance: PROVENANCE_WEB_SURFACED,
         default_memory_type: "semantic",
     };
     agent::apply_tool_call(tool_call, study.conn, &options, study.events)
@@ -541,6 +536,7 @@ fn execute_note_curiosity<'scope>(
         expired_at: None,
         memory_type: "semantic".to_string(),
         origin_session: String::new(),
+        provenance: PROVENANCE_WEB_SURFACED.to_string(),
     };
     let existed = db::load_edge(study.conn, &edge.source, &edge.target)?.is_some();
     db::write_edge(study.conn, &edge, study.source_message_id)?;
@@ -594,6 +590,7 @@ fn record_skipped_chunk(
             expired_at: None,
             memory_type: "semantic".to_string(),
             origin_session: String::new(),
+            provenance: PROVENANCE_WEB_SURFACED.to_string(),
         };
         let existed = db::load_edge(conn, &edge.source, &edge.target)?.is_some();
         db::write_edge(conn, &edge, source_message_id)?;

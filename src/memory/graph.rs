@@ -26,6 +26,21 @@ pub struct Edge {
     // across sessions comes from retrieval scoping (embed.rs), not decay.
     pub memory_type: String,
     pub origin_session: String,
+    pub provenance: String,
+}
+
+pub const PROVENANCE_USER_CONFIRMED: &str = "user-confirmed";
+pub const PROVENANCE_WEB_SURFACED: &str = "web-surfaced";
+pub const PROVENANCE_DREAMED: &str = "dreamed";
+pub const PROVENANCE_LEGACY: &str = "legacy";
+
+pub fn provenance_ceiling(tier: &str) -> f64 {
+    match tier {
+        PROVENANCE_USER_CONFIRMED => 1.0, // replay-tunable.
+        PROVENANCE_WEB_SURFACED => 0.5,   // replay-tunable.
+        PROVENANCE_DREAMED => 0.25,       // replay-tunable.
+        _ => 0.5,                         // replay-tunable: legacy and unknown.
+    }
 }
 
 pub fn normalize_memory_type(raw: &str) -> String {
@@ -124,6 +139,7 @@ fn parse_toon_edge(fields: &[String]) -> Option<Edge> {
         expired_at: None,
         memory_type: "semantic".to_string(),
         origin_session: String::new(),
+        provenance: PROVENANCE_LEGACY.to_string(),
     })
 }
 
@@ -214,6 +230,7 @@ pub fn graph_to_json(graph: &Graph) -> serde_json::Value {
             "expired_at": edge.expired_at,
             "occurred_at": edge.occurred_at,
             "importance": round2(edge.importance),
+            "provenance": edge.provenance,
             "source": edge.source,
             "stability": round2(edge.stability),
             "subject": edge.subject,
@@ -228,7 +245,10 @@ pub fn graph_to_json(graph: &Graph) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_memory_type;
+    use super::{
+        PROVENANCE_DREAMED, PROVENANCE_LEGACY, PROVENANCE_USER_CONFIRMED, PROVENANCE_WEB_SURFACED,
+        normalize_memory_type, provenance_ceiling,
+    };
 
     #[test]
     fn normalize_memory_type_accepts_episodic() {
@@ -245,5 +265,15 @@ mod tests {
         assert_eq!(normalize_memory_type("durable"), "semantic");
         assert_eq!(normalize_memory_type(""), "semantic");
         assert_eq!(normalize_memory_type("Episodic"), "semantic");
+    }
+
+    #[test]
+    fn provenance_tiers_have_structural_ceilings() {
+        assert_eq!(provenance_ceiling(PROVENANCE_USER_CONFIRMED), 1.0);
+        assert_eq!(provenance_ceiling(PROVENANCE_WEB_SURFACED), 0.5);
+        assert_eq!(provenance_ceiling(PROVENANCE_DREAMED), 0.25);
+        assert_eq!(provenance_ceiling(PROVENANCE_LEGACY), 0.5);
+        assert_eq!(provenance_ceiling(""), 0.5);
+        assert_eq!(provenance_ceiling("future-tier"), 0.5);
     }
 }

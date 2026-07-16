@@ -8,7 +8,10 @@ use std::sync::OnceLock;
 use tokio::runtime::Runtime;
 use turso::{Builder, Connection, Database, Value, params};
 
-use super::graph::{Edge, Graph, Node, load_from_toon, normalize_id};
+use super::graph::{
+    Edge, Graph, Node, PROVENANCE_DREAMED, PROVENANCE_LEGACY, PROVENANCE_USER_CONFIRMED,
+    PROVENANCE_WEB_SURFACED, load_from_toon, normalize_id, provenance_ceiling,
+};
 use super::loops::OpenLoop;
 
 use crate::paths;
@@ -24,6 +27,7 @@ pub type SemanticEdgeRow = (
     String,
     Option<String>,
     Option<String>,
+    String,
     String,
     String,
     Option<Vec<f64>>,
@@ -57,6 +61,7 @@ pub(crate) struct RecentLearning {
     pub target: String,
     pub event_type: String,
     pub timestamp: String,
+    pub provenance: String,
 }
 
 #[derive(Clone, Debug)]
@@ -318,6 +323,7 @@ async fn open_synced_result(
     if migrate_legacy && let Err(err) = migrate_legacy_if_empty(&conn).await {
         return Err(format!("legacy migration failed: {err}").into());
     }
+    let _ = backfill_edge_epistemics(&conn).await?;
     Ok(database)
 }
 
@@ -534,6 +540,7 @@ async fn init_schema(
     create_history_tables(conn, create_fts_index).await?;
     add_interest_node_columns(conn).await;
     add_edge_columns(conn).await;
+    let _ = backfill_edge_epistemics(conn).await?;
     add_ledger_tables(conn).await;
     drop_node_agent_views_table(conn).await;
     Ok(())
@@ -633,7 +640,7 @@ async fn fts_index_exists(conn: &Connection) -> bool {
     matches!(rows.next().await, Ok(Some(_)))
 }
 
-async fn add_edge_provenance_column(conn: &Connection) {
+async fn add_edge_attribution_column(conn: &Connection) {
     let _ = conn
         .execute(
             "ALTER TABLE edges ADD COLUMN source_message_id TEXT NOT NULL DEFAULT ''",
@@ -655,10 +662,153 @@ async fn add_edge_embedding_column(conn: &Connection) {
 }
 
 async fn add_edge_columns(conn: &Connection) {
-    add_edge_provenance_column(conn).await;
+    add_edge_attribution_column(conn).await;
     add_edge_embedding_column(conn).await;
     add_edge_time_columns(conn).await;
     add_edge_memory_type_columns(conn).await;
+    add_edge_epistemics_column(conn).await;
+}
+
+async fn add_edge_epistemics_column(conn: &Connection) {
+    let _ = conn
+        .execute(
+            "ALTER TABLE edges ADD COLUMN provenance TEXT NOT NULL DEFAULT ''",
+            (),
+        )
+        .await;
+}
+
+#[derive(Default)]
+struct EpistemicsBackfill {
+    total: usize,
+    dreamed: usize,
+    web: usize,
+    user: usize,
+    legacy: usize,
+    clamped: usize,
+}
+
+async fn backfill_edge_epistemics(
+    conn: &Connection,
+) -> Result<EpistemicsBackfill, Box<dyn Error + Send + Sync>> {
+    let pending = load_unclassified_edges(conn).await?;
+    let mut summary = EpistemicsBackfill::default();
+    for edge in pending {
+        backfill_one_edge(conn, edge, &mut summary).await?;
+    }
+    log_epistemics_backfill(&summary);
+    Ok(summary)
+}
+
+async fn load_unclassified_edges(
+    conn: &Connection,
+) -> Result<Vec<(String, String, String, f64)>, Box<dyn Error + Send + Sync>> {
+    let mut rows = conn
+        .query(
+            "SELECT source, target, origin_session, confidence FROM edges WHERE provenance = ''",
+            (),
+        )
+        .await?;
+    let mut pending = Vec::new();
+    while let Some(row) = rows.next().await? {
+        pending.push((
+            text(row.get_value(0)?),
+            text(row.get_value(1)?),
+            text(row.get_value(2)?),
+            real(row.get_value(3)?),
+        ));
+    }
+    Ok(pending)
+}
+
+async fn backfill_one_edge(
+    conn: &Connection,
+    edge: (String, String, String, f64),
+    summary: &mut EpistemicsBackfill,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let (source, target, origin_session, confidence) = edge;
+    let provenance = provenance_from_origin_session(&origin_session);
+    let clamped = clamped_confidence(confidence, provenance);
+    conn.execute(
+        "UPDATE edges SET provenance = ?1, confidence = ?2
+         WHERE source = ?3 AND target = ?4 AND provenance = ''",
+        params![provenance, clamped, source, target],
+    )
+    .await?;
+    count_backfill(summary, provenance, confidence);
+    Ok(())
+}
+
+fn log_epistemics_backfill(summary: &EpistemicsBackfill) {
+    if summary.total > 0 {
+        crate::runlog::log(
+            "epistemics",
+            &format!(
+                "[epistemics] backfilled {} edges ({} dreamed, {} web, {} user, {} legacy), clamped {}",
+                summary.total,
+                summary.dreamed,
+                summary.web,
+                summary.user,
+                summary.legacy,
+                summary.clamped
+            ),
+        );
+    }
+}
+
+fn count_backfill(summary: &mut EpistemicsBackfill, provenance: &str, confidence: f64) {
+    summary.total += 1;
+    match provenance {
+        PROVENANCE_DREAMED => summary.dreamed += 1,
+        PROVENANCE_WEB_SURFACED => summary.web += 1,
+        PROVENANCE_USER_CONFIRMED => summary.user += 1,
+        _ => summary.legacy += 1,
+    }
+    if confidence > provenance_ceiling(provenance) {
+        summary.clamped += 1;
+    }
+}
+
+fn provenance_from_origin_session(origin_session: &str) -> &'static str {
+    // Observed/current shapes: dream-<epoch> (older notes also used dream:*),
+    // explore-<epoch>, ingest-<epoch>, news:<date>, tg-<date>, and TUI
+    // timestamps like 2026-07-07T19-26-14. Blank or unknown stays legacy.
+    if origin_session.starts_with("dream-") || origin_session.starts_with("dream:") {
+        return PROVENANCE_DREAMED;
+    }
+    if origin_session.starts_with("news:")
+        || origin_session.starts_with("explore-")
+        || origin_session.starts_with("explore:")
+        || origin_session.starts_with("ingest-")
+        || origin_session.starts_with("ingest:")
+    {
+        return PROVENANCE_WEB_SURFACED;
+    }
+    if origin_session.starts_with("tg-") || timestamp_session_id(origin_session) {
+        return PROVENANCE_USER_CONFIRMED;
+    }
+    PROVENANCE_LEGACY
+}
+
+fn timestamp_session_id(origin_session: &str) -> bool {
+    let bytes = origin_session.as_bytes();
+    bytes.len() >= 10
+        && ascii_digits(bytes, 0, 4)
+        && bytes[4] == b'-'
+        && ascii_digits(bytes, 5, 7)
+        && bytes[7] == b'-'
+        && ascii_digits(bytes, 8, 10)
+}
+
+fn ascii_digits(bytes: &[u8], start: usize, end: usize) -> bool {
+    let mut index = start;
+    while index < end {
+        if !bytes[index].is_ascii_digit() {
+            return false;
+        }
+        index += 1;
+    }
+    true
 }
 
 async fn add_edge_memory_type_columns(conn: &Connection) {
@@ -1182,7 +1332,7 @@ async fn load_nodes(conn: &Connection, graph: &mut Graph) {
 async fn load_edges(conn: &Connection, graph: &mut Graph) {
     let Ok(mut rows) = conn
         .query(
-            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session FROM edges",
+            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session, provenance FROM edges",
             (),
         )
         .await
@@ -1215,6 +1365,7 @@ async fn load_edges(conn: &Connection, graph: &mut Graph) {
             expired_at: optional_text(row.get_value(9).ok()),
             memory_type: text_or(row.get_value(10), "semantic"),
             origin_session: text_or(row.get_value(11), ""),
+            provenance: text_or(row.get_value(12), PROVENANCE_LEGACY),
         });
     }
 }
@@ -1471,6 +1622,10 @@ pub(crate) fn round2(value: f64) -> f64 {
     (value * 100.0).round() / 100.0
 }
 
+fn clamped_confidence(confidence: f64, provenance: &str) -> f64 {
+    round2(confidence.min(provenance_ceiling(provenance)))
+}
+
 pub fn write_edge(
     conn: &Connection,
     edge: &Edge,
@@ -1478,13 +1633,13 @@ pub fn write_edge(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     runtime().block_on(async {
         conn.execute(
-            "INSERT OR REPLACE INTO edges (source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, source_message_id, memory_type, origin_session) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            "INSERT OR REPLACE INTO edges (source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, source_message_id, memory_type, origin_session, provenance) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 edge.source.as_str(),
                 edge.target.as_str(),
                 edge.content.as_str(),
                 round2(edge.stability),
-                round2(edge.confidence),
+                clamped_confidence(edge.confidence, &edge.provenance),
                 round2(edge.importance),
                 edge.subject as i64,
                 edge.date.as_str(),
@@ -1493,6 +1648,7 @@ pub fn write_edge(
                 source_message_id,
                 edge.memory_type.as_str(),
                 edge.origin_session.as_str(),
+                edge.provenance.as_str(),
             ],
         )
         .await?;
@@ -1545,8 +1701,8 @@ pub(crate) fn record_news_graph_material(
         conn.execute(
             "INSERT OR REPLACE INTO edges
              (source, target, content, stability, confidence, importance, subject, date,
-              occurred_at, memory_type, origin_session, embedding)
-             VALUES (?1, ?2, ?3, 1.0, 0.7, 0.4, 0, ?4, ?4, 'episodic', ?5, vector32(?6))",
+              occurred_at, memory_type, origin_session, provenance, embedding)
+             VALUES (?1, ?2, ?3, 1.0, 0.5, 0.4, 0, ?4, ?4, 'episodic', ?5, 'web-surfaced', vector32(?6))",
             params![
                 interest.node_id.as_str(),
                 target_id.as_str(),
@@ -1671,7 +1827,7 @@ pub fn load_game_edges(
     runtime().block_on(async {
         let mut rows = conn
             .query(
-                "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session FROM edges WHERE (source = ?1 OR target = ?1) AND memory_type = 'semantic' AND expired_at IS NULL ORDER BY confidence DESC LIMIT ?2",
+                "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session, provenance FROM edges WHERE (source = ?1 OR target = ?1) AND memory_type = 'semantic' AND expired_at IS NULL ORDER BY confidence DESC LIMIT ?2",
                 params![game_id, cap as i64],
             )
             .await?;
@@ -1840,7 +1996,7 @@ pub fn load_task_chain(
     runtime().block_on(async {
         let mut rows = conn
             .query(
-                "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session FROM edges WHERE source = ?1 AND target LIKE ?2 AND memory_type = 'episodic' AND expired_at IS NULL ORDER BY target DESC LIMIT ?3",
+                "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session, provenance FROM edges WHERE source = ?1 AND target LIKE ?2 AND memory_type = 'episodic' AND expired_at IS NULL ORDER BY target DESC LIMIT ?3",
                 params![hub_id.as_str(), pattern.as_str(), cap as i64],
             )
             .await?;
@@ -1873,10 +2029,17 @@ async fn update_edge_confidence_async(
     target: &str,
     confidence: f64,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    let Some(edge) = load_edge_async(conn, source, target).await? else {
+        return Ok(false);
+    };
     let changed = conn
         .execute(
             "UPDATE edges SET confidence = ?1 WHERE source = ?2 AND target = ?3 AND expired_at IS NULL",
-            params![round2(confidence), source, target],
+            params![
+                clamped_confidence(confidence, &edge.provenance),
+                source,
+                target
+            ],
         )
         .await?;
     Ok(changed > 0)
@@ -1889,7 +2052,7 @@ async fn load_edge_async(
 ) -> Result<Option<Edge>, Box<dyn Error + Send + Sync>> {
     let mut rows = conn
         .query(
-            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session FROM edges WHERE source = ?1 AND target = ?2 LIMIT 1",
+            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session, provenance FROM edges WHERE source = ?1 AND target = ?2 LIMIT 1",
             params![source, target],
         )
         .await?;
@@ -1931,7 +2094,7 @@ async fn load_edges_for_node_async(
 ) -> Result<Vec<Edge>, Box<dyn Error + Send + Sync>> {
     let mut rows = conn
         .query(
-            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session FROM edges WHERE source = ?1 OR target = ?1",
+            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session, provenance FROM edges WHERE source = ?1 OR target = ?1",
             params![node_id],
         )
         .await?;
@@ -2169,7 +2332,7 @@ async fn query_edges_ann(
 ) -> Result<Vec<SemanticEdgeRow>, Box<dyn Error + Send + Sync>> {
     execute_semantic_query(
         conn,
-        "SELECT e.source, e.target, e.content, e.stability, e.confidence, e.importance, e.subject, e.date, e.occurred_at, e.expired_at, e.memory_type, e.origin_session, vector_extract(e.embedding) FROM vector_top_k('edges_vec', vector32(?1), ?2) AS vt JOIN edges AS e ON e.rowid = vt.id LEFT JOIN nodes AS source_node ON source_node.id = e.source LEFT JOIN nodes AS target_node ON target_node.id = e.target WHERE e.expired_at IS NULL AND COALESCE(source_node.node_type, '') NOT IN ('loop', 'interest') AND COALESCE(target_node.node_type, '') NOT IN ('loop', 'interest')",
+        "SELECT e.source, e.target, e.content, e.stability, e.confidence, e.importance, e.subject, e.date, e.occurred_at, e.expired_at, e.memory_type, e.origin_session, e.provenance, vector_extract(e.embedding) FROM vector_top_k('edges_vec', vector32(?1), ?2) AS vt JOIN edges AS e ON e.rowid = vt.id LEFT JOIN nodes AS source_node ON source_node.id = e.source LEFT JOIN nodes AS target_node ON target_node.id = e.target WHERE e.expired_at IS NULL AND COALESCE(source_node.node_type, '') NOT IN ('loop', 'interest') AND COALESCE(target_node.node_type, '') NOT IN ('loop', 'interest')",
         json_str,
         limit,
     )
@@ -2183,7 +2346,7 @@ async fn query_edges_scan(
 ) -> Result<Vec<SemanticEdgeRow>, Box<dyn Error + Send + Sync>> {
     execute_semantic_query(
         conn,
-        "SELECT e.source, e.target, e.content, e.stability, e.confidence, e.importance, e.subject, e.date, e.occurred_at, e.expired_at, e.memory_type, e.origin_session, vector_extract(e.embedding) FROM edges e LEFT JOIN nodes source_node ON source_node.id = e.source LEFT JOIN nodes target_node ON target_node.id = e.target WHERE e.embedding IS NOT NULL AND e.expired_at IS NULL AND COALESCE(source_node.node_type, '') NOT IN ('loop', 'interest') AND COALESCE(target_node.node_type, '') NOT IN ('loop', 'interest') ORDER BY vector_distance_cos(e.embedding, vector32(?1)) LIMIT ?2",
+        "SELECT e.source, e.target, e.content, e.stability, e.confidence, e.importance, e.subject, e.date, e.occurred_at, e.expired_at, e.memory_type, e.origin_session, e.provenance, vector_extract(e.embedding) FROM edges e LEFT JOIN nodes source_node ON source_node.id = e.source LEFT JOIN nodes target_node ON target_node.id = e.target WHERE e.embedding IS NOT NULL AND e.expired_at IS NULL AND COALESCE(source_node.node_type, '') NOT IN ('loop', 'interest') AND COALESCE(target_node.node_type, '') NOT IN ('loop', 'interest') ORDER BY vector_distance_cos(e.embedding, vector32(?1)) LIMIT ?2",
         json_str,
         limit,
     )
@@ -2209,7 +2372,7 @@ async fn execute_semantic_query(
 
 fn parse_semantic_edge_row(row: &turso::Row) -> Option<SemanticEdgeRow> {
     let edge = parse_edge_row(row)?;
-    let embedding = parse_optional_vector32(row.get_value(12).ok());
+    let embedding = parse_optional_vector32(row.get_value(13).ok());
     Some((
         edge.source,
         edge.target,
@@ -2223,6 +2386,7 @@ fn parse_semantic_edge_row(row: &turso::Row) -> Option<SemanticEdgeRow> {
         edge.expired_at,
         edge.memory_type,
         edge.origin_session,
+        edge.provenance,
         embedding,
     ))
 }
@@ -2237,7 +2401,7 @@ pub fn load_all_edges_semantic() -> Vec<SemanticEdgeRow> {
 async fn load_all_edges_semantic_async(conn: &Connection) -> Vec<SemanticEdgeRow> {
     let Ok(mut rows) = conn
         .query(
-            "SELECT e.source, e.target, e.content, e.stability, e.confidence, e.importance, e.subject, e.date, e.occurred_at, e.expired_at, e.memory_type, e.origin_session, CASE WHEN e.embedding IS NULL THEN NULL ELSE vector_extract(e.embedding) END FROM edges e LEFT JOIN nodes source_node ON source_node.id = e.source LEFT JOIN nodes target_node ON target_node.id = e.target WHERE e.expired_at IS NULL AND COALESCE(source_node.node_type, '') NOT IN ('loop', 'interest') AND COALESCE(target_node.node_type, '') NOT IN ('loop', 'interest')",
+            "SELECT e.source, e.target, e.content, e.stability, e.confidence, e.importance, e.subject, e.date, e.occurred_at, e.expired_at, e.memory_type, e.origin_session, e.provenance, CASE WHEN e.embedding IS NULL THEN NULL ELSE vector_extract(e.embedding) END FROM edges e LEFT JOIN nodes source_node ON source_node.id = e.source LEFT JOIN nodes target_node ON target_node.id = e.target WHERE e.expired_at IS NULL AND COALESCE(source_node.node_type, '') NOT IN ('loop', 'interest') AND COALESCE(target_node.node_type, '') NOT IN ('loop', 'interest')",
             (),
         )
         .await
@@ -2599,13 +2763,13 @@ async fn insert_graph_edge(
     edge: &Edge,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     conn.execute(
-        "INSERT INTO edges (source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, source_message_id, memory_type, origin_session) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        "INSERT INTO edges (source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, source_message_id, memory_type, origin_session, provenance) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             edge.source.as_str(),
             edge.target.as_str(),
             edge.content.as_str(),
             round2(edge.stability),
-            round2(edge.confidence),
+            clamped_confidence(edge.confidence, &edge.provenance),
             round2(edge.importance),
             edge.subject as i64,
             edge.date.as_str(),
@@ -2614,6 +2778,7 @@ async fn insert_graph_edge(
             "",
             edge.memory_type.as_str(),
             edge.origin_session.as_str(),
+            edge.provenance.as_str(),
         ],
     )
     .await?;
@@ -2772,14 +2937,14 @@ pub(crate) async fn load_recent_learning_async(
     let modifier = format!("-{} days", since_days.min(7));
     let mut rows = conn
         .query(
-            "SELECT ed.content, ev.source, ev.target, ev.event_type, MAX(ev.ts)
+            "SELECT ed.content, ev.source, ev.target, ev.event_type, MAX(ev.ts), ed.provenance
              FROM events ev
              JOIN edges ed ON ed.source = ev.source AND ed.target = ev.target
              WHERE ev.event_type IN ('created', 'reinforced')
                AND ev.source != '' AND ev.target != ''
                AND ed.expired_at IS NULL
                AND julianday(ev.ts) >= julianday(date('now'), ?1)
-             GROUP BY ed.source, ed.target, ed.content, ev.event_type
+             GROUP BY ed.source, ed.target, ed.content, ev.event_type, ed.provenance
              ORDER BY MAX(ev.ts) DESC, MAX(ev.id) DESC
              LIMIT ?2",
             params![modifier, limit as i64],
@@ -2793,6 +2958,7 @@ pub(crate) async fn load_recent_learning_async(
             target: text(row.get_value(2)?),
             event_type: text(row.get_value(3)?),
             timestamp: text(row.get_value(4)?),
+            provenance: text(row.get_value(5)?),
         });
     }
     Ok(learning)
@@ -3316,6 +3482,7 @@ pub(super) fn parse_edge_row(row: &turso::Row) -> Option<Edge> {
         expired_at: optional_text(row.get_value(9).ok()),
         memory_type: text_or(row.get_value(10), "semantic"),
         origin_session: text_or(row.get_value(11), ""),
+        provenance: text_or(row.get_value(12), PROVENANCE_LEGACY),
     })
 }
 
@@ -3367,20 +3534,21 @@ pub(crate) fn int(val: Value) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_PING_MUTED_UNTIL, block_on, count_findings_in_window,
+        DEFAULT_PING_MUTED_UNTIL, backfill_edge_epistemics, block_on, count_findings_in_window,
         count_new_embedding_neighbours_async, divert_ping_topic, insert_finding, insert_interest,
         interest_density_with, load_all_edges_semantic_async, load_due_loops, load_game_edges,
         load_loops_for_anchors, load_ping_policy, load_recent_attention_counts_async,
         load_session_game, load_task_chain, load_unembedded_edges_async, mark_finding_surfaced,
         recover_replica_once, resume_pings, set_ping_mute, top_interests_with, unsurfaced_findings,
-        with_write_lock,
+        update_edge_confidence, with_write_lock, write_edge,
     };
+    use crate::memory::graph::Edge;
     use crate::web::NewsItem;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
     use turso::{Builder, Connection, params};
 
-    const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', embedding BLOB, PRIMARY KEY (source, target))";
+    const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', embedding BLOB, PRIMARY KEY (source, target))";
     const EVENTS_DDL: &str = "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')";
     const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
     const FINDINGS_DDL: &str = "CREATE TABLE findings (id INTEGER PRIMARY KEY AUTOINCREMENT, interest_topic TEXT NOT NULL, title TEXT NOT NULL, url TEXT NOT NULL, snippet TEXT NOT NULL DEFAULT '', novelty REAL NOT NULL, found_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'candidate', surfaced_at TEXT NOT NULL DEFAULT '')";
@@ -3647,6 +3815,141 @@ mod tests {
         };
         let _ = conn.execute(EDGES_DDL, ()).await;
         conn
+    }
+
+    fn epistemic_edge(source: &str, provenance: &str, confidence: f64) -> Edge {
+        Edge {
+            source: source.to_string(),
+            target: "target".to_string(),
+            content: "belief".to_string(),
+            stability: 0.5,
+            confidence,
+            importance: 0.5,
+            subject: false,
+            date: "2026-07-16".to_string(),
+            occurred_at: None,
+            expired_at: None,
+            memory_type: "semantic".to_string(),
+            origin_session: String::new(),
+            provenance: provenance.to_string(),
+        }
+    }
+
+    #[test]
+    fn writes_and_confidence_updates_obey_provenance_ceiling() {
+        let conn = block_on(harness());
+        let dreamed = epistemic_edge("dream", "dreamed", 0.9);
+        let confirmed = epistemic_edge("user", "user-confirmed", 0.9);
+        assert!(write_edge(&conn, &dreamed, "").is_ok());
+        assert!(write_edge(&conn, &confirmed, "").is_ok());
+        let Ok(Some(dreamed_stored)) = super::load_edge(&conn, "dream", "target") else {
+            unreachable!("dreamed edge loads")
+        };
+        let Ok(Some(confirmed_stored)) = super::load_edge(&conn, "user", "target") else {
+            unreachable!("confirmed edge loads")
+        };
+        assert_eq!(dreamed_stored.confidence, 0.25);
+        assert_eq!(confirmed_stored.confidence, 0.9);
+
+        assert!(update_edge_confidence(&conn, "dream", "target", 0.8).unwrap_or(false));
+        let Ok(Some(updated)) = super::load_edge(&conn, "dream", "target") else {
+            unreachable!("updated edge loads")
+        };
+        assert_eq!(updated.confidence, 0.25);
+    }
+
+    #[test]
+    fn epistemics_backfill_classifies_clamps_and_is_idempotent() {
+        let conn = block_on(migration_harness());
+        let Ok(first) = block_on(backfill_edge_epistemics(&conn)) else {
+            unreachable!("backfill succeeds")
+        };
+        assert_eq!(first.total, 4);
+        assert_eq!(first.dreamed, 1);
+        assert_eq!(first.web, 1);
+        assert_eq!(first.user, 1);
+        assert_eq!(first.legacy, 1);
+        assert_eq!(first.clamped, 3);
+
+        block_on(async {
+            let _ = conn
+                .execute(
+                    "UPDATE edges SET confidence = 0.1 WHERE source = 'dream'",
+                    (),
+                )
+                .await;
+        });
+        let Ok(second) = block_on(backfill_edge_epistemics(&conn)) else {
+            unreachable!("second backfill succeeds")
+        };
+        assert_eq!(second.total, 0);
+        let values = block_on(backfilled_values(&conn));
+        assert_eq!(
+            values,
+            vec![
+                ("dream".to_string(), "dreamed".to_string(), 0.1),
+                ("news".to_string(), "web-surfaced".to_string(), 0.5),
+                ("turn".to_string(), "user-confirmed".to_string(), 0.9),
+                ("unknown".to_string(), "legacy".to_string(), 0.5),
+            ]
+        );
+    }
+
+    async fn migration_harness() -> Connection {
+        let Ok(database) = Builder::new_local(":memory:").build().await else {
+            unreachable!("in-memory database builds")
+        };
+        let Ok(conn) = database.connect() else {
+            unreachable!("in-memory database connects")
+        };
+        let _ = conn
+            .execute(
+                "CREATE TABLE edges (
+                source TEXT NOT NULL, target TEXT NOT NULL, confidence REAL NOT NULL,
+                origin_session TEXT NOT NULL DEFAULT '',
+                provenance TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (source, target)
+            )",
+                (),
+            )
+            .await;
+        let _ = conn
+            .execute(
+                "INSERT INTO edges (source, target, confidence, origin_session) VALUES
+                ('dream', 'x', 0.9, 'dream:1'),
+                ('news', 'x', 0.9, 'news:2026-07-16'),
+                ('turn', 'x', 0.9, '2026-07-16T12-00-00'),
+                ('unknown', 'x', 0.9, '')",
+                (),
+            )
+            .await;
+        conn
+    }
+
+    async fn backfilled_values(conn: &Connection) -> Vec<(String, String, f64)> {
+        let Ok(mut rows) = conn
+            .query(
+                "SELECT source, provenance, confidence FROM edges ORDER BY source",
+                (),
+            )
+            .await
+        else {
+            unreachable!("query succeeds")
+        };
+        let mut values = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            let (Ok(source), Ok(provenance), Ok(confidence)) =
+                (row.get_value(0), row.get_value(1), row.get_value(2))
+            else {
+                unreachable!("backfill values read")
+            };
+            values.push((
+                super::text(source),
+                super::text(provenance),
+                super::real(confidence),
+            ));
+        }
+        values
     }
 
     async fn game_harness() -> Connection {

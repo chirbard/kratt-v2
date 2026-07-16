@@ -803,8 +803,8 @@ fn render_recent_learning(learning: &[memory::RecentLearning]) -> String {
             "Strengthened"
         };
         lines.push(format!(
-            "- {verb}: {} ({} → {})",
-            item.content, item.source, item.target
+            "- {verb} ({}): {} ({} → {})",
+            item.provenance, item.content, item.source, item.target
         ));
     }
     lines.join("\n")
@@ -990,7 +990,7 @@ mod tests {
         };
         let statements = [
             "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')",
-            "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', embedding BLOB, PRIMARY KEY (source, target))",
+            "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', embedding BLOB, PRIMARY KEY (source, target))",
             "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')",
             "CREATE TABLE sessions (id TEXT PRIMARY KEY, session_type TEXT NOT NULL DEFAULT 'conversation', created_at TEXT NOT NULL DEFAULT '')",
             "CREATE TABLE inbox (id INTEGER PRIMARY KEY AUTOINCREMENT, accepted_at TEXT NOT NULL, source TEXT NOT NULL, instruction TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'queued', resolved_at TEXT NOT NULL DEFAULT '', result TEXT NOT NULL DEFAULT '')",
@@ -1098,6 +1098,7 @@ mod tests {
             expired_at: None,
             memory_type: "semantic".to_string(),
             origin_session: String::new(),
+            provenance: "legacy".to_string(),
             embedding: None,
         }
     }
@@ -1205,6 +1206,7 @@ mod tests {
         });
         let rendered = execute_recall_recent_learning_with(&conn, 7);
         assert!(rendered.contains("a new belief"));
+        assert!(rendered.contains("New (legacy)"));
         assert!(!rendered.contains("an old belief"));
         assert_eq!(parse_since_days(r#"{"since_days":99}"#), 7);
         assert_eq!(parse_since_days("{}"), 0);

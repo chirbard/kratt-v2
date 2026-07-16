@@ -17,7 +17,7 @@ use super::agent::{self, ApplyToolOptions, ToolCall};
 use super::db;
 use super::dream::{self, DOMAIN_AGENT_NAMES};
 use super::embed::{self, SemanticEdge};
-use super::graph::{Edge, normalize_id};
+use super::graph::{Edge, PROVENANCE_WEB_SURFACED, normalize_id, provenance_ceiling};
 use super::ledger::{self, Actor, EdgeRef, Event, EventContext};
 
 const EXPLORATION_TURNS: usize = 4; // replay-tunable.
@@ -25,7 +25,6 @@ const EXPLORE_SEARCHES_PER_PASS: usize = 2; // replay-tunable.
 const RETRIEVE_LIMIT: usize = 15; // replay-tunable.
 const TRAVERSE_LIMIT: usize = 20; // replay-tunable.
 const MAX_TOOL_ROUNDS: usize = 6; // per turn; runaway guard for the autonomous loop.
-const EXPLORE_WEB_CONFIDENCE_CAP: f64 = 0.5; // replay-tunable.
 const INCUBATION_NEIGHBOUR_DISTANCE: f64 = 0.45; // replay-tunable.
 const RIPE_NEIGHBOUR_THRESHOLD: usize = 3; // replay-tunable.
 const INCUBATION_CHECK_LIMIT: usize = 10; // replay-tunable.
@@ -544,8 +543,8 @@ fn apply_web_mutation(
     context: &mut ToolContext,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
     let source_message_id = format!("{}:{}", context.session_id, context.turn_id);
-    // Only mutations after a search are web findings; anything the agent
-    // writes before searching is its own inference.
+    // The payload distinguishes searched findings from unsourced exploration,
+    // while slice-1 provenance classifies the whole pass as web-surfaced.
     let payload = match &context.active_query {
         Some(query) => json!({"via": "web_search", "query": query}).to_string(),
         None => json!({"via": "exploration"}).to_string(),
@@ -555,7 +554,8 @@ fn apply_web_mutation(
         context: EventContext::new(context.session_id, context.turn_id),
         source_message_id: &source_message_id,
         event_payload: &payload,
-        confidence_cap: Some(EXPLORE_WEB_CONFIDENCE_CAP),
+        confidence_cap: Some(provenance_ceiling(PROVENANCE_WEB_SURFACED)),
+        provenance: PROVENANCE_WEB_SURFACED,
         // Exploration is lived experience, not durable belief by default —
         // it becomes knowledge only if dreaming promotes it later.
         default_memory_type: "episodic",
@@ -599,6 +599,7 @@ fn semantic_edges_from_graph(edges: &[Edge]) -> Vec<SemanticEdge> {
             expired_at: edge.expired_at.clone(),
             memory_type: edge.memory_type.clone(),
             origin_session: edge.origin_session.clone(),
+            provenance: edge.provenance.clone(),
             embedding: None,
         });
     }

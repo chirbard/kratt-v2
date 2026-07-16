@@ -106,6 +106,7 @@ mod tests {
             expired_at: None,
             memory_type: memory_type.to_string(),
             origin_session: String::new(),
+            provenance: "legacy".to_string(),
         }
     }
 

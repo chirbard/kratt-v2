@@ -13,7 +13,7 @@ use turso::Connection;
 use super::db;
 use super::decay;
 use super::embed::SemanticEdge;
-use super::graph::{Edge, Node, graph_to_json, normalize_id};
+use super::graph::{Edge, Node, PROVENANCE_USER_CONFIRMED, graph_to_json, normalize_id};
 use super::ledger::{self, Actor, EdgeRef, Event, EventContext};
 
 const POSITIVE_REACTION_SCORE: f64 = 0.5; // replay-tunable.
@@ -565,6 +565,7 @@ fn to_semantic_edge(edge: &Edge) -> SemanticEdge {
         expired_at: edge.expired_at.clone(),
         memory_type: edge.memory_type.clone(),
         origin_session: edge.origin_session.clone(),
+        provenance: edge.provenance.clone(),
         embedding: None,
     }
 }
@@ -1221,6 +1222,7 @@ pub(crate) struct ApplyToolOptions<'scope> {
     pub source_message_id: &'scope str,
     pub event_payload: &'scope str,
     pub confidence_cap: Option<f64>,
+    pub provenance: &'static str,
     // memory_type an upsert_edge call gets when it doesn't specify one
     // itself. Chat and ingestion write durable belief ("semantic"— lived
     // experience is not yet knowledge); exploration/task sessions write
@@ -1245,6 +1247,7 @@ fn apply_tool_calls<'agent_run>(
             source_message_id: agent_run.user_message_id,
             event_payload: "",
             confidence_cap: None,
+            provenance: PROVENANCE_USER_CONFIRMED,
             default_memory_type,
         };
         for call in tool_calls {
@@ -1421,6 +1424,7 @@ fn apply_record_move_call<'scope>(
         expired_at: None,
         memory_type: "episodic".to_string(),
         origin_session: session_id,
+        provenance: options.provenance.to_string(),
     };
     apply_upsert_edge(conn, edge, options, events)?;
     Ok(format!(
@@ -1491,6 +1495,7 @@ fn apply_define_task_call<'scope>(
         expired_at: None,
         memory_type: "episodic".to_string(),
         origin_session: session_id,
+        provenance: options.provenance.to_string(),
     };
     apply_upsert_edge(conn, edge, options, events)?;
     Ok(format!("define_task: {name}"))
@@ -1543,6 +1548,7 @@ fn apply_record_rule_call<'scope>(
         expired_at: None,
         memory_type: "semantic".to_string(),
         origin_session: String::new(),
+        provenance: options.provenance.to_string(),
     };
     apply_upsert_edge(conn, edge, options, events)?;
     Ok(format!("record_rule: {rule}"))
@@ -1815,6 +1821,7 @@ fn open_loop_edge(loop_id: &str, anchor_id: &str, intention: &str) -> Edge {
         expired_at: None,
         memory_type: "semantic".to_string(),
         origin_session: String::new(),
+        provenance: PROVENANCE_USER_CONFIRMED.to_string(),
     }
 }
 
@@ -2023,6 +2030,7 @@ fn apply_upsert_edge_call<'scope>(
         expired_at: None,
         memory_type,
         origin_session,
+        provenance: options.provenance.to_string(),
     };
     if edge.memory_type == "episodic" {
         runlog::log(
@@ -2055,11 +2063,15 @@ fn apply_upsert_node(
 
 fn apply_upsert_edge<'scope>(
     conn: &Connection,
-    edge: Edge,
+    mut edge: Edge,
     options: &ApplyToolOptions<'scope>,
     events: &mut Vec<Event>,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
     let existing = db::load_edge(conn, &edge.source, &edge.target)?;
+    edge.provenance = match &existing {
+        Some(stored) => stored.provenance.clone(),
+        None => options.provenance.to_string(),
+    };
     db::write_edge(conn, &edge, options.source_message_id)?;
     let event = if options.event_payload.is_empty() {
         Event::upsert(
@@ -2432,7 +2444,7 @@ mod tests {
         use turso::Builder;
 
         const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
-        const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', PRIMARY KEY (source, target))";
+        const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', PRIMARY KEY (source, target))";
 
         async fn harness() -> turso::Connection {
             let Ok(database) = Builder::new_local(":memory:").build().await else {
@@ -2453,6 +2465,7 @@ mod tests {
                 source_message_id: "game-1:user:ts",
                 event_payload: "",
                 confidence_cap: None,
+                provenance: "user-confirmed",
                 default_memory_type: "episodic",
             }
         }
@@ -2572,7 +2585,7 @@ mod tests {
         use turso::Builder;
 
         const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
-        const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', embedding BLOB, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', PRIMARY KEY (source, target))";
+        const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', embedding BLOB, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', PRIMARY KEY (source, target))";
         const EVENTS_DDL: &str = "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL, actor_id TEXT NOT NULL, event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')";
         const VIEWS_DDL: &str = "CREATE TABLE edge_actor_views (actor_type TEXT NOT NULL, actor_id TEXT NOT NULL, source TEXT NOT NULL, target TEXT NOT NULL, views REAL NOT NULL DEFAULT 0, last_visited_at TEXT NOT NULL, PRIMARY KEY (actor_type, actor_id, source, target))";
         const POSITIONS_DDL: &str = "CREATE TABLE actor_positions (actor_type TEXT NOT NULL, actor_id TEXT NOT NULL, sum_vector BLOB, total_weight REAL NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY (actor_type, actor_id))";
@@ -2601,6 +2614,7 @@ mod tests {
                 source_message_id: "game-1:user:ts",
                 event_payload: "",
                 confidence_cap: None,
+                provenance: "user-confirmed",
                 default_memory_type: "episodic",
             }
         }
@@ -2756,7 +2770,8 @@ mod tests {
                 .await;
             let _ = conn
                 .execute(
-                    "INSERT INTO edges (source, target, confidence) VALUES ('a', 'b', 0.5)",
+                    "INSERT INTO edges (source, target, confidence, provenance)
+                     VALUES ('a', 'b', 0.5, 'user-confirmed')",
                     (),
                 )
                 .await;
@@ -2971,6 +2986,7 @@ mod tests {
                 source_message_id: "chat-1:user:ts",
                 event_payload: "",
                 confidence_cap: None,
+                provenance: "user-confirmed",
                 default_memory_type: "episodic",
             }
         }
@@ -3132,6 +3148,7 @@ mod tests {
                 source_message_id: "message-1",
                 event_payload: "",
                 confidence_cap: None,
+                provenance: "user-confirmed",
                 default_memory_type: "semantic",
             };
             let mut events: Vec<Event> = Vec::new();
@@ -3202,6 +3219,7 @@ mod tests {
                 source_message_id: "message-1",
                 event_payload: "",
                 confidence_cap: None,
+                provenance: "user-confirmed",
                 default_memory_type: "semantic",
             };
             let mut events: Vec<Event> = Vec::new();
@@ -3252,7 +3270,7 @@ mod tests {
         use turso::Builder;
 
         const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
-        const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', PRIMARY KEY (source, target))";
+        const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', PRIMARY KEY (source, target))";
 
         async fn harness() -> turso::Connection {
             let Ok(database) = Builder::new_local(":memory:").build().await else {
@@ -3273,6 +3291,7 @@ mod tests {
                 source_message_id: "chat-1:user:ts",
                 event_payload: "",
                 confidence_cap: None,
+                provenance: "user-confirmed",
                 default_memory_type: "episodic",
             }
         }
@@ -3333,6 +3352,7 @@ mod tests {
                 expired_at: None,
                 memory_type: "semantic".to_string(),
                 origin_session: String::new(),
+                provenance: "legacy".to_string(),
             };
             let Ok(()) = db::write_edge(conn, &raw_edge, "test") else {
                 unreachable!("raw edge writes")
@@ -3386,6 +3406,7 @@ mod tests {
                 (edge.importance, edge.memory_type.as_str()),
                 (1.0, "semantic")
             );
+            assert_eq!(edge.provenance, "user-confirmed");
         }
 
         #[test]

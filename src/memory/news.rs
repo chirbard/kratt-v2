@@ -167,6 +167,29 @@ mod tests {
         let findings = db::unsurfaced_findings(&conn, 10).unwrap_or_default();
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].title, "distant update");
+        db::block_on(async {
+            let Ok(mut rows) = conn
+                .query(
+                    "SELECT provenance, confidence FROM edges
+                     WHERE provenance = 'web-surfaced'",
+                    (),
+                )
+                .await
+            else {
+                unreachable!("news edge query succeeds")
+            };
+            let Ok(Some(row)) = rows.next().await else {
+                unreachable!("news edge exists")
+            };
+            assert_eq!(
+                db::text(row.get_value(0).unwrap_or(turso::Value::Null)),
+                "web-surfaced"
+            );
+            assert_eq!(
+                db::real(row.get_value(1).unwrap_or(turso::Value::Null)),
+                0.5
+            );
+        });
     }
 
     async fn test_connection() -> Connection {
@@ -182,7 +205,7 @@ mod tests {
     fn seed_test_graph(conn: &Connection) {
         db::block_on(async {
             let _ = conn.execute("CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')", ()).await;
-            let _ = conn.execute("CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', embedding BLOB, PRIMARY KEY (source, target))", ()).await;
+            let _ = conn.execute("CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', embedding BLOB, PRIMARY KEY (source, target))", ()).await;
             let _ = conn.execute("CREATE TABLE findings (id INTEGER PRIMARY KEY AUTOINCREMENT, interest_topic TEXT NOT NULL, title TEXT NOT NULL, url TEXT NOT NULL, snippet TEXT NOT NULL DEFAULT '', novelty REAL NOT NULL, found_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'candidate', surfaced_at TEXT NOT NULL DEFAULT '')", ()).await;
             let _ = conn
                 .execute(
