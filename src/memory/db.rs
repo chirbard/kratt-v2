@@ -1313,6 +1313,13 @@ fn dedup_interests(interests: &mut Vec<Interest>) {
     interests.retain(|interest| seen.insert(interest.node_id.clone()));
 }
 
+// Weights are stored at two decimals: full float precision survives every
+// multiply-and-write cycle (decay, reinforce) and bloats the prompt/token
+// side; nothing downstream needs more than 0.01 resolution.
+pub(crate) fn round2(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
+}
+
 pub fn write_edge(
     conn: &Connection,
     edge: &Edge,
@@ -1325,9 +1332,9 @@ pub fn write_edge(
                 edge.source.as_str(),
                 edge.target.as_str(),
                 edge.content.as_str(),
-                edge.stability,
-                edge.confidence,
-                edge.importance,
+                round2(edge.stability),
+                round2(edge.confidence),
+                round2(edge.importance),
                 edge.subject as i64,
                 edge.date.as_str(),
                 edge.occurred_at.as_deref(),
@@ -1718,7 +1725,7 @@ async fn update_edge_confidence_async(
     let changed = conn
         .execute(
             "UPDATE edges SET confidence = ?1 WHERE source = ?2 AND target = ?3 AND expired_at IS NULL",
-            params![confidence, source, target],
+            params![round2(confidence), source, target],
         )
         .await?;
     Ok(changed > 0)
@@ -2446,9 +2453,9 @@ async fn insert_graph_edge(
             edge.source.as_str(),
             edge.target.as_str(),
             edge.content.as_str(),
-            edge.stability,
-            edge.confidence,
-            edge.importance,
+            round2(edge.stability),
+            round2(edge.confidence),
+            round2(edge.importance),
             edge.subject as i64,
             edge.date.as_str(),
             edge.occurred_at.as_deref(),
