@@ -15,7 +15,8 @@ use super::agent::{ToolCall, parse_tool_calls, stream_collect};
 use super::db;
 use super::embed::{self, SemanticEdge};
 use super::graph::{
-    Edge, Node, PROVENANCE_DREAMED, graph_to_json, normalize_id, provenance_ceiling,
+    Edge, Node, PROVENANCE_DREAMED, PROVENANCE_INFERRED, PROVENANCE_SYNTHESIZED, graph_to_json,
+    inferred_ceiling, normalize_id, synthesized_ceiling,
 };
 use super::hygiene;
 use super::ledger::{self, Actor, EdgeRef, Event, EventContext};
@@ -23,7 +24,6 @@ use super::synthesis::{self, SynthesisPolicy};
 
 const DREAM_STABILITY: f64 = 0.3;
 const GIST_IMPORTANCE: f64 = 0.5; // replay-tunable.
-const GIST_MIN_SUPPORTS: usize = 2; // replay-tunable.
 const MAX_PRUNES_PER_PASS: usize = 3; // replay-tunable.
 const PRUNE_GUARD_THRESHOLD: f64 = 0.7; // replay-tunable.
 pub const DOMAIN_AGENT_NAMES: [&str; 3] = ["biologist", "historian", "economist"];
@@ -591,6 +591,7 @@ fn apply_dream_call<'scope, 'policy>(
             subject,
             date,
             memory_type: _,
+            inferred_from,
         } => apply_dream_upsert_edge(
             ctx,
             DreamEdgeCall {
@@ -601,6 +602,7 @@ fn apply_dream_call<'scope, 'policy>(
                 importance,
                 subject,
                 date,
+                inferred_from,
             },
         ),
         ToolCall::UpsertNode {
@@ -716,14 +718,19 @@ fn apply_dream_gist_edge<'scope, 'policy>(
     call: DreamGistCall,
 ) -> Result<(String, bool), Box<dyn Error + Send + Sync>> {
     let supports = collect_gist_supports(ctx.conn, &call.supported_by)?;
-    if supports.len() < GIST_MIN_SUPPORTS {
-        return Ok((gist_denied_message(&call), false));
-    }
     let source = normalize_id(&call.source);
     let target = normalize_id(&call.target);
-    let mut edge = gist_edge(&source, &target, &call);
+    let mut edge = gist_edge(&source, &target, &call, &supports);
     if let Some(existing) = db::load_edge(ctx.conn, &source, &target)? {
         edge.provenance = existing.provenance;
+        edge.ceiling = existing.ceiling;
+    } else if supports.is_empty() {
+        runlog::log(
+            "epistemics",
+            &format!(
+                "[epistemics] synthesized fallback: {source} → {target} has no resolvable supports"
+            ),
+        );
     }
     db::write_edge(ctx.conn, &edge, ctx.source_id)?;
     ctx.events.push(Event::updated(
@@ -734,7 +741,7 @@ fn apply_dream_gist_edge<'scope, 'policy>(
     ));
     Ok((
         format!(
-            "gist_edge: {source} → {target} (from {} episodes)",
+            "gist_edge: {source} → {target} (from {} supports)",
             supports.len()
         ),
         true,
@@ -747,35 +754,41 @@ fn apply_dream_gist_edge<'scope, 'policy>(
 fn collect_gist_supports(
     conn: &Connection,
     refs: &[(String, String)],
-) -> Result<Vec<(String, String)>, Box<dyn Error + Send + Sync>> {
+) -> Result<Vec<Edge>, Box<dyn Error + Send + Sync>> {
     let mut kept = Vec::new();
     for (source, target) in refs {
         match db::load_edge(conn, source, target)? {
-            Some(edge) if edge.memory_type == "episodic" => {
-                kept.push((source.clone(), target.clone()));
-            }
-            Some(_) => runlog::log(
-                "dream",
-                &format!("gist support dropped (not episodic): {source} → {target}"),
-            ),
+            Some(edge) if edge.expired_at.is_none() => kept.push(edge),
             None => runlog::log(
                 "dream",
                 &format!("gist support dropped (unknown): {source} → {target}"),
+            ),
+            Some(_) => runlog::log(
+                "dream",
+                &format!("gist support dropped (expired): {source} → {target}"),
             ),
         }
     }
     Ok(kept)
 }
 
-fn gist_edge(source: &str, target: &str, call: &DreamGistCall) -> Edge {
+fn gist_edge(source: &str, target: &str, call: &DreamGistCall, supports: &[Edge]) -> Edge {
+    let mut confidences = Vec::new();
+    for edge in supports {
+        confidences.push(edge.confidence);
+    }
+    let ceiling = synthesized_ceiling(&confidences);
+    let provenance = if ceiling.is_some() {
+        PROVENANCE_SYNTHESIZED
+    } else {
+        PROVENANCE_DREAMED
+    };
     Edge {
         source: source.to_string(),
         target: target.to_string(),
         content: call.content.clone(),
         stability: call.stability.clamp(0.0, 1.0),
-        confidence: call
-            .confidence
-            .clamp(0.0, provenance_ceiling(PROVENANCE_DREAMED)),
+        confidence: call.confidence.clamp(0.0, 1.0),
         importance: GIST_IMPORTANCE,
         subject: false,
         date: crate::prompts::today_iso(),
@@ -783,23 +796,17 @@ fn gist_edge(source: &str, target: &str, call: &DreamGistCall) -> Edge {
         expired_at: None,
         memory_type: "semantic".to_string(),
         origin_session: String::new(),
-        provenance: PROVENANCE_DREAMED.to_string(),
+        provenance: provenance.to_string(),
+        ceiling,
     }
 }
 
-fn gist_payload(supports: &[(String, String)]) -> String {
+fn gist_payload(supports: &[Edge]) -> String {
     let mut refs = Vec::new();
-    for (source, target) in supports {
-        refs.push(format!("{source} → {target}"));
+    for edge in supports {
+        refs.push(format!("{} → {}", edge.source, edge.target));
     }
     serde_json::json!({ "gist_of": refs }).to_string()
-}
-
-fn gist_denied_message(call: &DreamGistCall) -> String {
-    format!(
-        "gist_edge denied: {} → {} needs {GIST_MIN_SUPPORTS}+ episodic supports — use promote_edge for one episode that is itself the lesson",
-        call.source, call.target
-    )
 }
 
 struct DreamApplyState<'policy> {
@@ -824,6 +831,7 @@ struct DreamEdgeCall {
     importance: f64,
     subject: bool,
     date: String,
+    inferred_from: Option<Vec<(String, String)>>,
 }
 
 struct DreamNodeCall {
@@ -886,11 +894,13 @@ fn apply_dream_upsert_edge<'scope, 'policy>(
     let target = normalize_id(&edge_call.target);
     let existing = db::load_edge(ctx.conn, &source, &target)?;
     let key = (source.clone(), target.clone());
-    let (stability, confidence, provenance) = dream_edge_values(
+    let inherited = dream_declared_ceiling(ctx.conn, &edge_call.inferred_from)?;
+    let (stability, confidence, provenance, ceiling) = dream_edge_values(
         ctx.apply_state.synthesis_policy,
         &key,
         existing.as_ref(),
         edge_call.confidence,
+        inherited,
     );
     let edge = Edge {
         source: source.clone(),
@@ -906,6 +916,7 @@ fn apply_dream_upsert_edge<'scope, 'policy>(
         memory_type: "semantic".to_string(),
         origin_session: String::new(),
         provenance,
+        ceiling,
     };
     db::write_edge(ctx.conn, &edge, ctx.source_id)?;
     ctx.events.push(Event::upsert(
@@ -925,21 +936,62 @@ fn dream_edge_values(
     key: &(String, String),
     existing: Option<&Edge>,
     requested_confidence: f64,
-) -> (f64, f64, String) {
+    inherited: Option<f64>,
+) -> (f64, f64, String, Option<f64>) {
     let mut stability = DREAM_STABILITY;
     let mut confidence = requested_confidence;
+    if let Some(stored) = existing {
+        return (
+            stability,
+            confidence,
+            stored.provenance.clone(),
+            stored.ceiling,
+        );
+    }
     if let Some(override_values) = policy.edge_overrides.get(key) {
         stability = override_values.stability;
         confidence = override_values.confidence;
+        return (
+            stability,
+            confidence,
+            PROVENANCE_SYNTHESIZED.to_string(),
+            Some(override_values.ceiling),
+        );
     }
-    let provenance = match existing {
-        Some(stored) => stored.provenance.clone(),
-        None => PROVENANCE_DREAMED.to_string(),
+    dream_inferred_values(inherited, stability, confidence)
+}
+
+fn dream_declared_ceiling(
+    conn: &Connection,
+    inferred_from: &Option<Vec<(String, String)>>,
+) -> Result<Option<f64>, Box<dyn Error + Send + Sync>> {
+    let Some(refs) = inferred_from else {
+        return Ok(None);
+    };
+    let confidences = super::agent::resolve_live_premise_confidences(conn, refs)?;
+    let ceiling = inferred_ceiling(&confidences);
+    if ceiling.is_none() {
+        runlog::log(
+            "epistemics",
+            "[epistemics] dream inference fallback: no resolvable premises",
+        );
+    }
+    Ok(ceiling)
+}
+
+fn dream_inferred_values(
+    inherited: Option<f64>,
+    stability: f64,
+    confidence: f64,
+) -> (f64, f64, String, Option<f64>) {
+    let Some(ceiling) = inherited else {
+        return (stability, confidence, PROVENANCE_DREAMED.to_string(), None);
     };
     (
         stability,
-        confidence.min(provenance_ceiling(PROVENANCE_DREAMED)),
-        provenance,
+        confidence,
+        PROVENANCE_INFERRED.to_string(),
+        Some(ceiling),
     )
 }
 
@@ -1147,7 +1199,7 @@ fn send_append(sender: &std::sync::mpsc::Sender<DreamEvent>, phase: &'static str
 mod tests {
     use super::{
         DreamApplyState, DreamCallContext, DreamGistCall, Edge, Event, SynthesisPolicy,
-        apply_dream_gist_edge,
+        apply_dream_gist_edge, dream_edge_values,
     };
     use crate::memory::agent::{self, ToolCall};
     use crate::memory::db;
@@ -1155,7 +1207,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use turso::{Builder, Connection};
 
-    const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', PRIMARY KEY (source, target))";
+    const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', ceiling REAL, PRIMARY KEY (source, target))";
     const EVENTS_DDL: &str = "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')";
     const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
 
@@ -1189,6 +1241,7 @@ mod tests {
             memory_type: memory_type.to_string(),
             origin_session: "session-1".to_string(),
             provenance: "legacy".to_string(),
+            ceiling: None,
         }
     }
 
@@ -1251,7 +1304,7 @@ mod tests {
         edge
     }
 
-    // Two episodic supports, proposed at 0.6 and capped as dreamed.
+    // Two 0.3-confidence supports, proposed at 0.6 and capped at mean × 0.9.
     fn gist_two_supports(conn: &Connection) -> Vec<Event> {
         insert(conn, "game3-hub", "move-qh5", "episodic");
         insert(conn, "game4-hub", "move-qf3", "episodic");
@@ -1271,8 +1324,9 @@ mod tests {
         let written = must_load(&conn, "queen-sorties", "chess-openings");
         assert_eq!(written.memory_type, "semantic");
         assert_eq!(written.date, crate::prompts::today_iso());
-        assert!((written.confidence - 0.25).abs() < 1e-9);
-        assert_eq!(written.provenance, "dreamed");
+        assert!((written.confidence - 0.27).abs() < 1e-9);
+        assert_eq!(written.provenance, "synthesized");
+        assert_eq!(written.ceiling, Some(0.27));
     }
 
     #[test]
@@ -1293,7 +1347,7 @@ mod tests {
     }
 
     #[test]
-    fn confidence_is_clamped_to_the_dreamed_ceiling() {
+    fn gist_confidence_is_clamped_to_the_inherited_ceiling() {
         let conn = harness();
         insert(&conn, "game3-hub", "move-qh5", "episodic");
         insert(&conn, "game4-hub", "move-qf3", "episodic");
@@ -1305,36 +1359,37 @@ mod tests {
             ),
         );
         let written = must_load(&conn, "queen-sorties", "chess-openings");
-        assert!((written.confidence - 0.25).abs() < 1e-9);
+        assert!((written.confidence - 0.27).abs() < 1e-9);
     }
 
     #[test]
-    fn a_single_support_is_denied_with_the_promote_edge_hint() {
+    fn a_single_resolvable_support_can_synthesize() {
         let conn = harness();
         insert(&conn, "game3-hub", "move-qh5", "episodic");
         let ((description, added), events) =
             run_gist(&conn, gist_call(&[("game3-hub", "move-qh5")], 0.6));
-        assert!(!added);
-        assert!(description.contains("denied"));
-        assert!(description.contains("promote_edge"));
-        assert!(events.is_empty());
-        assert!(loaded(&conn, "queen-sorties", "chess-openings").is_none());
+        assert!(added);
+        assert!(description.contains("from 1 supports"));
+        assert_eq!(events.len(), 1);
+        let written = must_load(&conn, "queen-sorties", "chess-openings");
+        assert_eq!(written.provenance, "synthesized");
+        assert_eq!(written.ceiling, Some(0.27));
     }
 
     #[test]
-    fn an_unknown_ref_drops_the_count_below_the_minimum() {
+    fn an_unknown_ref_is_skipped_when_another_support_resolves() {
         let conn = harness();
         insert(&conn, "game3-hub", "move-qh5", "episodic");
         let ((description, added), _) = run_gist(
             &conn,
             gist_call(&[("game3-hub", "move-qh5"), ("ghost", "nowhere")], 0.6),
         );
-        assert!(!added);
-        assert!(description.contains("denied"));
+        assert!(added);
+        assert!(description.contains("from 1 supports"));
     }
 
     #[test]
-    fn a_semantic_support_is_dropped() {
+    fn a_semantic_support_contributes_to_a_gist() {
         let conn = harness();
         insert(&conn, "game3-hub", "move-qh5", "episodic");
         insert(&conn, "old-belief", "chess", "semantic");
@@ -1342,7 +1397,64 @@ mod tests {
             &conn,
             gist_call(&[("game3-hub", "move-qh5"), ("old-belief", "chess")], 0.6),
         );
-        assert!(!added, "the semantic ref is dropped, leaving one support");
+        assert!(added);
+        let written = must_load(&conn, "queen-sorties", "chess-openings");
+        assert_eq!(written.provenance, "synthesized");
+    }
+
+    #[test]
+    fn gist_ceiling_uses_the_mean_of_mixed_supporters() {
+        let conn = harness();
+        insert(&conn, "episode", "fact", "episodic");
+        insert(&conn, "belief", "fact", "semantic");
+        let _ = db::block_on(conn.execute(
+            "UPDATE edges SET confidence = 0.9 WHERE source = 'belief'",
+            (),
+        ));
+        let _ = run_gist(
+            &conn,
+            gist_call(&[("episode", "fact"), ("belief", "fact")], 0.9),
+        );
+        let written = must_load(&conn, "queen-sorties", "chess-openings");
+        assert_eq!(written.ceiling, Some(0.54));
+        assert_eq!(written.confidence, 0.54);
+    }
+
+    #[test]
+    fn zero_resolvable_gist_supports_fall_back_to_dreamed() {
+        let conn = harness();
+        let ((_, added), _) = run_gist(&conn, gist_call(&[("ghost", "nowhere")], 0.9));
+        assert!(added);
+        let written = must_load(&conn, "queen-sorties", "chess-openings");
+        assert_eq!(written.provenance, "dreamed");
+        assert_eq!(written.ceiling, None);
+        assert_eq!(written.confidence, 0.25);
+    }
+
+    #[test]
+    fn dream_inference_inherits_the_dream_premise_floor() {
+        let conn = harness();
+        let mut first = edge("dream-a", "fact", "semantic");
+        first.provenance = "dreamed".to_string();
+        first.confidence = 0.25;
+        let mut second = edge("dream-b", "fact", "semantic");
+        second.provenance = "dreamed".to_string();
+        second.confidence = 0.25;
+        assert!(db::write_edge(&conn, &first, "").is_ok());
+        assert!(db::write_edge(&conn, &second, "").is_ok());
+        let refs = Some(vec![
+            ("dream-a".to_string(), "fact".to_string()),
+            ("dream-b".to_string(), "fact".to_string()),
+        ]);
+        let values = dream_edge_values(
+            &empty_policy(),
+            &("result".to_string(), "fact".to_string()),
+            None,
+            0.9,
+            super::dream_declared_ceiling(&conn, &refs).unwrap_or_default(),
+        );
+        assert_eq!(values.2, "inferred");
+        assert_eq!(values.3, Some(0.25));
     }
 
     #[test]
@@ -1387,7 +1499,7 @@ mod strategy_tests {
     use turso::{Builder, Connection};
 
     const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
-    const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', PRIMARY KEY (source, target))";
+    const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', ceiling REAL, PRIMARY KEY (source, target))";
     const EVENTS_DDL: &str = "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')";
 
     // Replays one canned response per stream() call and counts the calls so a
@@ -1520,6 +1632,7 @@ mod strategy_tests {
             memory_type: memory_type.to_string(),
             origin_session: String::new(),
             provenance: "legacy".to_string(),
+            ceiling: None,
         }
     }
 

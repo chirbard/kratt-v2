@@ -924,7 +924,7 @@ pub(super) async fn load_injected_edges(
 ) -> Result<Vec<Edge>, Box<dyn Error + Send + Sync>> {
     let mut rows = conn
         .query(
-            "SELECT ed.source, ed.target, ed.content, ed.stability, ed.confidence, ed.importance, ed.subject, ed.date, ed.occurred_at, ed.expired_at, ed.memory_type, ed.origin_session, ed.provenance FROM events ev JOIN edges ed ON ed.source = ev.source AND ed.target = ev.target WHERE ev.turn_id = ?1 AND ev.event_type = 'injected' AND ed.expired_at IS NULL GROUP BY ed.source, ed.target",
+            "SELECT ed.source, ed.target, ed.content, ed.stability, ed.confidence, ed.importance, ed.subject, ed.date, ed.occurred_at, ed.expired_at, ed.memory_type, ed.origin_session, ed.provenance, ed.ceiling FROM events ev JOIN edges ed ON ed.source = ev.source AND ed.target = ev.target WHERE ev.turn_id = ?1 AND ev.event_type = 'injected' AND ed.expired_at IS NULL GROUP BY ed.source, ed.target",
             params![turn_id],
         )
         .await?;
@@ -1494,7 +1494,7 @@ mod tests {
     use crate::memory::db;
     use turso::{Builder, params};
 
-    const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', PRIMARY KEY (source, target))";
+    const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', ceiling REAL, PRIMARY KEY (source, target))";
     const EVENTS_DDL: &str = "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')";
     const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
 
@@ -1617,6 +1617,7 @@ mod tests {
             memory_type: "semantic".to_string(),
             origin_session: String::new(),
             provenance: "legacy".to_string(),
+            ceiling: None,
         };
         let today = crate::prompts::today_iso();
         let Ok(refreshed) = db::block_on(db::touch_edge_dates(&conn, &[expired], &today)) else {

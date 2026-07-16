@@ -13,7 +13,10 @@ use turso::Connection;
 use super::db;
 use super::decay;
 use super::embed::SemanticEdge;
-use super::graph::{Edge, Node, PROVENANCE_USER_CONFIRMED, graph_to_json, normalize_id};
+use super::graph::{
+    Edge, Node, PROVENANCE_INFERRED, PROVENANCE_USER_CONFIRMED, graph_to_json, inferred_ceiling,
+    normalize_id,
+};
 use super::ledger::{self, Actor, EdgeRef, Event, EventContext};
 
 const POSITIVE_REACTION_SCORE: f64 = 0.5; // replay-tunable.
@@ -109,6 +112,7 @@ pub(crate) enum ToolCall {
         // None means the caller did not specify memory_type — the writer's
         // default (ApplyToolOptions::default_memory_type) applies.
         memory_type: Option<String>,
+        inferred_from: Option<Vec<(String, String)>>,
     },
     DeleteNode {
         name: String,
@@ -975,6 +979,7 @@ fn parse_upsert_edge(args: &serde_json::Value) -> Option<ToolCall> {
         subject: json_bool(args, "subject"),
         date,
         memory_type: json_opt_str(args, "memory_type"),
+        inferred_from: parse_optional_edge_refs(args, "inferred_from"),
     })
 }
 
@@ -1017,6 +1022,34 @@ fn parse_gist_edge(args: &serde_json::Value) -> Option<ToolCall> {
         stability,
         supported_by,
     })
+}
+
+fn parse_optional_edge_refs(args: &serde_json::Value, key: &str) -> Option<Vec<(String, String)>> {
+    let values = args.get(key)?.as_array()?;
+    let mut refs = Vec::new();
+    for value in values {
+        let parsed = match value {
+            serde_json::Value::String(text) => parse_support_ref(text),
+            serde_json::Value::Array(pair) if pair.len() == 2 => parse_ref_pair(&pair[0], &pair[1]),
+            _ => None,
+        };
+        if let Some(edge_ref) = parsed {
+            refs.push(edge_ref);
+        }
+    }
+    Some(refs)
+}
+
+fn parse_ref_pair(
+    source_value: &serde_json::Value,
+    target_value: &serde_json::Value,
+) -> Option<(String, String)> {
+    let source = normalize_id(source_value.as_str()?);
+    let target = normalize_id(target_value.as_str()?);
+    if source.is_empty() || target.is_empty() {
+        return None;
+    }
+    Some((source, target))
 }
 
 // The move text is the only required field: without it there is nothing to
@@ -1280,8 +1313,8 @@ pub(crate) fn apply_tool_call<'scope>(
     match call {
         ToolCall::UpsertNode { name, node_type, body, date } =>
             apply_upsert_node(conn, name, node_type, body, date),
-        ToolCall::UpsertEdge { source, target, content, stability, confidence, importance, subject, date, memory_type } =>
-            apply_upsert_edge_call(conn, options, events, UpsertEdgeCall { source, target, content, stability, confidence, importance, subject, date, memory_type }),
+        ToolCall::UpsertEdge { source, target, content, stability, confidence, importance, subject, date, memory_type, inferred_from } =>
+            apply_upsert_edge_call(conn, options, events, UpsertEdgeCall { source, target, content, stability, confidence, importance, subject, date, memory_type, inferred_from }),
         ToolCall::DeleteNode { name } =>
             apply_delete_node(conn, name, options, events),
         ToolCall::DeleteEdge { source, target } =>
@@ -1425,6 +1458,7 @@ fn apply_record_move_call<'scope>(
         memory_type: "episodic".to_string(),
         origin_session: session_id,
         provenance: options.provenance.to_string(),
+        ceiling: None,
     };
     apply_upsert_edge(conn, edge, options, events)?;
     Ok(format!(
@@ -1496,6 +1530,7 @@ fn apply_define_task_call<'scope>(
         memory_type: "episodic".to_string(),
         origin_session: session_id,
         provenance: options.provenance.to_string(),
+        ceiling: None,
     };
     apply_upsert_edge(conn, edge, options, events)?;
     Ok(format!("define_task: {name}"))
@@ -1549,6 +1584,7 @@ fn apply_record_rule_call<'scope>(
         memory_type: "semantic".to_string(),
         origin_session: String::new(),
         provenance: options.provenance.to_string(),
+        ceiling: None,
     };
     apply_upsert_edge(conn, edge, options, events)?;
     Ok(format!("record_rule: {rule}"))
@@ -1822,6 +1858,7 @@ fn open_loop_edge(loop_id: &str, anchor_id: &str, intention: &str) -> Edge {
         memory_type: "semantic".to_string(),
         origin_session: String::new(),
         provenance: PROVENANCE_USER_CONFIRMED.to_string(),
+        ceiling: None,
     }
 }
 
@@ -1997,6 +2034,7 @@ struct UpsertEdgeCall {
     subject: bool,
     date: String,
     memory_type: Option<String>,
+    inferred_from: Option<Vec<(String, String)>>,
 }
 
 fn apply_upsert_edge_call<'scope>(
@@ -2008,6 +2046,7 @@ fn apply_upsert_edge_call<'scope>(
     if let Some(confidence_cap) = options.confidence_cap {
         call.confidence = call.confidence.min(confidence_cap);
     }
+    let inferred_from = call.inferred_from.take();
     let memory_type = match call.memory_type {
         Some(requested) => super::graph::normalize_memory_type(&requested),
         None => options.default_memory_type.to_string(),
@@ -2017,7 +2056,7 @@ fn apply_upsert_edge_call<'scope>(
     } else {
         String::new()
     };
-    let edge = Edge {
+    let mut edge = Edge {
         source: normalize_id(&call.source),
         target: normalize_id(&call.target),
         content: call.content,
@@ -2031,7 +2070,9 @@ fn apply_upsert_edge_call<'scope>(
         memory_type,
         origin_session,
         provenance: options.provenance.to_string(),
+        ceiling: None,
     };
+    apply_inferred_declaration(conn, options, &inferred_from, &mut edge)?;
     if edge.memory_type == "episodic" {
         runlog::log(
             "mem",
@@ -2042,6 +2083,51 @@ fn apply_upsert_edge_call<'scope>(
         );
     }
     apply_upsert_edge(conn, edge, options, events)
+}
+
+fn apply_inferred_declaration<'scope>(
+    conn: &Connection,
+    options: &ApplyToolOptions<'scope>,
+    refs: &Option<Vec<(String, String)>>,
+    edge: &mut Edge,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let Some(premises) = refs else {
+        return Ok(());
+    };
+    if !matches!(options.actor.actor_id.as_str(), "extract" | "consolidate") {
+        return Ok(());
+    }
+    let confidences = resolve_live_premise_confidences(conn, premises)?;
+    let Some(ceiling) = inferred_ceiling(&confidences) else {
+        runlog::log(
+            "epistemics",
+            &format!(
+                "[epistemics] inferred fallback: {} → {} has no resolvable premises",
+                edge.source, edge.target
+            ),
+        );
+        return Ok(());
+    };
+    edge.provenance = PROVENANCE_INFERRED.to_string();
+    edge.ceiling = Some(ceiling);
+    Ok(())
+}
+
+pub(crate) fn resolve_live_premise_confidences(
+    conn: &Connection,
+    refs: &[(String, String)],
+) -> Result<Vec<f64>, Box<dyn Error + Send + Sync>> {
+    let mut confidences = Vec::new();
+    for (source, target) in refs {
+        match db::load_edge(conn, source, target)? {
+            Some(edge) if edge.expired_at.is_none() => confidences.push(edge.confidence),
+            _ => runlog::log(
+                "epistemics",
+                &format!("[epistemics] premise skipped: {source} → {target}"),
+            ),
+        }
+    }
+    Ok(confidences)
 }
 
 fn apply_upsert_node(
@@ -2073,8 +2159,13 @@ fn apply_upsert_edge<'scope>(
             PROVENANCE_USER_CONFIRMED.to_string()
         }
         Some(stored) => stored.provenance.clone(),
-        None => options.provenance.to_string(),
+        None => edge.provenance.clone(),
     };
+    if existing.is_some() && options.provenance == PROVENANCE_USER_CONFIRMED {
+        edge.ceiling = None;
+    } else if let Some(stored) = &existing {
+        edge.ceiling = stored.ceiling;
+    }
     db::write_edge(conn, &edge, options.source_message_id)?;
     let event = if options.event_payload.is_empty() {
         Event::upsert(
@@ -2434,6 +2525,26 @@ mod tests {
     }
 
     #[test]
+    fn upsert_edge_parses_inferred_from_pairs() {
+        let text = r#"{"tool":"upsert_edge","args":{"source":"result","target":"fact","inferred_from":[["Premise A","Fact"],["premise-b","fact"]]}}"#;
+        let calls = parse_tool_calls(text);
+        let ToolCall::UpsertEdge {
+            inferred_from: Some(refs),
+            ..
+        } = &calls[0]
+        else {
+            unreachable!("parsed inferred refs")
+        };
+        assert_eq!(
+            refs,
+            &vec![
+                ("premise-a".to_string(), "fact".to_string()),
+                ("premise-b".to_string(), "fact".to_string()),
+            ]
+        );
+    }
+
+    #[test]
     fn prose_wrapped_json_is_recovered() {
         let wrapped = r#"Here are the extracted facts: {"tools":[{"tool":"delete_edge","args":{"source":"a","target":"b"}}]} done."#;
         let calls = parse_tool_calls(wrapped);
@@ -2457,7 +2568,7 @@ mod tests {
                 unreachable!("in-memory database connects")
             };
             let _ = conn.execute("CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')", ()).await;
-            let _ = conn.execute("CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', PRIMARY KEY (source, target))", ()).await;
+            let _ = conn.execute("CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', ceiling REAL, PRIMARY KEY (source, target))", ()).await;
             conn
         });
         let legacy = Edge {
@@ -2474,6 +2585,7 @@ mod tests {
             memory_type: "semantic".to_string(),
             origin_session: String::new(),
             provenance: "legacy".to_string(),
+            ceiling: None,
         };
         assert!(db::write_edge(&conn, &legacy, "old").is_ok());
         let call = ToolCall::UpsertEdge {
@@ -2486,6 +2598,7 @@ mod tests {
             subject: false,
             date: String::new(),
             memory_type: Some("semantic".to_string()),
+            inferred_from: None,
         };
         let options = ApplyToolOptions {
             actor: Actor::new("system", "extract"),
@@ -2505,6 +2618,98 @@ mod tests {
         assert_eq!(edge.confidence, 0.9);
     }
 
+    #[test]
+    #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+    fn heavy_upsert_inherits_an_inferred_cap_or_falls_back() {
+        use super::{ApplyToolOptions, apply_tool_call};
+        use crate::memory::db;
+        use crate::memory::graph::Edge;
+        use crate::memory::ledger::{Actor, Event, EventContext};
+        use turso::Builder;
+
+        let conn = db::block_on(async {
+            let Ok(database) = Builder::new_local(":memory:").build().await else {
+                unreachable!("in-memory database builds")
+            };
+            let Ok(conn) = database.connect() else {
+                unreachable!("in-memory database connects")
+            };
+            let _ = conn.execute("CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')", ()).await;
+            let _ = conn.execute("CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', ceiling REAL, PRIMARY KEY (source, target))", ()).await;
+            conn
+        });
+        for (source, confidence) in [("premise-a", 1.0), ("premise-b", 0.9)] {
+            let premise = Edge {
+                source: source.to_string(),
+                target: "fact".to_string(),
+                content: "premise".to_string(),
+                stability: 0.5,
+                confidence,
+                importance: 0.5,
+                subject: false,
+                date: String::new(),
+                occurred_at: None,
+                expired_at: None,
+                memory_type: "semantic".to_string(),
+                origin_session: String::new(),
+                provenance: "user-confirmed".to_string(),
+                ceiling: None,
+            };
+            assert!(db::write_edge(&conn, &premise, "").is_ok());
+        }
+        let options = ApplyToolOptions {
+            actor: Actor::new("system", "extract"),
+            context: EventContext::new("chat-1", "turn-1"),
+            source_message_id: "",
+            event_payload: "",
+            confidence_cap: None,
+            provenance: "user-confirmed",
+            default_memory_type: "semantic",
+        };
+        let mut events: Vec<Event> = Vec::new();
+        let inferred = ToolCall::UpsertEdge {
+            source: "conclusion".to_string(),
+            target: "fact".to_string(),
+            content: "combined".to_string(),
+            stability: 0.5,
+            confidence: 0.95,
+            importance: 0.5,
+            subject: false,
+            date: String::new(),
+            memory_type: None,
+            inferred_from: Some(vec![
+                ("premise-a".to_string(), "fact".to_string()),
+                ("premise-b".to_string(), "fact".to_string()),
+            ]),
+        };
+        assert!(apply_tool_call(inferred, &conn, &options, &mut events).is_ok());
+        let Ok(Some(stored)) = db::load_edge(&conn, "conclusion", "fact") else {
+            unreachable!("inferred edge exists")
+        };
+        assert_eq!(stored.provenance, "inferred");
+        assert_eq!(stored.ceiling, Some(0.81));
+        assert_eq!(stored.confidence, 0.81);
+
+        let fallback = ToolCall::UpsertEdge {
+            source: "fallback".to_string(),
+            target: "fact".to_string(),
+            content: "unsupported".to_string(),
+            stability: 0.5,
+            confidence: 0.9,
+            importance: 0.5,
+            subject: false,
+            date: String::new(),
+            memory_type: None,
+            inferred_from: Some(vec![("ghost".to_string(), "fact".to_string())]),
+        };
+        assert!(apply_tool_call(fallback, &conn, &options, &mut events).is_ok());
+        let Ok(Some(stored)) = db::load_edge(&conn, "fallback", "fact") else {
+            unreachable!("fallback edge exists")
+        };
+        assert_eq!(stored.provenance, "user-confirmed");
+        assert_eq!(stored.ceiling, None);
+    }
+
     mod record_move {
         use super::super::{ApplyToolOptions, ToolCall, apply_tool_call, parse_tool_calls};
         use crate::memory::db;
@@ -2512,7 +2717,7 @@ mod tests {
         use turso::Builder;
 
         const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
-        const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', PRIMARY KEY (source, target))";
+        const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', ceiling REAL, PRIMARY KEY (source, target))";
 
         async fn harness() -> turso::Connection {
             let Ok(database) = Builder::new_local(":memory:").build().await else {
@@ -2653,7 +2858,7 @@ mod tests {
         use turso::Builder;
 
         const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
-        const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', embedding BLOB, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', PRIMARY KEY (source, target))";
+        const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', embedding BLOB, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', ceiling REAL, PRIMARY KEY (source, target))";
         const EVENTS_DDL: &str = "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL, actor_id TEXT NOT NULL, event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')";
         const VIEWS_DDL: &str = "CREATE TABLE edge_actor_views (actor_type TEXT NOT NULL, actor_id TEXT NOT NULL, source TEXT NOT NULL, target TEXT NOT NULL, views REAL NOT NULL DEFAULT 0, last_visited_at TEXT NOT NULL, PRIMARY KEY (actor_type, actor_id, source, target))";
         const POSITIONS_DDL: &str = "CREATE TABLE actor_positions (actor_type TEXT NOT NULL, actor_id TEXT NOT NULL, sum_vector BLOB, total_weight REAL NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY (actor_type, actor_id))";
@@ -3338,7 +3543,7 @@ mod tests {
         use turso::Builder;
 
         const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
-        const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', PRIMARY KEY (source, target))";
+        const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', ceiling REAL, PRIMARY KEY (source, target))";
 
         async fn harness() -> turso::Connection {
             let Ok(database) = Builder::new_local(":memory:").build().await else {
@@ -3421,6 +3626,7 @@ mod tests {
                 memory_type: "semantic".to_string(),
                 origin_session: String::new(),
                 provenance: "legacy".to_string(),
+                ceiling: None,
             };
             let Ok(()) = db::write_edge(conn, &raw_edge, "test") else {
                 unreachable!("raw edge writes")

@@ -17,7 +17,7 @@ use super::agent::{self, ApplyToolOptions, ToolCall};
 use super::db;
 use super::dream::{self, DOMAIN_AGENT_NAMES};
 use super::embed::{self, SemanticEdge};
-use super::graph::{Edge, PROVENANCE_WEB_SURFACED, normalize_id, provenance_ceiling};
+use super::graph::{Edge, PROVENANCE_WEB_SURFACED, edge_ceiling, normalize_id};
 use super::ledger::{self, Actor, EdgeRef, Event, EventContext};
 
 const EXPLORATION_TURNS: usize = 4; // replay-tunable.
@@ -554,7 +554,7 @@ fn apply_web_mutation(
         context: EventContext::new(context.session_id, context.turn_id),
         source_message_id: &source_message_id,
         event_payload: &payload,
-        confidence_cap: Some(provenance_ceiling(PROVENANCE_WEB_SURFACED)),
+        confidence_cap: Some(edge_ceiling(PROVENANCE_WEB_SURFACED, None)),
         provenance: PROVENANCE_WEB_SURFACED,
         // Exploration is lived experience, not durable belief by default —
         // it becomes knowledge only if dreaming promotes it later.

@@ -10,7 +10,7 @@ use crate::prompts;
 
 use super::agent::{ToolCall, parse_tool_calls, stream_collect};
 use super::db;
-use super::graph::normalize_id;
+use super::graph::{normalize_id, synthesized_ceiling};
 
 const CLUSTER_MIN_EDGES: usize = 3; // replay-tunable.
 const SYNTHESIS_CLUSTERS_PER_PASS: usize = 2; // replay-tunable.
@@ -20,6 +20,7 @@ const SYNTHESIS_STABILITY: f64 = 0.4; // replay-tunable.
 pub struct SynthesisEdgeOverride {
     pub confidence: f64,
     pub stability: f64,
+    pub ceiling: f64,
 }
 
 pub struct SynthesisPolicy {
@@ -99,7 +100,7 @@ pub fn run_synthesis_stage(
             index += 1;
             continue;
         }
-        apply_policy_overrides(cluster, stage_calls.as_slice(), &mut policy);
+        apply_policy_overrides(cluster, &edges, stage_calls.as_slice(), &mut policy);
         proposal_blocks.push((title, tool_calls_json(&stage_calls)));
         index += 1;
     }
@@ -423,7 +424,7 @@ fn run_cluster_pipeline(
     if parsed.is_empty() {
         return Ok(Vec::new());
     }
-    Ok(normalize_calls_for_cluster(cluster, parsed))
+    Ok(normalize_calls_for_cluster(cluster, edges, parsed))
 }
 
 struct StageIo<'stage_io> {
@@ -582,8 +583,12 @@ fn cluster_toon(cluster: &Cluster, edges: &[ClusterEdge]) -> String {
     toon::encode(&json!({"nodes": [], "edges": edges_json}), None)
 }
 
-fn normalize_calls_for_cluster(cluster: &Cluster, calls: Vec<ToolCall>) -> Vec<ToolCall> {
-    let confidence = (cluster.edge_indices.len() as f64 * 0.15).min(0.75);
+fn normalize_calls_for_cluster(
+    cluster: &Cluster,
+    edges: &[ClusterEdge],
+    calls: Vec<ToolCall>,
+) -> Vec<ToolCall> {
+    let confidence = cluster_ceiling(cluster, edges);
     let mut normalized = Vec::new();
     let mut idx = 0usize;
     while idx < calls.len() {
@@ -761,6 +766,7 @@ fn normalize_upsert_edge(call: &ToolCall, confidence: f64) -> ToolCall {
         subject,
         date,
         memory_type,
+        inferred_from,
         ..
     } = call
     else {
@@ -776,6 +782,7 @@ fn normalize_upsert_edge(call: &ToolCall, confidence: f64) -> ToolCall {
         subject: *subject,
         date: date.clone(),
         memory_type: memory_type.clone(),
+        inferred_from: inferred_from.clone(),
     }
 }
 
@@ -812,8 +819,13 @@ fn normalize_expire_edge(call: &ToolCall) -> ToolCall {
     }
 }
 
-fn apply_policy_overrides(cluster: &Cluster, calls: &[ToolCall], policy: &mut SynthesisPolicy) {
-    let confidence = (cluster.edge_indices.len() as f64 * 0.15).min(0.75);
+fn apply_policy_overrides(
+    cluster: &Cluster,
+    edges: &[ClusterEdge],
+    calls: &[ToolCall],
+    policy: &mut SynthesisPolicy,
+) {
+    let confidence = cluster_ceiling(cluster, edges);
     let mut idx = 0usize;
     while idx < calls.len() {
         match &calls[idx] {
@@ -827,6 +839,7 @@ fn apply_policy_overrides(cluster: &Cluster, calls: &[ToolCall], policy: &mut Sy
                     SynthesisEdgeOverride {
                         confidence,
                         stability: SYNTHESIS_STABILITY,
+                        ceiling: confidence,
                     },
                 );
             }
@@ -848,6 +861,14 @@ fn apply_policy_overrides(cluster: &Cluster, calls: &[ToolCall], policy: &mut Sy
         }
         idx += 1;
     }
+}
+
+fn cluster_ceiling(cluster: &Cluster, edges: &[ClusterEdge]) -> f64 {
+    let mut confidences = Vec::new();
+    for edge_index in &cluster.edge_indices {
+        confidences.push(edges[*edge_index].confidence);
+    }
+    synthesized_ceiling(&confidences).unwrap_or_default()
 }
 
 fn gist_refs(supported_by: &[(String, String)]) -> Vec<String> {
@@ -980,11 +1001,12 @@ fn upsert_edge_json(call: &ToolCall) -> serde_json::Value {
         subject,
         date,
         memory_type,
+        inferred_from,
     } = call
     else {
         unreachable!("upsert_edge_json called with non-upsert_edge");
     };
-    json!({"tool":"upsert_edge","args":{"source":source,"target":target,"content":content,"stability":stability,"confidence":confidence,"importance":importance,"subject":subject,"date":date,"memory_type":memory_type}})
+    json!({"tool":"upsert_edge","args":{"source":source,"target":target,"content":content,"stability":stability,"confidence":confidence,"importance":importance,"subject":subject,"date":date,"memory_type":memory_type,"inferred_from":inferred_from}})
 }
 
 fn gist_edge_json(call: &ToolCall) -> serde_json::Value {
@@ -1020,4 +1042,36 @@ fn format_blocks(blocks: &[(String, String)]) -> String {
 
 fn cluster_label(cluster: &Cluster) -> String {
     format!("cluster:{}:{}", cluster.hub, cluster.edge_indices.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cluster, ClusterEdge, cluster_ceiling};
+
+    fn cluster_edge(confidence: f64) -> ClusterEdge {
+        ClusterEdge {
+            source: "source".to_string(),
+            target: "target".to_string(),
+            content: "belief".to_string(),
+            confidence,
+            stability: 0.5,
+            importance: 0.5,
+            subject: false,
+            date: String::new(),
+            occurred_at: None,
+            expired_at: None,
+        }
+    }
+
+    #[test]
+    fn cluster_ceiling_uses_mean_confidence_not_cluster_size() {
+        let edges = vec![cluster_edge(0.25); 10];
+        let cluster = Cluster {
+            hub: "hub".to_string(),
+            edge_indices: (0..10).collect(),
+            node_ids: Vec::new(),
+            view_mass: 0.0,
+        };
+        assert_eq!(cluster_ceiling(&cluster, &edges), 0.25);
+    }
 }

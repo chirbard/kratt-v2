@@ -27,13 +27,21 @@ pub struct Edge {
     pub memory_type: String,
     pub origin_session: String,
     pub provenance: String,
+    // NULL in storage means the provenance tier owns the cap. Derived edges
+    // snapshot a premise-inherited cap here at creation time.
+    #[serde(default)]
+    pub ceiling: Option<f64>,
 }
 
 pub const PROVENANCE_USER_CONFIRMED: &str = "user-confirmed";
 pub const PROVENANCE_WEB_CONFIRMED: &str = "web-confirmed";
 pub const PROVENANCE_WEB_SURFACED: &str = "web-surfaced";
 pub const PROVENANCE_DREAMED: &str = "dreamed";
+pub const PROVENANCE_INFERRED: &str = "inferred";
+pub const PROVENANCE_SYNTHESIZED: &str = "synthesized";
 pub const PROVENANCE_LEGACY: &str = "legacy";
+pub const INFERENCE_DISCOUNT: f64 = 0.9; // replay-tunable.
+pub const SYNTHESIS_DISCOUNT: f64 = 0.9; // replay-tunable.
 
 pub fn provenance_ceiling(tier: &str) -> f64 {
     match tier {
@@ -41,8 +49,38 @@ pub fn provenance_ceiling(tier: &str) -> f64 {
         PROVENANCE_WEB_CONFIRMED => 0.8,  // replay-tunable.
         PROVENANCE_WEB_SURFACED => 0.5,   // replay-tunable.
         PROVENANCE_DREAMED => 0.25,       // replay-tunable.
-        _ => 0.5,                         // replay-tunable: legacy and unknown.
+        PROVENANCE_INFERRED | PROVENANCE_SYNTHESIZED => 0.25,
+        _ => 0.5, // replay-tunable: legacy and unknown.
     }
+}
+
+pub fn edge_ceiling(provenance: &str, ceiling: Option<f64>) -> f64 {
+    ceiling.unwrap_or_else(|| provenance_ceiling(provenance))
+}
+
+pub fn inferred_ceiling(confidences: &[f64]) -> Option<f64> {
+    let first = *confidences.first()?;
+    let mut minimum = first;
+    for confidence in &confidences[1..] {
+        minimum = minimum.min(*confidence);
+    }
+    Some(round_ceiling(
+        (minimum * INFERENCE_DISCOUNT).max(provenance_ceiling(PROVENANCE_DREAMED)),
+    ))
+}
+
+pub fn synthesized_ceiling(confidences: &[f64]) -> Option<f64> {
+    if confidences.is_empty() {
+        return None;
+    }
+    let mean = confidences.iter().sum::<f64>() / confidences.len() as f64;
+    Some(round_ceiling(
+        (mean * SYNTHESIS_DISCOUNT).max(provenance_ceiling(PROVENANCE_DREAMED)),
+    ))
+}
+
+fn round_ceiling(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
 }
 
 pub fn normalize_memory_type(raw: &str) -> String {
@@ -142,6 +180,7 @@ fn parse_toon_edge(fields: &[String]) -> Option<Edge> {
         memory_type: "semantic".to_string(),
         origin_session: String::new(),
         provenance: PROVENANCE_LEGACY.to_string(),
+        ceiling: None,
     })
 }
 
@@ -233,6 +272,7 @@ pub fn graph_to_json(graph: &Graph) -> serde_json::Value {
             "occurred_at": edge.occurred_at,
             "importance": round2(edge.importance),
             "provenance": edge.provenance,
+            "ceiling": edge.ceiling,
             "source": edge.source,
             "stability": round2(edge.stability),
             "subject": edge.subject,
@@ -248,8 +288,9 @@ pub fn graph_to_json(graph: &Graph) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        PROVENANCE_DREAMED, PROVENANCE_LEGACY, PROVENANCE_USER_CONFIRMED, PROVENANCE_WEB_CONFIRMED,
-        PROVENANCE_WEB_SURFACED, normalize_memory_type, provenance_ceiling,
+        PROVENANCE_DREAMED, PROVENANCE_INFERRED, PROVENANCE_LEGACY, PROVENANCE_SYNTHESIZED,
+        PROVENANCE_USER_CONFIRMED, PROVENANCE_WEB_CONFIRMED, PROVENANCE_WEB_SURFACED, edge_ceiling,
+        inferred_ceiling, normalize_memory_type, provenance_ceiling, synthesized_ceiling,
     };
 
     #[test]
@@ -270,13 +311,32 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cognitive_complexity)]
     fn provenance_tiers_have_structural_ceilings() {
         assert_eq!(provenance_ceiling(PROVENANCE_USER_CONFIRMED), 1.0);
         assert_eq!(provenance_ceiling(PROVENANCE_WEB_CONFIRMED), 0.8);
         assert_eq!(provenance_ceiling(PROVENANCE_WEB_SURFACED), 0.5);
         assert_eq!(provenance_ceiling(PROVENANCE_DREAMED), 0.25);
+        assert_eq!(provenance_ceiling(PROVENANCE_INFERRED), 0.25);
+        assert_eq!(provenance_ceiling(PROVENANCE_SYNTHESIZED), 0.25);
         assert_eq!(provenance_ceiling(PROVENANCE_LEGACY), 0.5);
         assert_eq!(provenance_ceiling(""), 0.5);
         assert_eq!(provenance_ceiling("future-tier"), 0.5);
+    }
+
+    #[test]
+    fn edge_ceiling_prefers_the_stored_cap() {
+        assert_eq!(edge_ceiling(PROVENANCE_USER_CONFIRMED, None), 1.0);
+        assert_eq!(edge_ceiling(PROVENANCE_SYNTHESIZED, Some(0.72)), 0.72);
+    }
+
+    #[test]
+    fn derived_ceiling_math_uses_premise_strength_and_floor() {
+        assert_eq!(inferred_ceiling(&[1.0, 0.9]), Some(0.81));
+        assert_eq!(inferred_ceiling(&[0.25, 0.25]), Some(0.25));
+        assert_eq!(synthesized_ceiling(&[1.0, 0.5]), Some(0.68));
+        assert_eq!(synthesized_ceiling(&[0.25; 10]), Some(0.25));
+        assert_eq!(inferred_ceiling(&[]), None);
+        assert_eq!(synthesized_ceiling(&[]), None);
     }
 }
