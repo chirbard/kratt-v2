@@ -159,7 +159,9 @@ fn apply_edge_delta(
     }
     let confidence_before = current.confidence;
     let confidence_after = clamp_confidence(confidence_before, edge_delta.delta);
-    if !db::update_edge_confidence(conn, &edge.source, &edge.target, confidence_after)? {
+    let stability_before = current.stability;
+    let stability_after = reinforced_stability(stability_before, edge_delta.delta);
+    if !db::update_edge_reinforcement(conn, &current, confidence_after, stability_after)? {
         return Ok(None);
     }
     let payload = serde_json::json!({
@@ -172,6 +174,8 @@ fn apply_edge_delta(
         "outcome_score": outcome_score,
         "confidence_before": confidence_before,
         "confidence_after": confidence_after,
+        "stability_before": stability_before,
+        "stability_after": stability_after,
     })
     .to_string();
     let event = Event::reinforced(
@@ -182,6 +186,13 @@ fn apply_edge_delta(
         payload,
     );
     Ok(Some(event))
+}
+
+fn reinforced_stability(current: f64, confidence_delta: f64) -> f64 {
+    if confidence_delta <= 0.0 || current >= 1.0 {
+        return current;
+    }
+    (current + confidence_delta).min(1.0)
 }
 
 fn clamp_confidence(current: f64, delta: f64) -> f64 {
@@ -348,7 +359,7 @@ async fn load_session_slice_async(
 mod tests {
     use super::{
         CONFIDENCE_MAX, CONFIDENCE_MIN, REINFORCE_RATE, SliceEvent, TEMPORAL_FLOOR,
-        clamp_confidence, compute_edge_deltas, temporal_weight,
+        clamp_confidence, compute_edge_deltas, reinforced_stability, temporal_weight,
     };
 
     fn edge_event(activity_weight: f64) -> SliceEvent {
@@ -454,6 +465,13 @@ mod tests {
         // An edge already above the ceiling must stay put under a positive nudge.
         assert!((clamp_confidence(0.98, 0.05) - 0.98).abs() < 1e-9);
         assert!((clamp_confidence(0.02, -0.05) - 0.02).abs() < 1e-9);
+    }
+
+    #[test]
+    fn only_positive_reinforcement_grows_stability() {
+        assert_eq!(reinforced_stability(0.4, 0.05), 0.45);
+        assert_eq!(reinforced_stability(0.4, -0.05), 0.4);
+        assert_eq!(reinforced_stability(1.0, 0.05), 1.0);
     }
 
     #[test]

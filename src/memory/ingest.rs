@@ -16,7 +16,9 @@ use crate::web::SearchClient;
 use super::agent::{self, ApplyToolOptions, ToolCall};
 use super::db;
 use super::embed::{self, SemanticEdge};
-use super::graph::{Edge, Node, PROVENANCE_WEB_SURFACED, edge_ceiling, normalize_id};
+use super::graph::{
+    Edge, Node, PROVENANCE_WEB_SURFACED, edge_ceiling, normalize_id, stability_seed_max,
+};
 use super::ledger::{self, Actor, EdgeRef, Event, EventContext};
 
 const INGEST_CHUNK_CHARS: usize = 4000; // replay-tunable.
@@ -519,7 +521,7 @@ fn execute_note_curiosity<'scope>(
     };
     db::write_node(study.conn, &topic_id, &topic_node)?;
     db::write_node(study.conn, &note_id, &note_node)?;
-    let edge = Edge {
+    let mut edge = Edge {
         source: note_id.clone(),
         target: topic_id.clone(),
         content: format!(
@@ -539,7 +541,12 @@ fn execute_note_curiosity<'scope>(
         provenance: PROVENANCE_WEB_SURFACED.to_string(),
         ceiling: None,
     };
-    let existed = db::load_edge(study.conn, &edge.source, &edge.target)?.is_some();
+    let existing = db::load_edge(study.conn, &edge.source, &edge.target)?;
+    edge.stability = match &existing {
+        Some(stored) => stored.stability,
+        None => edge.stability.min(stability_seed_max(&edge.provenance)),
+    };
+    let existed = existing.is_some();
     db::write_edge(study.conn, &edge, study.source_message_id)?;
     study.events.push(Event::upsert_with_payload(
         Actor::new("agent", "ingestor"),
@@ -578,7 +585,7 @@ fn record_skipped_chunk(
         db::write_node(conn, &fact_id, &fact)?;
         // The summary must live on the edge: edge content is what retrieval
         // embeds and injects — a body-only node is invisible to recall.
-        let edge = Edge {
+        let mut edge = Edge {
             source: fact_id.clone(),
             target: doc_node_id.to_string(),
             content: summary.to_string(),
@@ -594,7 +601,12 @@ fn record_skipped_chunk(
             provenance: PROVENANCE_WEB_SURFACED.to_string(),
             ceiling: None,
         };
-        let existed = db::load_edge(conn, &edge.source, &edge.target)?.is_some();
+        let existing = db::load_edge(conn, &edge.source, &edge.target)?;
+        edge.stability = match &existing {
+            Some(stored) => stored.stability,
+            None => edge.stability.min(stability_seed_max(&edge.provenance)),
+        };
+        let existed = existing.is_some();
         db::write_edge(conn, &edge, source_message_id)?;
         events.push(Event::upsert_with_payload(
             Actor::new("agent", "ingestor"),

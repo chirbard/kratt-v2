@@ -15,7 +15,6 @@ use super::graph::{normalize_id, synthesized_ceiling};
 const CLUSTER_MIN_EDGES: usize = 3; // replay-tunable.
 const SYNTHESIS_CLUSTERS_PER_PASS: usize = 2; // replay-tunable.
 const VIEW_MASS_WINDOW_DAYS: usize = 7; // replay-tunable.
-const SYNTHESIS_STABILITY: f64 = 0.4; // replay-tunable.
 
 pub struct SynthesisEdgeOverride {
     pub confidence: f64,
@@ -762,6 +761,7 @@ fn normalize_upsert_edge(call: &ToolCall, confidence: f64) -> ToolCall {
         source,
         target,
         content,
+        stability,
         importance,
         subject,
         date,
@@ -776,7 +776,7 @@ fn normalize_upsert_edge(call: &ToolCall, confidence: f64) -> ToolCall {
         source: source.clone(),
         target: target.clone(),
         content: content.clone(),
-        stability: SYNTHESIS_STABILITY,
+        stability: *stability,
         confidence,
         importance: *importance,
         subject: *subject,
@@ -832,16 +832,13 @@ fn apply_policy_overrides(
             ToolCall::UpsertNode { name, .. } => {
                 policy.synthesis_nodes.insert(normalize_id(name));
             }
-            ToolCall::UpsertEdge { source, target, .. } => {
-                let key = (normalize_id(source), normalize_id(target));
-                policy.edge_overrides.insert(
-                    key,
-                    SynthesisEdgeOverride {
-                        confidence,
-                        stability: SYNTHESIS_STABILITY,
-                        ceiling: confidence,
-                    },
-                );
+            ToolCall::UpsertEdge {
+                source,
+                target,
+                stability,
+                ..
+            } => {
+                add_edge_override(policy, source, target, *stability, confidence);
             }
             ToolCall::DeleteNode { .. }
             | ToolCall::DeleteEdge { .. }
@@ -861,6 +858,24 @@ fn apply_policy_overrides(
         }
         idx += 1;
     }
+}
+
+fn add_edge_override(
+    policy: &mut SynthesisPolicy,
+    source: &str,
+    target: &str,
+    stability: f64,
+    confidence: f64,
+) {
+    let key = (normalize_id(source), normalize_id(target));
+    policy.edge_overrides.insert(
+        key,
+        SynthesisEdgeOverride {
+            confidence,
+            stability,
+            ceiling: confidence,
+        },
+    );
 }
 
 fn cluster_ceiling(cluster: &Cluster, edges: &[ClusterEdge]) -> f64 {

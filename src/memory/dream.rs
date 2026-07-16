@@ -16,13 +16,12 @@ use super::db;
 use super::embed::{self, SemanticEdge};
 use super::graph::{
     Edge, Node, PROVENANCE_DREAMED, PROVENANCE_INFERRED, PROVENANCE_SYNTHESIZED, graph_to_json,
-    inferred_ceiling, normalize_id, synthesized_ceiling,
+    inferred_ceiling, normalize_id, stability_seed_max, synthesized_ceiling,
 };
 use super::hygiene;
 use super::ledger::{self, Actor, EdgeRef, Event, EventContext};
 use super::synthesis::{self, SynthesisPolicy};
 
-const DREAM_STABILITY: f64 = 0.3;
 const GIST_IMPORTANCE: f64 = 0.5; // replay-tunable.
 const MAX_PRUNES_PER_PASS: usize = 3; // replay-tunable.
 const PRUNE_GUARD_THRESHOLD: f64 = 0.7; // replay-tunable.
@@ -585,7 +584,7 @@ fn apply_dream_call<'scope, 'policy>(
             source,
             target,
             content,
-            stability: _,
+            stability,
             confidence,
             importance,
             subject,
@@ -598,6 +597,7 @@ fn apply_dream_call<'scope, 'policy>(
                 source,
                 target,
                 content,
+                stability,
                 confidence,
                 importance,
                 subject,
@@ -724,6 +724,7 @@ fn apply_dream_gist_edge<'scope, 'policy>(
     if let Some(existing) = db::load_edge(ctx.conn, &source, &target)? {
         edge.provenance = existing.provenance;
         edge.ceiling = existing.ceiling;
+        edge.stability = existing.stability;
     } else if supports.is_empty() {
         runlog::log(
             "epistemics",
@@ -787,7 +788,10 @@ fn gist_edge(source: &str, target: &str, call: &DreamGistCall, supports: &[Edge]
         source: source.to_string(),
         target: target.to_string(),
         content: call.content.clone(),
-        stability: call.stability.clamp(0.0, 1.0),
+        stability: call
+            .stability
+            .clamp(0.0, 1.0)
+            .min(stability_seed_max(provenance)),
         confidence: call.confidence.clamp(0.0, 1.0),
         importance: GIST_IMPORTANCE,
         subject: false,
@@ -827,11 +831,26 @@ struct DreamEdgeCall {
     source: String,
     target: String,
     content: String,
+    stability: f64,
     confidence: f64,
     importance: f64,
     subject: bool,
     date: String,
     inferred_from: Option<Vec<(String, String)>>,
+}
+
+struct DreamWeights {
+    stability: f64,
+    confidence: f64,
+}
+
+impl DreamWeights {
+    fn from_call(call: &DreamEdgeCall) -> Self {
+        Self {
+            stability: call.stability,
+            confidence: call.confidence,
+        }
+    }
 }
 
 struct DreamNodeCall {
@@ -895,11 +914,12 @@ fn apply_dream_upsert_edge<'scope, 'policy>(
     let existing = db::load_edge(ctx.conn, &source, &target)?;
     let key = (source.clone(), target.clone());
     let inherited = dream_declared_ceiling(ctx.conn, &edge_call.inferred_from)?;
+    let requested = DreamWeights::from_call(&edge_call);
     let (stability, confidence, provenance, ceiling) = dream_edge_values(
         ctx.apply_state.synthesis_policy,
         &key,
         existing.as_ref(),
-        edge_call.confidence,
+        &requested,
         inherited,
     );
     let edge = Edge {
@@ -935,14 +955,14 @@ fn dream_edge_values(
     policy: &SynthesisPolicy,
     key: &(String, String),
     existing: Option<&Edge>,
-    requested_confidence: f64,
+    requested: &DreamWeights,
     inherited: Option<f64>,
 ) -> (f64, f64, String, Option<f64>) {
-    let mut stability = DREAM_STABILITY;
-    let mut confidence = requested_confidence;
+    let mut stability = requested.stability;
+    let mut confidence = requested.confidence;
     if let Some(stored) = existing {
         return (
-            stability,
+            stored.stability,
             confidence,
             stored.provenance.clone(),
             stored.ceiling,
@@ -952,13 +972,19 @@ fn dream_edge_values(
         stability = override_values.stability;
         confidence = override_values.confidence;
         return (
-            stability,
+            stability.min(stability_seed_max(PROVENANCE_SYNTHESIZED)),
             confidence,
             PROVENANCE_SYNTHESIZED.to_string(),
             Some(override_values.ceiling),
         );
     }
-    dream_inferred_values(inherited, stability, confidence)
+    let values = dream_inferred_values(inherited, stability, confidence);
+    (
+        values.0.min(stability_seed_max(&values.2)),
+        values.1,
+        values.2,
+        values.3,
+    )
 }
 
 fn dream_declared_ceiling(
@@ -1429,6 +1455,7 @@ mod tests {
         assert_eq!(written.provenance, "dreamed");
         assert_eq!(written.ceiling, None);
         assert_eq!(written.confidence, 0.25);
+        assert_eq!(written.stability, 0.15);
     }
 
     #[test]
@@ -1450,11 +1477,31 @@ mod tests {
             &empty_policy(),
             &("result".to_string(), "fact".to_string()),
             None,
-            0.9,
+            &super::DreamWeights {
+                stability: 0.9,
+                confidence: 0.9,
+            },
             super::dream_declared_ceiling(&conn, &refs).unwrap_or_default(),
         );
         assert_eq!(values.2, "inferred");
         assert_eq!(values.3, Some(0.25));
+        assert_eq!(values.0, 0.3);
+    }
+
+    #[test]
+    fn dream_creation_clamps_model_stability_to_dream_seed() {
+        let values = dream_edge_values(
+            &empty_policy(),
+            &("dream".to_string(), "fact".to_string()),
+            None,
+            &super::DreamWeights {
+                stability: 0.9,
+                confidence: 0.9,
+            },
+            None,
+        );
+        assert_eq!(values.0, 0.15);
+        assert_eq!(values.2, "dreamed");
     }
 
     #[test]
