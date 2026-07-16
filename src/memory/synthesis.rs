@@ -128,6 +128,7 @@ fn load_live_edges() -> Vec<ClusterEdge> {
         expired_at,
         _memory_type,
         _origin_session,
+        _provenance,
         _embedding,
     ) in rows
     {

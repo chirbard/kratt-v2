@@ -10,6 +10,7 @@ use std::error::Error;
 use turso::{Connection, params};
 
 use super::db;
+use super::graph::provenance_ceiling;
 use super::ledger::{self, Actor, EdgeRef, Event, EventContext};
 
 // Enough examples to recognise the pattern in a log line, not a full dump.
@@ -164,22 +165,7 @@ fn expiry_event(source: &str, target: &str) -> Event {
 }
 
 async fn clamp_edge_weights(conn: &Connection) -> Result<usize, Box<dyn Error + Send + Sync>> {
-    let mut rows = conn
-        .query(
-            "SELECT source, target, confidence, stability, importance FROM edges WHERE confidence < 0 OR confidence > 1 OR stability < 0 OR stability > 1 OR importance < 0 OR importance > 1",
-            (),
-        )
-        .await?;
-    let mut clamped: Vec<(String, String, f64, f64, f64)> = Vec::new();
-    while let Some(row) = rows.next().await? {
-        clamped.push((
-            db::text(row.get_value(0)?),
-            db::text(row.get_value(1)?),
-            clamp_unit(db::real(row.get_value(2)?)),
-            clamp_unit(db::real(row.get_value(3)?)),
-            clamp_unit(db::real(row.get_value(4)?)),
-        ));
-    }
+    let clamped = load_clamped_weights(conn).await?;
     for (source, target, confidence, stability, importance) in &clamped {
         conn.execute(
             "UPDATE edges SET confidence = ?1, stability = ?2, importance = ?3 WHERE source = ?4 AND target = ?5",
@@ -194,6 +180,38 @@ async fn clamp_edge_weights(conn: &Connection) -> Result<usize, Box<dyn Error + 
         .await?;
     }
     Ok(clamped.len())
+}
+
+async fn load_clamped_weights(
+    conn: &Connection,
+) -> Result<Vec<(String, String, f64, f64, f64)>, Box<dyn Error + Send + Sync>> {
+    let mut rows = conn
+        .query(
+            "SELECT source, target, confidence, stability, importance, provenance
+             FROM edges
+             WHERE confidence < 0 OR confidence > 1
+                OR confidence > CASE provenance
+                    WHEN 'user-confirmed' THEN 1.0
+                    WHEN 'dreamed' THEN 0.25
+                    ELSE 0.5
+                END
+                OR stability < 0 OR stability > 1
+                OR importance < 0 OR importance > 1",
+            (),
+        )
+        .await?;
+    let mut clamped: Vec<(String, String, f64, f64, f64)> = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let provenance = db::text(row.get_value(5)?);
+        clamped.push((
+            db::text(row.get_value(0)?),
+            db::text(row.get_value(1)?),
+            clamp_unit(db::real(row.get_value(2)?)).min(provenance_ceiling(&provenance)),
+            clamp_unit(db::real(row.get_value(3)?)),
+            clamp_unit(db::real(row.get_value(4)?)),
+        ));
+    }
+    Ok(clamped)
 }
 
 fn clamp_unit(value: f64) -> f64 {
@@ -348,7 +366,7 @@ mod tests {
     use turso::{Builder, Connection, params};
 
     const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
-    const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', embedding BLOB, PRIMARY KEY (source, target))";
+    const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', embedding BLOB, PRIMARY KEY (source, target))";
     const EVENTS_DDL: &str = "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')";
     // record_events_in_tx also writes actor views and positions.
     const VIEWS_DDL: &str = "CREATE TABLE edge_actor_views (actor_type TEXT NOT NULL, actor_id TEXT NOT NULL, source TEXT NOT NULL, target TEXT NOT NULL, views REAL NOT NULL DEFAULT 0, last_visited_at TEXT NOT NULL, PRIMARY KEY (actor_type, actor_id, source, target))";
@@ -504,7 +522,8 @@ mod tests {
         db::block_on(add_node(&conn, "backup", "entity"));
         db::block_on(add_edge(&conn, "ask-about-backup", "backup", None));
         let _ = db::block_on(conn.execute(
-            "UPDATE edges SET confidence = 0.9, stability = 0.9, importance = 1.0 WHERE source = 'ask-about-backup'",
+            "UPDATE edges SET confidence = 0.9, stability = 0.9, importance = 1.0,
+             provenance = 'user-confirmed' WHERE source = 'ask-about-backup'",
             (),
         ));
 
@@ -534,7 +553,7 @@ mod tests {
         assert_eq!(report.clamped_edges, 1);
         assert_eq!(
             db::block_on(edge_weights(&conn, "alice", "berlin")),
-            (1.0, 0.0, 0.5)
+            (0.5, 0.0, 0.5)
         );
         // In-range edge untouched.
         assert_eq!(

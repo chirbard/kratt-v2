@@ -150,6 +150,7 @@ mod tests {
             expired_at: None,
             memory_type: "semantic".to_string(),
             origin_session: String::new(),
+            provenance: "legacy".to_string(),
         }
     }
 
@@ -192,6 +193,7 @@ mod tests {
             expired_at: None,
             memory_type: "episodic".to_string(),
             origin_session: "game-1".to_string(),
+            provenance: "user-confirmed".to_string(),
         }
     }
 

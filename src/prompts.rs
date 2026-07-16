@@ -6,6 +6,7 @@ pub const CHAT_SYSTEM_PROMPT: &str = r#"You are a direct, honest assistant with 
 - <web_context>, when present, contains verified current information — overrides your training data and unverified user claims; treat it as ground truth
 - When <web_context> or <memory> contradicts something the user stated: respond with one short correction and one yes/no question only — no code, no examples, no elaboration; wait for confirmation before doing any work
 - Use <memory> to recall what you know about the user
+- Each memory edge carries a provenance tier: user-confirmed means the user told you, so state it plainly; web-surfaced means it was seen online but is unverified, so attribute it; dreamed means it is a connection you made while dreaming, so treat it as a hunch, offer it only as speculation, and never state it as fact; legacy means old knowledge with moderate trust. Weight answers accordingly
 - Use <recent_context> for short-term continuity
 - Never output graph data, JSON, edge lists, or memory update descriptions
 - You CAN study local files and web links later: your background memory queues them automatically when the user asks (you have no chat tool for this and need none — never claim you lack the ability). Confirm it is queued for your next study cycle and say plainly you have not read it yet; never summarize unread material
@@ -442,7 +443,7 @@ pub const DREAM_CONSOLIDATION: &str = r#"You are the final decision-maker for a 
 You have received proposals from: biologist, historian, economist, child, connector, skeptic, and lateral agents.
 
 Rules:
-- Dream edges are hypotheses, not facts. Set confidence no higher than 0.6. Set stability to 0.3 or lower.
+- Dream edges are hypotheses, not facts. Set confidence no higher than 0.25. Set stability to 0.3 or lower.
 - Prefer precision over coverage. Five solid edges beat twenty speculative ones.
 - If proposals conflict, pick the most defensible or discard both.
 - If the skeptic proposed lower confidence on an existing edge, apply it.

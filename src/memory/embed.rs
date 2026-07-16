@@ -55,6 +55,7 @@ pub struct SemanticEdge {
     pub expired_at: Option<String>,
     pub memory_type: String,
     pub origin_session: String,
+    pub provenance: String,
     pub embedding: Option<Vec<f64>>,
 }
 
@@ -228,6 +229,7 @@ pub fn edges_to_toon(edges: &[SemanticEdge]) -> String {
             "date": edge.date,
             "occurred_at": edge.occurred_at,
             "expired_at": edge.expired_at,
+            "provenance": edge.provenance,
         }));
     }
     toon::encode(&json!({"nodes": [], "edges": edges_json}), None)
@@ -762,6 +764,7 @@ fn rows_to_semantic_edges(rows: Vec<db::SemanticEdgeRow>) -> Vec<SemanticEdge> {
         expired_at,
         memory_type,
         origin_session,
+        provenance,
         embedding,
     ) in rows
     {
@@ -778,6 +781,7 @@ fn rows_to_semantic_edges(rows: Vec<db::SemanticEdgeRow>) -> Vec<SemanticEdge> {
             expired_at,
             memory_type,
             origin_session,
+            provenance,
             embedding,
         });
     }
@@ -794,7 +798,8 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        SemanticEdge, interest_bonus, rank_by_exploration, satiation_factor, scope_episodic,
+        SemanticEdge, edges_to_toon, interest_bonus, rank_by_exploration, satiation_factor,
+        scope_episodic,
     };
     use crate::memory::db::InterestTarget;
 
@@ -812,6 +817,7 @@ mod tests {
             expired_at: None,
             memory_type: memory_type.to_string(),
             origin_session: origin_session.to_string(),
+            provenance: "legacy".to_string(),
             embedding: None,
         }
     }
@@ -821,6 +827,15 @@ mod tests {
         let edges = vec![test_edge("episodic", "game-1")];
         let scoped = scope_episodic(edges, Some("game-1"));
         assert_eq!(scoped.len(), 1);
+    }
+
+    #[test]
+    fn injected_context_includes_provenance() {
+        let mut edge = test_edge("semantic", "");
+        edge.provenance = "dreamed".to_string();
+        let toon = edges_to_toon(&[edge]);
+        assert!(toon.contains("provenance"));
+        assert!(toon.contains("dreamed"));
     }
 
     #[test]
