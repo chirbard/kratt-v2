@@ -30,6 +30,7 @@ pub struct Edge {
 }
 
 pub const PROVENANCE_USER_CONFIRMED: &str = "user-confirmed";
+pub const PROVENANCE_WEB_CONFIRMED: &str = "web-confirmed";
 pub const PROVENANCE_WEB_SURFACED: &str = "web-surfaced";
 pub const PROVENANCE_DREAMED: &str = "dreamed";
 pub const PROVENANCE_LEGACY: &str = "legacy";
@@ -37,6 +38,7 @@ pub const PROVENANCE_LEGACY: &str = "legacy";
 pub fn provenance_ceiling(tier: &str) -> f64 {
     match tier {
         PROVENANCE_USER_CONFIRMED => 1.0, // replay-tunable.
+        PROVENANCE_WEB_CONFIRMED => 0.8,  // replay-tunable.
         PROVENANCE_WEB_SURFACED => 0.5,   // replay-tunable.
         PROVENANCE_DREAMED => 0.25,       // replay-tunable.
         _ => 0.5,                         // replay-tunable: legacy and unknown.
@@ -246,8 +248,8 @@ pub fn graph_to_json(graph: &Graph) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        PROVENANCE_DREAMED, PROVENANCE_LEGACY, PROVENANCE_USER_CONFIRMED, PROVENANCE_WEB_SURFACED,
-        normalize_memory_type, provenance_ceiling,
+        PROVENANCE_DREAMED, PROVENANCE_LEGACY, PROVENANCE_USER_CONFIRMED, PROVENANCE_WEB_CONFIRMED,
+        PROVENANCE_WEB_SURFACED, normalize_memory_type, provenance_ceiling,
     };
 
     #[test]
@@ -270,6 +272,7 @@ mod tests {
     #[test]
     fn provenance_tiers_have_structural_ceilings() {
         assert_eq!(provenance_ceiling(PROVENANCE_USER_CONFIRMED), 1.0);
+        assert_eq!(provenance_ceiling(PROVENANCE_WEB_CONFIRMED), 0.8);
         assert_eq!(provenance_ceiling(PROVENANCE_WEB_SURFACED), 0.5);
         assert_eq!(provenance_ceiling(PROVENANCE_DREAMED), 0.25);
         assert_eq!(provenance_ceiling(PROVENANCE_LEGACY), 0.5);

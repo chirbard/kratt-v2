@@ -192,6 +192,7 @@ async fn load_clamped_weights(
              WHERE confidence < 0 OR confidence > 1
                 OR confidence > CASE provenance
                     WHEN 'user-confirmed' THEN 1.0
+                    WHEN 'web-confirmed' THEN 0.8
                     WHEN 'dreamed' THEN 0.25
                     ELSE 0.5
                 END

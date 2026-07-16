@@ -64,6 +64,15 @@ pub(crate) struct RecentLearning {
     pub provenance: String,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct NearestLiveEdge {
+    pub source: String,
+    pub target: String,
+    pub provenance: String,
+    pub confidence: f64,
+    pub similarity: f64,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct RegionTransition {
     pub target: String,
@@ -1656,25 +1665,37 @@ pub fn write_edge(
     })
 }
 
-pub(crate) fn nearest_live_edge_similarity(
+pub(crate) fn nearest_live_edges(
     conn: &Connection,
     vector: &[f64],
-) -> Result<Option<f64>, Box<dyn Error + Send + Sync>> {
+    limit: usize,
+) -> Result<Vec<NearestLiveEdge>, Box<dyn Error + Send + Sync>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     let json_str = vector32_json(vector)?;
     block_on(async {
         let mut rows = conn
             .query(
-                "SELECT vector_distance_cos(embedding, vector32(?1))
+                "SELECT source, target, provenance, confidence,
+                        vector_distance_cos(embedding, vector32(?1))
                  FROM edges WHERE embedding IS NOT NULL AND expired_at IS NULL
-                 ORDER BY vector_distance_cos(embedding, vector32(?1)) LIMIT 1",
-                params![json_str],
+                 ORDER BY vector_distance_cos(embedding, vector32(?1)) LIMIT ?2",
+                params![json_str, limit as i64],
             )
             .await?;
-        let Some(row) = rows.next().await? else {
-            return Ok(None);
-        };
-        let distance = row.get::<f64>(0)?;
-        Ok(Some((1.0 - distance).clamp(-1.0, 1.0)))
+        let mut edges = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let distance = row.get::<f64>(4)?;
+            edges.push(NearestLiveEdge {
+                source: text(row.get_value(0)?),
+                target: text(row.get_value(1)?),
+                provenance: text_or(row.get_value(2), PROVENANCE_LEGACY),
+                confidence: real(row.get_value(3)?),
+                similarity: (1.0 - distance).clamp(-1.0, 1.0),
+            });
+        }
+        Ok(edges)
     })
 }
 
