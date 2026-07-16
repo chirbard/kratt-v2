@@ -184,9 +184,9 @@ async fn clamp_edge_weights(conn: &Connection) -> Result<usize, Box<dyn Error + 
         conn.execute(
             "UPDATE edges SET confidence = ?1, stability = ?2, importance = ?3 WHERE source = ?4 AND target = ?5",
             params![
-                *confidence,
-                *stability,
-                *importance,
+                db::round2(*confidence),
+                db::round2(*stability),
+                db::round2(*importance),
                 source.as_str(),
                 target.as_str()
             ],
