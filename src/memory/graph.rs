@@ -269,42 +269,61 @@ pub fn closure_nodes(
     endpoints: &[(String, String)],
     nodes: &HashMap<String, Node>,
 ) -> Vec<(String, Node)> {
-    let mut seen = HashSet::new();
-    let mut selected = Vec::new();
-    let mut value_count = 0usize;
+    closure_nodes_with_limit(endpoints, nodes, Some(CLOSURE_NODE_CAP))
+}
+
+pub(crate) fn closure_nodes_uncapped(
+    endpoints: &[(String, String)],
+    nodes: &HashMap<String, Node>,
+) -> Vec<(String, Node)> {
+    closure_nodes_with_limit(endpoints, nodes, None)
+}
+
+fn closure_nodes_with_limit(
+    endpoints: &[(String, String)],
+    nodes: &HashMap<String, Node>,
+    limit: Option<usize>,
+) -> Vec<(String, Node)> {
+    let mut state = ClosureState {
+        seen: HashSet::new(),
+        selected: Vec::new(),
+        value_count: 0,
+        limit,
+    };
     for (source, target) in endpoints {
-        collect_closure_node(source, nodes, &mut seen, &mut selected, &mut value_count);
-        collect_closure_node(target, nodes, &mut seen, &mut selected, &mut value_count);
+        collect_closure_node(source, nodes, &mut state);
+        collect_closure_node(target, nodes, &mut state);
     }
-    if value_count > CLOSURE_NODE_CAP {
+    if limit.is_some_and(|cap| state.value_count > cap) {
         crate::runlog::log(
             "toon",
             &format!(
-                "closure capped: {} of {value_count} nodes",
-                CLOSURE_NODE_CAP
+                "closure capped: {} of {} nodes",
+                CLOSURE_NODE_CAP, state.value_count
             ),
         );
     }
-    selected.sort_by(|left, right| left.0.cmp(&right.0));
-    selected
+    state.selected.sort_by(|left, right| left.0.cmp(&right.0));
+    state.selected
 }
 
-fn collect_closure_node(
-    node_id: &str,
-    nodes: &HashMap<String, Node>,
-    seen: &mut HashSet<String>,
-    selected: &mut Vec<(String, Node)>,
-    value_count: &mut usize,
-) {
+struct ClosureState {
+    seen: HashSet<String>,
+    selected: Vec<(String, Node)>,
+    value_count: usize,
+    limit: Option<usize>,
+}
+
+fn collect_closure_node(node_id: &str, nodes: &HashMap<String, Node>, state: &mut ClosureState) {
     let Some(node) = nodes.get(node_id) else {
         return;
     };
-    if !node_carries_value(node) || !seen.insert(node_id.to_string()) {
+    if !node_carries_value(node) || !state.seen.insert(node_id.to_string()) {
         return;
     }
-    *value_count += 1;
-    if selected.len() < CLOSURE_NODE_CAP {
-        selected.push((node_id.to_string(), node.clone()));
+    state.value_count += 1;
+    if state.limit.is_none_or(|cap| state.selected.len() < cap) {
+        state.selected.push((node_id.to_string(), node.clone()));
     }
 }
 

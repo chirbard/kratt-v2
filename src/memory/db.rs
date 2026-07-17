@@ -183,6 +183,7 @@ fn open_and_probe_synced(
         } else {
             startup_pull_best_effort(&database, &conn).await?;
         }
+        let _ = migrate_entity_bodies_matching_ids(&conn).await?;
         Ok(DbHandle::Synced(database))
     })
 }
@@ -306,6 +307,9 @@ async fn open_local() -> Database {
         .expect("open db");
     let conn = database.connect().expect("db connect");
     init_schema(&conn, true).await.expect("init schema");
+    migrate_entity_bodies_matching_ids(&conn)
+        .await
+        .expect("entity body migration");
     database
 }
 
@@ -333,6 +337,7 @@ async fn open_synced_result(
         return Err(format!("legacy migration failed: {err}").into());
     }
     let _ = backfill_edge_epistemics(&conn).await?;
+    let _ = migrate_entity_bodies_matching_ids(&conn).await?;
     Ok(database)
 }
 
@@ -714,6 +719,38 @@ async fn backfill_edge_epistemics(
     }
     log_epistemics_backfill(&summary);
     Ok(summary)
+}
+
+async fn migrate_entity_bodies_matching_ids(
+    conn: &Connection,
+) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+    let predicate = "node_type = 'entity' AND body != ''
+        AND lower(trim(replace(replace(body, '-', ' '), '_', ' ')))
+          = lower(trim(replace(replace(id, '-', ' '), '_', ' ')))";
+    let mut rows = conn
+        .query(
+            &format!("SELECT id FROM nodes WHERE {predicate} ORDER BY id"),
+            (),
+        )
+        .await?;
+    let mut ids = Vec::new();
+    while let Some(row) = rows.next().await? {
+        ids.push(text(row.get_value(0)?));
+    }
+    conn.execute(&format!("UPDATE nodes SET body = '' WHERE {predicate}"), ())
+        .await?;
+    log_entity_body_migration(&ids);
+    Ok(ids)
+}
+
+fn log_entity_body_migration(ids: &[String]) {
+    if ids.is_empty() {
+        return;
+    }
+    for node_id in ids {
+        crate::runlog::log("nodes", &format!("migrated body≈id: {node_id}"));
+    }
+    crate::runlog::log("nodes", &format!("migrated body≈id: {} nodes", ids.len()));
 }
 
 async fn load_unclassified_edges(
@@ -1291,7 +1328,9 @@ pub fn db_init() -> Result<(), Box<dyn Error + Send + Sync>> {
     if graph.nodes.is_empty() && graph.edges.is_empty() {
         return Ok(());
     }
-    runtime().block_on(write_graph(&conn, &graph))
+    runtime().block_on(write_graph(&conn, &graph))?;
+    let _ = runtime().block_on(migrate_entity_bodies_matching_ids(&conn))?;
+    Ok(())
 }
 
 async fn node_count(conn: &Connection) -> Result<i64, Box<dyn Error + Send + Sync>> {
@@ -3660,9 +3699,9 @@ mod tests {
         insert_finding, insert_interest, interest_density_with, load_all_edges_semantic_async,
         load_due_loops, load_game_edges, load_loops_for_anchors, load_ping_policy,
         load_recent_attention_counts_async, load_session_game, load_task_chain,
-        load_unembedded_edges_async, mark_finding_surfaced, recover_replica_once, resume_pings,
-        set_ping_mute, top_interests_with, unsurfaced_findings, update_edge_confidence,
-        with_write_lock, write_edge,
+        load_unembedded_edges_async, mark_finding_surfaced, migrate_entity_bodies_matching_ids,
+        recover_replica_once, resume_pings, set_ping_mute, top_interests_with, unsurfaced_findings,
+        update_edge_confidence, with_write_lock, write_edge,
     };
     use crate::memory::graph::Edge;
     use crate::web::NewsItem;
@@ -4047,6 +4086,46 @@ mod tests {
                 ("unknown".to_string(), "legacy".to_string(), 0.5),
             ]
         );
+    }
+
+    #[test]
+    fn entity_body_id_migration_is_strict_and_idempotent() {
+        let conn = block_on(harness());
+        block_on(async {
+            let _ = conn
+                .execute(
+                    "INSERT INTO nodes (id, node_type, body) VALUES
+                    ('some-name', 'entity', ' Some_Name '),
+                    ('another-name', 'entity', 'ANOTHER-NAME'),
+                    ('fact-name', 'fact', 'fact name'),
+                    ('kept', 'entity', 'different')",
+                    (),
+                )
+                .await;
+        });
+        let first = block_on(migrate_entity_bodies_matching_ids(&conn)).unwrap_or_default();
+        assert_eq!(first, vec!["another-name", "some-name"]);
+        assert_eq!(node_body(&conn, "some-name"), "");
+        assert_eq!(node_body(&conn, "another-name"), "");
+        assert_eq!(node_body(&conn, "fact-name"), "fact name");
+        assert_eq!(node_body(&conn, "kept"), "different");
+        let second = block_on(migrate_entity_bodies_matching_ids(&conn)).unwrap_or_default();
+        assert!(second.is_empty());
+    }
+
+    fn node_body(conn: &Connection, node_id: &str) -> String {
+        block_on(async {
+            let Ok(mut rows) = conn
+                .query("SELECT body FROM nodes WHERE id = ?1", params![node_id])
+                .await
+            else {
+                return String::new();
+            };
+            match rows.next().await {
+                Ok(Some(row)) => row.get::<String>(0).unwrap_or_default(),
+                _ => String::new(),
+            }
+        })
     }
 
     async fn migration_harness() -> Connection {

@@ -18,6 +18,8 @@ pub const CHAT_SYSTEM_PROMPT: &str = r#"You are a direct, honest assistant with 
 
 pub const EXTRACT_EXPLANATION: &str = r#"You are the extraction agent for a memory graph. Extract the surprise: what this conversation adds to, contradicts, or refines in what memory already knows.
 
+The memory state shown is a relevance-selected subset, not the whole graph: absence of a belief here does not mean memory lacks it, so prefer retrieve-style caution over asserting global absence.
+
 ## What memory already predicted
 
 The "Beliefs injected into this turn" section, when present, is what memory retrieved and showed the assistant before it answered — memory's prediction for this turn.
@@ -54,6 +56,8 @@ The "Beliefs injected into this turn" section, when present, is what memory retr
 pub const CONSOLIDATE_EXPLANATION: &str = r#"You are a quality-gate agent for a memory graph. The extract agent just ran — your job is to audit its changes and push back where needed.
 
 The diff below shows exactly what extract added (+) and removed (-). Focus on those lines.
+
+The memory state shown is a relevance-selected subset, not the whole graph: absence of a belief here does not mean memory lacks it, so prefer retrieve-style caution over asserting global absence.
 
 - Delete nodes or edges that are wrong, too vague, or cannot be verified from the conversation
 - Merge nodes that duplicate existing ones: re-add their edges under the canonical name, delete_node the duplicate
@@ -309,11 +313,7 @@ pub fn build_agent_prompt(input: &AgentPrompt) -> String {
     push_injected_section(&mut prompt, input.injected_toon);
     push_role(&mut prompt, input.explanation);
     if let Some(game) = input.active_game {
-        prompt.push_str("\n\n## Active game\n\nThis session is playing: ");
-        prompt.push_str(game);
-        prompt.push_str(
-            ". Rules stated in the exchange go through record_rule. If the game ended this turn (checkmate, resignation, agreed draw), emit record_outcome with the result from the assistant's perspective.",
-        );
+        prompt.push_str(&active_game_context(game));
     }
     if let Some(diff) = input.diff_text {
         prompt.push_str("\n\n## What extract added\n\n");
@@ -324,6 +324,12 @@ pub fn build_agent_prompt(input: &AgentPrompt) -> String {
     prompt.push_str("\nAssistant: ");
     prompt.push_str(input.assistant_msg);
     prompt
+}
+
+pub(crate) fn active_game_context(game: &str) -> String {
+    format!(
+        "\n\n## Active game\n\nThis session is playing: {game}. Rules stated in the exchange go through record_rule. If the game ended this turn (checkmate, resignation, agreed draw), emit record_outcome with the result from the assistant's perspective."
+    )
 }
 
 fn push_injected_section(prompt: &mut String, injected_toon: Option<&str>) {
@@ -873,6 +879,13 @@ mod tests {
         });
         let toon_end = position(&extract, toon) + toon.len();
         assert!(common_prefix_len(&extract, &consolidate) >= toon_end);
+    }
+
+    #[test]
+    fn heavy_roles_warn_that_memory_state_is_bounded() {
+        let warning = "relevance-selected subset, not the whole graph";
+        assert!(EXTRACT_EXPLANATION.contains(warning));
+        assert!(CONSOLIDATE_EXPLANATION.contains(warning));
     }
 
     #[test]

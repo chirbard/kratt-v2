@@ -10,9 +10,11 @@ use crate::timeutil;
 
 use super::MemoryEvent;
 use super::db;
-use super::graph::{Node, closure_nodes};
+use super::graph::{Edge, Node, closure_nodes, closure_nodes_uncapped};
 use super::ledger;
 use super::routing;
+
+type ClosureFn = fn(&[(String, String)], &HashMap<String, Node>) -> Vec<(String, Node)>;
 
 pub const EMBED_BATCH: usize = 50;
 pub const TOP_K: usize = 60;
@@ -221,6 +223,13 @@ pub fn edges_to_toon(edges: &[SemanticEdge]) -> String {
     edges_to_toon_with_nodes(edges, &nodes)
 }
 
+pub(crate) fn packed_edges_to_toon(
+    edges: &[SemanticEdge],
+    nodes: &HashMap<String, Node>,
+) -> String {
+    edges_to_toon_with_closure(edges, closure_nodes_uncapped, nodes)
+}
+
 fn endpoint_nodes(edges: &[SemanticEdge]) -> HashMap<String, Node> {
     let mut node_ids = Vec::new();
     for edge in edges {
@@ -240,6 +249,14 @@ fn endpoint_nodes(edges: &[SemanticEdge]) -> HashMap<String, Node> {
 }
 
 fn edges_to_toon_with_nodes(edges: &[SemanticEdge], nodes: &HashMap<String, Node>) -> String {
+    edges_to_toon_with_closure(edges, closure_nodes, nodes)
+}
+
+fn edges_to_toon_with_closure(
+    edges: &[SemanticEdge],
+    closure_fn: ClosureFn,
+    nodes: &HashMap<String, Node>,
+) -> String {
     let mut edges_json = Vec::new();
     let mut endpoints = Vec::new();
     for edge in edges {
@@ -258,7 +275,7 @@ fn edges_to_toon_with_nodes(edges: &[SemanticEdge], nodes: &HashMap<String, Node
             "provenance": edge.provenance,
         }));
     }
-    let closure = closure_nodes(&endpoints, nodes);
+    let closure = closure_fn(&endpoints, nodes);
     let mut nodes_json = Vec::new();
     for (node_id, node) in closure {
         nodes_json.push(json!({
@@ -269,6 +286,40 @@ fn edges_to_toon_with_nodes(edges: &[SemanticEdge], nodes: &HashMap<String, Node
         }));
     }
     toon::encode(&json!({"nodes": nodes_json, "edges": edges_json}), None)
+}
+
+pub(crate) fn semantic_edge(edge: &Edge) -> SemanticEdge {
+    SemanticEdge {
+        source: edge.source.clone(),
+        target: edge.target.clone(),
+        content: edge.content.clone(),
+        confidence: edge.confidence,
+        stability: edge.stability,
+        importance: edge.importance,
+        subject: edge.subject,
+        date: edge.date.clone(),
+        occurred_at: edge.occurred_at.clone(),
+        expired_at: edge.expired_at.clone(),
+        memory_type: edge.memory_type.clone(),
+        origin_session: edge.origin_session.clone(),
+        provenance: edge.provenance.clone(),
+        embedding: None,
+    }
+}
+
+pub(crate) fn nearest_edges(
+    embed: &dyn EmbeddingClient,
+    query: &str,
+    session_id: Option<&str>,
+    limit: usize,
+) -> Vec<SemanticEdge> {
+    let Ok(vector) = embed_text(embed, query) else {
+        return Vec::new();
+    };
+    let Ok(rows) = db::query_edges_by_vector(&vector, limit) else {
+        return Vec::new();
+    };
+    scope_episodic(rows_to_semantic_edges(rows), session_id)
 }
 
 fn embed_batch(
@@ -474,8 +525,7 @@ fn log_interest_anchor(
     if matches!(
         unpulled_top,
         Some((_, key)) if key.0 == first.edge.source && key.1 == first.edge.target
-    )
-    {
+    ) {
         return;
     }
     let mut best: Option<(&db::InterestTarget, f64)> = None;
