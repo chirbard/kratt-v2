@@ -1348,7 +1348,10 @@ async fn load_nodes(conn: &Connection, graph: &mut Graph) {
 async fn load_edges(conn: &Connection, graph: &mut Graph) {
     let Ok(mut rows) = conn
         .query(
-            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session, provenance, ceiling FROM edges",
+            // Stable order: TOON emission preserves row order, so an unordered scan
+            // makes graph serializations engine-dependent — deterministic bytes are
+            // a precondition for any prompt prefix reuse across calls.
+            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session, provenance, ceiling FROM edges ORDER BY source, target",
             (),
         )
         .await
