@@ -10,6 +10,7 @@ use crate::timeutil;
 
 use super::MemoryEvent;
 use super::db;
+use super::graph::{Node, closure_nodes};
 use super::ledger;
 use super::routing;
 
@@ -216,8 +217,33 @@ pub fn select_exploration_edges(
 }
 
 pub fn edges_to_toon(edges: &[SemanticEdge]) -> String {
-    let mut edges_json = Vec::new();
+    let nodes = endpoint_nodes(edges);
+    edges_to_toon_with_nodes(edges, &nodes)
+}
+
+fn endpoint_nodes(edges: &[SemanticEdge]) -> HashMap<String, Node> {
+    let mut node_ids = Vec::new();
     for edge in edges {
+        node_ids.push(edge.source.clone());
+        node_ids.push(edge.target.clone());
+    }
+    let Ok(conn) = db::open_connection() else {
+        return HashMap::new();
+    };
+    match db::load_nodes_by_ids(&conn, &node_ids) {
+        Ok(nodes) => nodes,
+        Err(err) => {
+            runlog::log("toon", &format!("node closure load failed: {err}"));
+            HashMap::new()
+        }
+    }
+}
+
+fn edges_to_toon_with_nodes(edges: &[SemanticEdge], nodes: &HashMap<String, Node>) -> String {
+    let mut edges_json = Vec::new();
+    let mut endpoints = Vec::new();
+    for edge in edges {
+        endpoints.push((edge.source.clone(), edge.target.clone()));
         edges_json.push(json!({
             "source": edge.source,
             "target": edge.target,
@@ -232,7 +258,17 @@ pub fn edges_to_toon(edges: &[SemanticEdge]) -> String {
             "provenance": edge.provenance,
         }));
     }
-    toon::encode(&json!({"nodes": [], "edges": edges_json}), None)
+    let closure = closure_nodes(&endpoints, nodes);
+    let mut nodes_json = Vec::new();
+    for (node_id, node) in closure {
+        nodes_json.push(json!({
+            "body": node.body,
+            "date": node.date,
+            "id": node_id,
+            "type": node.node_type,
+        }));
+    }
+    toon::encode(&json!({"nodes": nodes_json, "edges": edges_json}), None)
 }
 
 fn embed_batch(
@@ -798,10 +834,11 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        SemanticEdge, edges_to_toon, interest_bonus, rank_by_exploration, satiation_factor,
-        scope_episodic,
+        SemanticEdge, edges_to_toon, edges_to_toon_with_nodes, interest_bonus, rank_by_exploration,
+        satiation_factor, scope_episodic,
     };
     use crate::memory::db::InterestTarget;
+    use crate::memory::graph::Node;
 
     fn test_edge(memory_type: &str, origin_session: &str) -> SemanticEdge {
         SemanticEdge {
@@ -836,6 +873,59 @@ mod tests {
         let toon = edges_to_toon(&[edge]);
         assert!(toon.contains("provenance"));
         assert!(toon.contains("dreamed"));
+    }
+
+    #[test]
+    fn bounded_toon_includes_fact_endpoint_body() {
+        let edge = test_edge("semantic", "");
+        let nodes = HashMap::from([
+            (
+                "a".to_string(),
+                Node {
+                    node_type: "fact".to_string(),
+                    body: "Atomic sentence".to_string(),
+                    date: "2026-07-17".to_string(),
+                },
+            ),
+            (
+                "b".to_string(),
+                Node {
+                    node_type: "entity".to_string(),
+                    body: String::new(),
+                    date: String::new(),
+                },
+            ),
+        ]);
+        let first = edges_to_toon_with_nodes(std::slice::from_ref(&edge), &nodes);
+        let second = edges_to_toon_with_nodes(std::slice::from_ref(&edge), &nodes);
+        assert!(first.contains("Atomic sentence"));
+        assert!(!first.contains("\"b\""));
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn bounded_toon_has_empty_nodes_for_mute_entities() {
+        let edge = test_edge("semantic", "");
+        let nodes = HashMap::from([
+            (
+                "a".to_string(),
+                Node {
+                    node_type: "entity".to_string(),
+                    body: " ".to_string(),
+                    date: String::new(),
+                },
+            ),
+            (
+                "b".to_string(),
+                Node {
+                    node_type: "entity".to_string(),
+                    body: String::new(),
+                    date: String::new(),
+                },
+            ),
+        ]);
+        let toon = edges_to_toon_with_nodes(&[edge], &nodes);
+        assert!(toon.contains("nodes[0]"));
     }
 
     #[test]

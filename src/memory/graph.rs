@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Node {
     pub node_type: String,
     pub body: String,
@@ -42,6 +43,7 @@ pub const PROVENANCE_SYNTHESIZED: &str = "synthesized";
 pub const PROVENANCE_LEGACY: &str = "legacy";
 pub const INFERENCE_DISCOUNT: f64 = 0.9; // replay-tunable.
 pub const SYNTHESIS_DISCOUNT: f64 = 0.9; // replay-tunable.
+pub const CLOSURE_NODE_CAP: usize = 40; // replay-tunable.
 
 pub fn stability_seed_max(provenance: &str) -> f64 {
     match provenance {
@@ -256,6 +258,56 @@ fn round2(value: f64) -> f64 {
     (value * 100.0).round() / 100.0
 }
 
+pub fn node_carries_value(node: &Node) -> bool {
+    node.node_type != "entity" || !node.body.trim().is_empty()
+}
+
+// Selected edges keep endpoint priority in their existing relevance order.
+// The chosen closure is sorted only after the cap is applied so emitted bytes
+// stay deterministic without losing the ranking signal at the boundary.
+pub fn closure_nodes(
+    endpoints: &[(String, String)],
+    nodes: &HashMap<String, Node>,
+) -> Vec<(String, Node)> {
+    let mut seen = HashSet::new();
+    let mut selected = Vec::new();
+    let mut value_count = 0usize;
+    for (source, target) in endpoints {
+        collect_closure_node(source, nodes, &mut seen, &mut selected, &mut value_count);
+        collect_closure_node(target, nodes, &mut seen, &mut selected, &mut value_count);
+    }
+    if value_count > CLOSURE_NODE_CAP {
+        crate::runlog::log(
+            "toon",
+            &format!(
+                "closure capped: {} of {value_count} nodes",
+                CLOSURE_NODE_CAP
+            ),
+        );
+    }
+    selected.sort_by(|left, right| left.0.cmp(&right.0));
+    selected
+}
+
+fn collect_closure_node(
+    node_id: &str,
+    nodes: &HashMap<String, Node>,
+    seen: &mut HashSet<String>,
+    selected: &mut Vec<(String, Node)>,
+    value_count: &mut usize,
+) {
+    let Some(node) = nodes.get(node_id) else {
+        return;
+    };
+    if !node_carries_value(node) || !seen.insert(node_id.to_string()) {
+        return;
+    }
+    *value_count += 1;
+    if selected.len() < CLOSURE_NODE_CAP {
+        selected.push((node_id.to_string(), node.clone()));
+    }
+}
+
 pub fn graph_to_json(graph: &Graph) -> serde_json::Value {
     let mut node_names: Vec<&String> = graph.nodes.keys().collect();
     node_names.sort();
@@ -264,6 +316,9 @@ pub fn graph_to_json(graph: &Graph) -> serde_json::Value {
         let Some(node) = graph.nodes.get(node_name) else {
             continue;
         };
+        if !node_carries_value(node) {
+            continue;
+        }
         nodes_json.push(serde_json::json!({
             "body": node.body,
             "date": node.date,
@@ -296,12 +351,109 @@ pub fn graph_to_json(graph: &Graph) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::{
-        PROVENANCE_DREAMED, PROVENANCE_INFERRED, PROVENANCE_LEGACY, PROVENANCE_SYNTHESIZED,
-        PROVENANCE_USER_CONFIRMED, PROVENANCE_WEB_CONFIRMED, PROVENANCE_WEB_SURFACED, edge_ceiling,
-        inferred_ceiling, normalize_memory_type, provenance_ceiling, stability_seed_max,
-        synthesized_ceiling,
+        CLOSURE_NODE_CAP, Edge, Graph, Node, PROVENANCE_DREAMED, PROVENANCE_INFERRED,
+        PROVENANCE_LEGACY, PROVENANCE_SYNTHESIZED, PROVENANCE_USER_CONFIRMED,
+        PROVENANCE_WEB_CONFIRMED, PROVENANCE_WEB_SURFACED, closure_nodes, edge_ceiling,
+        graph_to_json, inferred_ceiling, node_carries_value, normalize_memory_type,
+        provenance_ceiling, stability_seed_max, synthesized_ceiling,
     };
+
+    fn node(node_type: &str, body: &str) -> Node {
+        Node {
+            node_type: node_type.to_string(),
+            body: body.to_string(),
+            date: String::new(),
+        }
+    }
+
+    #[test]
+    fn value_predicate_only_mutes_empty_entities() {
+        for node_type in ["fact", "synthesis", "loop", "task"] {
+            assert!(node_carries_value(&node(node_type, "")));
+        }
+        assert!(node_carries_value(&node("entity", "meaningful")));
+        assert!(!node_carries_value(&node("entity", "")));
+        assert!(!node_carries_value(&node("entity", " \n\t")));
+    }
+
+    #[test]
+    fn closure_is_value_bearing_sorted_deduplicated_and_bounded() {
+        let nodes = HashMap::from([
+            ("a".to_string(), node("fact", "A fact")),
+            ("b".to_string(), node("entity", "")),
+            ("c".to_string(), node("loop", "")),
+            ("outside".to_string(), node("fact", "not selected")),
+        ]);
+        let endpoints = vec![
+            ("c".to_string(), "b".to_string()),
+            ("a".to_string(), "c".to_string()),
+        ];
+        let closure = closure_nodes(&endpoints, &nodes);
+        let mut node_ids = Vec::new();
+        for (node_id, _) in &closure {
+            node_ids.push(node_id.as_str());
+        }
+        assert_eq!(node_ids, vec!["a", "c"]);
+    }
+
+    #[test]
+    fn closure_cap_prefers_earlier_edge_endpoints() {
+        let mut nodes = HashMap::new();
+        let mut endpoints = Vec::new();
+        let total = CLOSURE_NODE_CAP + 2;
+        for index in 0..total {
+            let node_id = format!("node-{index:02}");
+            nodes.insert(node_id.clone(), node("fact", &node_id));
+            endpoints.push((node_id, "mute".to_string()));
+        }
+        nodes.insert("mute".to_string(), node("entity", ""));
+        let closure = closure_nodes(&endpoints, &nodes);
+        assert_eq!(closure.len(), CLOSURE_NODE_CAP);
+        let mut includes_first = false;
+        let mut includes_over_cap = false;
+        for (node_id, _) in &closure {
+            includes_first |= node_id == "node-00";
+            includes_over_cap |= node_id == "node-40";
+        }
+        assert!(includes_first);
+        assert!(!includes_over_cap);
+    }
+
+    #[test]
+    fn full_graph_filters_only_mute_entities_deterministically() {
+        let mut graph = Graph::new();
+        graph.nodes.insert("mute".to_string(), node("entity", " "));
+        graph
+            .nodes
+            .insert("entity".to_string(), node("entity", "body"));
+        graph.nodes.insert("task".to_string(), node("task", ""));
+        graph.edges.push(Edge {
+            source: "entity".to_string(),
+            target: "task".to_string(),
+            content: String::new(),
+            stability: 0.0,
+            confidence: 0.0,
+            importance: 0.0,
+            date: String::new(),
+            subject: false,
+            occurred_at: None,
+            expired_at: None,
+            memory_type: "semantic".to_string(),
+            origin_session: String::new(),
+            provenance: PROVENANCE_LEGACY.to_string(),
+            ceiling: None,
+        });
+        let first = graph_to_json(&graph);
+        let second = graph_to_json(&graph);
+        let Some(emitted) = first["nodes"].as_array() else {
+            panic!("nodes array missing");
+        };
+        assert_eq!(emitted.len(), 2);
+        assert_eq!(first, second);
+    }
 
     #[test]
     fn normalize_memory_type_accepts_episodic() {

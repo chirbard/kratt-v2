@@ -1798,6 +1798,43 @@ pub fn load_node(
     })
 }
 
+pub fn load_nodes_by_ids(
+    conn: &Connection,
+    node_ids: &[String],
+) -> Result<HashMap<String, Node>, Box<dyn Error + Send + Sync>> {
+    if node_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut values = Vec::new();
+    let mut placeholders = Vec::new();
+    let mut seen = HashSet::new();
+    for node_id in node_ids {
+        if seen.insert(node_id) {
+            values.push(Value::Text(node_id.clone()));
+            placeholders.push(format!("?{}", values.len()));
+        }
+    }
+    let query = format!(
+        "SELECT id, node_type, body, date FROM nodes WHERE id IN ({})",
+        placeholders.join(", ")
+    );
+    runtime().block_on(async {
+        let mut rows = conn.query(&query, turso::params_from_iter(values)).await?;
+        let mut nodes = HashMap::new();
+        while let Some(row) = rows.next().await? {
+            nodes.insert(
+                text(row.get_value(0)?),
+                Node {
+                    node_type: text(row.get_value(1)?),
+                    body: text(row.get_value(2)?),
+                    date: text(row.get_value(3)?),
+                },
+            );
+        }
+        Ok(nodes)
+    })
+}
+
 // The game-definition node a session's task hub is linked to (episodic
 // hub→game edge), if any. Returns the normalized game id and its node so the
 // caller can render the definition body and anchor rules/strategies.
@@ -3461,7 +3498,7 @@ pub fn graph_diff_toon(pre: &Graph, post: &Graph) -> String {
 
 fn node_diff_lines(pre: &Graph, post: &Graph, lines: &mut Vec<String>) {
     for (node_id, node) in &post.nodes {
-        if !pre.nodes.contains_key(node_id) {
+        if !pre.nodes.contains_key(node_id) && super::graph::node_carries_value(node) {
             lines.push(format!(
                 "+nodes[{node_id} | {} | {} | {}]",
                 node.node_type, node.body, node.date
