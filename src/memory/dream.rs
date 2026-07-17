@@ -291,6 +291,12 @@ fn execute_dream_pass(
         let consolidation =
             run_consolidation_agent(llm, &session_id, &global_toon, &all_ctx, sender)?;
         let tool_calls = parse_tool_calls(&consolidation);
+        if tool_calls.is_empty() {
+            // Two consecutive post-reorder dreams wrote zero edges with no
+            // visibility into why — a truncated raw reply is the diagnostic.
+            let preview: String = consolidation.chars().take(600).collect();
+            runlog::log("dream", &format!("consolidation parsed 0 tool calls; reply head: {preview}"));
+        }
         let source_id = format!("dream:{session_id}");
         apply_dream_tool_calls(&conn, tool_calls, &source_id, &synthesis.policy, sender)?
     };
