@@ -65,6 +65,7 @@ The memory state shown is a relevance-selected subset, not the whole graph: abse
 - True duplicates differ in separators or wording ("claude-pro" vs "claude_pro"): first re-add the variant's edges under the canonical id, then delete_node the variant spelled exactly as it appears in the graph state
 - Reword edge content to match the closest existing predicate template when one clearly fits
 - Fix any fact node missing a subject edge (subject=true, importance=1.0) to its primary entity
+- subject=true edges must originate from a fact node you have declared (this batch or earlier). If an id already exists as an entity, you cannot redeclare it as a fact — declare a NEW fact id (e.g. <entity>-fact), give it the body, and connect it to the entity
 - Do not add new nodes or edges beyond corrections and merges
 - Emit at most 8 tool calls in this response. If more work remains you will be asked to continue, so never rush the rest in"#;
 
