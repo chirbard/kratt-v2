@@ -18,8 +18,8 @@ use super::agent::{
 use super::db;
 use super::embed::{self, SemanticEdge};
 use super::graph::{
-    Edge, Node, PROVENANCE_DREAMED, PROVENANCE_INFERRED, PROVENANCE_SYNTHESIZED, graph_to_json,
-    inferred_ceiling, normalize_id, stability_seed_max, synthesized_ceiling,
+    Edge, Graph, Node, PROVENANCE_DREAMED, PROVENANCE_INFERRED, PROVENANCE_SYNTHESIZED,
+    graph_to_json, inferred_ceiling, node_carries_value, normalize_id, stability_seed_max, synthesized_ceiling,
 };
 use super::hygiene;
 use super::ledger::{self, Actor, EdgeRef, Event, EventContext};
@@ -256,6 +256,90 @@ fn run_strategy_game<'run>(
     apply_dream_tool_calls(stage.conn, tool_calls, &source_id, &policy, stage.sender)
 }
 
+// The graph context for the dream's global stages (child lens, abstract
+// agents, consolidation), bounded by importance so the prompt plus the
+// proposals context plus the reply always fit the model window. The full
+// dump hit the 131k ceiling on 2026-07-17 (hard 400s; earlier dreams
+// silently lost their output space and wrote zero edges). Work-unit dreams
+// (graph-paging step 7) replace this; until then, highest-importance first.
+const DREAM_GRAPH_BUDGET_TOKENS: usize = 60_000; // replay-tunable.
+
+fn bounded_global_toon(graph: &Graph) -> String {
+    let ranked = ranked_live_edges(graph);
+    let (edges, node_ids) = pack_dream_edges(&ranked, &graph.nodes);
+    let mut nodes = std::collections::HashMap::new();
+    for node_id in &node_ids {
+        if let Some(node) = graph.nodes.get(node_id) {
+            nodes.insert(node_id.clone(), node.clone());
+        }
+    }
+    let dropped = ranked.len().saturating_sub(edges.len());
+    let bounded = Graph { nodes, edges };
+    let toon_text = toon::encode(&graph_to_json(&bounded), None);
+    runlog::log(
+        "dream",
+        &format!(
+            "graph context: {} edges, {} dropped (~{} tokens)",
+            bounded.edges.len(),
+            dropped,
+            super::heavy::estimate_tokens(&toon_text)
+        ),
+    );
+    toon_text
+}
+
+fn ranked_live_edges(graph: &Graph) -> Vec<Edge> {
+    let mut ranked = Vec::new();
+    for edge in &graph.edges {
+        if edge.expired_at.is_none() {
+            ranked.push(edge.clone());
+        }
+    }
+    ranked.sort_by(|left, right| {
+        right
+            .importance
+            .total_cmp(&left.importance)
+            .then_with(|| left.source.cmp(&right.source))
+            .then_with(|| left.target.cmp(&right.target))
+    });
+    ranked
+}
+
+// Greedy pack under the budget: each edge costs its content plus any
+// newly introduced value-bearing endpoint bodies (mute entities are free —
+// the serializer omits them anyway).
+fn pack_dream_edges(
+    ranked: &[Edge],
+    nodes: &std::collections::HashMap<String, Node>,
+) -> (Vec<Edge>, Vec<String>) {
+    let mut used = 500usize;
+    let mut selected = Vec::new();
+    let mut introduced: Vec<String> = Vec::new();
+    for edge in ranked {
+        let mut cost = super::heavy::estimate_tokens(&edge.content) + 45;
+        let mut new_nodes = Vec::new();
+        for endpoint in [&edge.source, &edge.target] {
+            if introduced.contains(endpoint) {
+                continue;
+            }
+            let Some(node) = nodes.get(endpoint) else {
+                continue;
+            };
+            if node_carries_value(node) {
+                cost += super::heavy::estimate_tokens(&node.body) + 25;
+                new_nodes.push(endpoint.clone());
+            }
+        }
+        if used + cost > DREAM_GRAPH_BUDGET_TOKENS {
+            continue;
+        }
+        used += cost;
+        selected.push(edge.clone());
+        introduced.extend(new_nodes);
+    }
+    (selected, introduced)
+}
+
 fn execute_dream_pass(
     llm: Arc<dyn LlmClient>,
     embed: Arc<dyn EmbeddingClient>,
@@ -272,7 +356,7 @@ fn execute_dream_pass(
     // consolidation for the same attention.
     run_strategy_stage(&llm, &conn, &session_id, sender)?;
     let graph = db::load_graph();
-    let global_toon = toon::encode(&graph_to_json(&graph), None);
+    let global_toon = bounded_global_toon(&graph);
     let domain = run_domain_agents(Arc::clone(&llm), embed, &session_id, &global_toon, sender)?;
     let abstract_outputs =
         run_abstract_agents(Arc::clone(&llm), &session_id, &global_toon, &domain, sender)?;
@@ -1319,8 +1403,43 @@ fn send_append(sender: &std::sync::mpsc::Sender<DreamEvent>, phase: &'static str
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dream_graph_context_prefers_importance_and_respects_budget() {
+        let mut graph = Graph::new();
+        let mut edges = Vec::new();
+        for index in 0..3000 {
+            edges.push(Edge {
+                source: format!("s{index:05}"),
+                target: format!("t{index:05}"),
+                content: "x".repeat(200),
+                stability: 0.3,
+                confidence: 0.5,
+                importance: if index == 0 { 1.0 } else { 0.1 },
+                date: String::new(),
+                subject: false,
+                occurred_at: None,
+                expired_at: None,
+                memory_type: "semantic".to_string(),
+                origin_session: String::new(),
+                provenance: "legacy".to_string(),
+                ceiling: None,
+            });
+        }
+        graph.edges = edges;
+        let ranked = super::ranked_live_edges(&graph);
+        assert_eq!(ranked[0].source, "s00000");
+        let (selected, _nodes) = super::pack_dream_edges(&ranked, &graph.nodes);
+        assert!(!selected.is_empty());
+        assert!(selected.len() < 3000);
+        assert_eq!(selected[0].source, "s00000");
+        let toon_a = super::bounded_global_toon(&graph);
+        let toon_b = super::bounded_global_toon(&graph);
+        assert_eq!(toon_a, toon_b);
+        assert!(super::super::heavy::estimate_tokens(&toon_a) <= super::DREAM_GRAPH_BUDGET_TOKENS + 2000);
+    }
+
     use super::{
-        DreamApplyState, DreamCallContext, DreamGistCall, DreamNodeCall, Edge, Event,
+        DreamApplyState, DreamCallContext, DreamGistCall, DreamNodeCall, Edge, Event, Graph,
         SynthesisPolicy, apply_dream_gist_edge, apply_dream_upsert_node, dream_edge_values,
     };
     use crate::memory::agent::{self, ToolCall};
