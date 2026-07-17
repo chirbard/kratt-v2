@@ -5,6 +5,7 @@ mod dream;
 mod embed;
 mod explore;
 mod graph;
+mod heavy;
 mod hygiene;
 mod ingest;
 mod ledger;

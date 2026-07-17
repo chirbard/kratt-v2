@@ -60,12 +60,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let embed_model = DEFAULT_EMBED_MODEL.to_string();
     let chat_llm: Arc<dyn api::LlmClient> = Arc::new(api::new_client(api_key.clone(), chat_model));
+    let embed: Arc<dyn api::EmbeddingClient> =
+        Arc::new(api::new_embed_client(api_key.clone(), embed_model));
     // The three memory seats. Heavy is always MEMORY_MODEL; classifier and
     // scribe default to it unless CLASSIFIER_MODEL/SCRIBE_MODEL override them
     // (which may be an "ollama:" local model). Unset → all three identical.
-    let seats = build_memory_seats(&api_key, &memory_model);
-    let embed: Arc<dyn api::EmbeddingClient> =
-        Arc::new(api::new_embed_client(api_key.clone(), embed_model));
+    let seats = build_memory_seats(&api_key, &memory_model, Arc::clone(&embed));
     if seat_replay_mode() {
         return seat_replay::run(&seats);
     }
@@ -120,7 +120,11 @@ fn seat_replay_mode() -> bool {
 // Heavy is always MEMORY_MODEL. classifier/scribe follow their own env spec
 // (which may be an "ollama:" local model); unset falls back to MEMORY_MODEL so
 // default configuration is byte-identical to the pre-split single client.
-fn build_memory_seats(api_key: &str, memory_model: &str) -> memory::MemorySeats {
+fn build_memory_seats(
+    api_key: &str,
+    memory_model: &str,
+    embed: Arc<dyn api::EmbeddingClient>,
+) -> memory::MemorySeats {
     let heavy = api::resolve_model_client(memory_model, api_key);
     let classifier = match std::env::var("CLASSIFIER_MODEL") {
         Ok(spec) => api::resolve_model_client(&spec, api_key),
@@ -134,5 +138,6 @@ fn build_memory_seats(api_key: &str, memory_model: &str) -> memory::MemorySeats 
         classifier,
         scribe,
         heavy,
+        embed,
     }
 }

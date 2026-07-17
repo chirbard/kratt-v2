@@ -2,21 +2,20 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::sync::Arc;
 
-use crate::api::{Chunk, LlmClient, ToolCallRequest};
+use crate::api::{Chunk, EmbeddingClient, LlmClient, ToolCallRequest};
 use crate::prompts::{
     AgentPrompt, CONSOLIDATE_EXPLANATION, EXTRACT_EXPLANATION, SCRIBE_EXPLANATION,
-    build_agent_prompt, build_classify_prompt, build_continue_prompt, build_scribe_continue_prompt,
-    build_scribe_prompt,
+    active_game_context, build_agent_prompt, build_classify_prompt, build_continue_prompt,
+    build_scribe_continue_prompt, build_scribe_prompt,
 };
 use crate::runlog;
 use turso::Connection;
 
 use super::db;
 use super::decay;
-use super::embed::SemanticEdge;
 use super::graph::{
-    Edge, Node, PROVENANCE_INFERRED, PROVENANCE_USER_CONFIRMED, graph_to_json, inferred_ceiling,
-    normalize_id, stability_seed_max,
+    Edge, Node, PROVENANCE_INFERRED, PROVENANCE_USER_CONFIRMED, inferred_ceiling, normalize_id,
+    stability_seed_max,
 };
 use super::ledger::{self, Actor, EdgeRef, Event, EventContext};
 
@@ -38,6 +37,7 @@ pub struct MemorySeats {
     pub classifier: Arc<dyn LlmClient>,
     pub scribe: Arc<dyn LlmClient>,
     pub heavy: Arc<dyn LlmClient>,
+    pub embed: Arc<dyn EmbeddingClient>,
 }
 
 impl MemorySeats {
@@ -48,7 +48,18 @@ impl MemorySeats {
             classifier: Arc::clone(&llm),
             scribe: Arc::clone(&llm),
             heavy: llm,
+            embed: Arc::new(NoopEmbedding),
         }
+    }
+}
+
+#[cfg(test)]
+struct NoopEmbedding;
+
+#[cfg(test)]
+impl EmbeddingClient for NoopEmbedding {
+    fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f64>>, Box<dyn Error + Send + Sync>> {
+        Ok(Vec::new())
     }
 }
 
@@ -387,16 +398,18 @@ impl<'run> AgentRun<'run> {
             conn: &conn,
         };
         let pre_extract_graph = graph.clone();
-        let pre_extract_toon = toon::encode(&graph_to_json(&pre_extract_graph), None);
-        let injected_toon = injected_toon(&injected);
         let active_game = self.active_game_name(&conn);
+        let selection =
+            self.heavy_selection(&pre_extract_graph, &injected, &conn, active_game.as_deref());
+        self.log_heavy_selection(&selection);
+        let pre_extract_toon = selection.toon;
         let extract_prompt = build_agent_prompt(&AgentPrompt {
             explanation: EXTRACT_EXPLANATION,
             toon: &pre_extract_toon,
             user_msg: self.user_msg,
             assistant_msg: self.assistant_msg,
             diff_text: None,
-            injected_toon: injected_toon.as_deref(),
+            injected_toon: None,
             active_game: active_game.as_deref(),
         });
         self.run_pass(&ctx, &heavy_pass("extract"), extract_prompt)?;
@@ -418,6 +431,65 @@ impl<'run> AgentRun<'run> {
             ),
         );
         Ok(())
+    }
+
+    fn heavy_selection(
+        &self,
+        graph: &super::graph::Graph,
+        injected: &[Edge],
+        conn: &Connection,
+        active_game: Option<&str>,
+    ) -> super::heavy::HeavySelection {
+        let active_ids = self.active_context_ids(conn);
+        let reserved = match active_game {
+            Some(game) => active_game_context(game),
+            None => String::new(),
+        };
+        let exchange = format!("{}\n{}", self.user_msg, self.assistant_msg);
+        let session_id = db::source_session_id(self.user_message_id);
+        super::heavy::select(
+            &*self.seats.embed,
+            &super::heavy::HeavyInputs {
+                graph,
+                injected,
+                exchange: &exchange,
+                session_id: session_id.as_deref(),
+                active_ids: &active_ids,
+                reserved_text: &reserved,
+            },
+        )
+    }
+
+    fn active_context_ids(&self, conn: &Connection) -> Vec<String> {
+        let Some(session_id) = db::source_session_id(self.user_message_id) else {
+            return Vec::new();
+        };
+        let hub_id = normalize_id(&format!("task-{session_id}"));
+        let mut ids = Vec::new();
+        if db::count_task_chain(conn, &hub_id).is_ok_and(|count| count > 0) {
+            ids.push(hub_id.clone());
+        }
+        if let Ok(Some((game_id, _))) = db::load_session_game(conn, &hub_id) {
+            ids.push(game_id);
+        }
+        ids
+    }
+
+    fn log_heavy_selection(&self, selection: &super::heavy::HeavySelection) {
+        let fill = selection.tier_fill;
+        self.send_log(
+            "heavy",
+            format!(
+                "selection: {} edges + {} nodes (~{} tokens, tier fill 1:{} 2:{} 3:{} 4:{})",
+                selection.edge_count,
+                selection.node_count,
+                selection.estimated_tokens,
+                fill[0],
+                fill[1],
+                fill[2],
+                fill[3]
+            ),
+        );
     }
 
     fn decayed_graph(&self) -> Result<super::graph::Graph, Box<dyn Error + Send + Sync>> {
@@ -540,38 +612,6 @@ impl<'run> AgentRun<'run> {
 
     fn send_append(&self, phase: &'static str, text: String) {
         let _ = self.sender.send(MemoryEvent::Append { phase, text });
-    }
-}
-
-// None when nothing was injected — the prompt then omits the section entirely
-// rather than showing the model an empty prediction.
-fn injected_toon(edges: &[Edge]) -> Option<String> {
-    if edges.is_empty() {
-        return None;
-    }
-    let mut semantic = Vec::new();
-    for edge in edges {
-        semantic.push(to_semantic_edge(edge));
-    }
-    Some(super::embed::edges_to_toon(&semantic))
-}
-
-fn to_semantic_edge(edge: &Edge) -> SemanticEdge {
-    SemanticEdge {
-        source: edge.source.clone(),
-        target: edge.target.clone(),
-        content: edge.content.clone(),
-        confidence: edge.confidence,
-        stability: edge.stability,
-        importance: edge.importance,
-        subject: edge.subject,
-        date: edge.date.clone(),
-        occurred_at: edge.occurred_at.clone(),
-        expired_at: edge.expired_at.clone(),
-        memory_type: edge.memory_type.clone(),
-        origin_session: edge.origin_session.clone(),
-        provenance: edge.provenance.clone(),
-        embedding: None,
     }
 }
 
