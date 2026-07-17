@@ -10,7 +10,7 @@ use crate::prompts;
 
 use super::agent::{ToolCall, parse_tool_calls, stream_collect};
 use super::db;
-use super::graph::{normalize_id, synthesized_ceiling};
+use super::graph::{Node, closure_nodes, normalize_id, synthesized_ceiling};
 
 const CLUSTER_MIN_EDGES: usize = 3; // replay-tunable.
 const SYNTHESIS_CLUSTERS_PER_PASS: usize = 2; // replay-tunable.
@@ -41,6 +41,11 @@ impl SynthesisPolicy {
 pub struct SynthesisStageResult {
     pub proposal_text: String,
     pub policy: SynthesisPolicy,
+}
+
+struct ClusterSynthesisResult {
+    proposal_blocks: Vec<(String, String)>,
+    policy: SynthesisPolicy,
 }
 
 struct Cluster {
@@ -83,6 +88,27 @@ pub fn run_synthesis_stage(
         });
     }
     log_cluster_ranking(&clusters, &log_line);
+    let stage_io = StageIo {
+        log_line: &log_line,
+        append_text: &append_text,
+    };
+    let result = run_synthesis_clusters(llm, conn, &clusters, &edges, &stage_io)?;
+    if result.proposal_blocks.is_empty() {
+        log_line("no synthesis survived".to_string());
+    }
+    Ok(SynthesisStageResult {
+        proposal_text: format_blocks(&result.proposal_blocks),
+        policy: result.policy,
+    })
+}
+
+fn run_synthesis_clusters<'scope>(
+    llm: Arc<dyn LlmClient>,
+    conn: &Connection,
+    clusters: &[Cluster],
+    edges: &[ClusterEdge],
+    stage_io: &StageIo<'scope>,
+) -> Result<ClusterSynthesisResult, Box<dyn Error + Send + Sync>> {
     let mut policy = SynthesisPolicy {
         synthesis_nodes: HashSet::new(),
         edge_overrides: HashMap::new(),
@@ -92,22 +118,19 @@ pub fn run_synthesis_stage(
     while index < clusters.len() {
         let cluster = &clusters[index];
         let title = format!("cluster-{}", index + 1);
-        let stage_calls =
-            run_cluster_pipeline(Arc::clone(&llm), cluster, &edges, &log_line, &append_text)?;
+        let nodes = db::load_nodes_by_ids(conn, &cluster.node_ids)?;
+        let stage_calls = run_cluster_pipeline(Arc::clone(&llm), cluster, edges, &nodes, stage_io)?;
         if stage_calls.is_empty() {
-            log_line(format!("{title}: no synthesis survived"));
+            (stage_io.log_line)(format!("{title}: no synthesis survived"));
             index += 1;
             continue;
         }
-        apply_policy_overrides(cluster, &edges, stage_calls.as_slice(), &mut policy);
+        apply_policy_overrides(cluster, edges, stage_calls.as_slice(), &mut policy);
         proposal_blocks.push((title, tool_calls_json(&stage_calls)));
         index += 1;
     }
-    if proposal_blocks.is_empty() {
-        log_line("no synthesis survived".to_string());
-    }
-    Ok(SynthesisStageResult {
-        proposal_text: format_blocks(&proposal_blocks),
+    Ok(ClusterSynthesisResult {
+        proposal_blocks,
         policy,
     })
 }
@@ -399,26 +422,22 @@ fn log_cluster_ranking(clusters: &[Cluster], log_line: &impl Fn(String)) {
     }
 }
 
-fn run_cluster_pipeline(
+fn run_cluster_pipeline<'scope>(
     llm: Arc<dyn LlmClient>,
     cluster: &Cluster,
     edges: &[ClusterEdge],
-    log_line: &impl Fn(String),
-    append_text: &impl Fn(String),
+    nodes: &HashMap<String, Node>,
+    stage_io: &StageIo<'scope>,
 ) -> Result<Vec<ToolCall>, Box<dyn Error + Send + Sync>> {
-    let cluster_toon = cluster_toon(cluster, edges);
-    let stage_io = StageIo {
-        log_line,
-        append_text,
-    };
-    log_line(format!(
+    let cluster_toon = cluster_toon(cluster, edges, nodes);
+    (stage_io.log_line)(format!(
         "{}: start hub={} edges={}",
         cluster_label(cluster),
         cluster.hub,
         cluster.edge_indices.len()
     ));
-    let text_outputs = run_brainstorm_text_stages(Arc::clone(&llm), &cluster_toon, &stage_io)?;
-    let chairman = run_chairman_stage(llm, &cluster_toon, &text_outputs, &stage_io)?;
+    let text_outputs = run_brainstorm_text_stages(Arc::clone(&llm), &cluster_toon, stage_io)?;
+    let chairman = run_chairman_stage(llm, &cluster_toon, &text_outputs, stage_io)?;
     let parsed = parse_tool_calls(&chairman);
     if parsed.is_empty() {
         return Ok(Vec::new());
@@ -560,11 +579,13 @@ fn summarize(text: &str) -> String {
     output
 }
 
-fn cluster_toon(cluster: &Cluster, edges: &[ClusterEdge]) -> String {
+fn cluster_toon(cluster: &Cluster, edges: &[ClusterEdge], nodes: &HashMap<String, Node>) -> String {
     let mut edges_json = Vec::new();
+    let mut endpoints = Vec::new();
     let mut idx = 0usize;
     while idx < cluster.edge_indices.len() {
         let edge = &edges[cluster.edge_indices[idx]];
+        endpoints.push((edge.source.clone(), edge.target.clone()));
         edges_json.push(json!({
             "source": edge.source,
             "target": edge.target,
@@ -579,7 +600,17 @@ fn cluster_toon(cluster: &Cluster, edges: &[ClusterEdge]) -> String {
         }));
         idx += 1;
     }
-    toon::encode(&json!({"nodes": [], "edges": edges_json}), None)
+    let closure = closure_nodes(&endpoints, nodes);
+    let mut nodes_json = Vec::new();
+    for (node_id, node) in closure {
+        nodes_json.push(json!({
+            "body": node.body,
+            "date": node.date,
+            "id": node_id,
+            "type": node.node_type,
+        }));
+    }
+    toon::encode(&json!({"nodes": nodes_json, "edges": edges_json}), None)
 }
 
 fn normalize_calls_for_cluster(
@@ -1061,7 +1092,10 @@ fn cluster_label(cluster: &Cluster) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cluster, ClusterEdge, cluster_ceiling};
+    use std::collections::HashMap;
+
+    use super::{Cluster, ClusterEdge, cluster_ceiling, cluster_toon};
+    use crate::memory::graph::Node;
 
     fn cluster_edge(confidence: f64) -> ClusterEdge {
         ClusterEdge {
@@ -1088,5 +1122,38 @@ mod tests {
             view_mass: 0.0,
         };
         assert_eq!(cluster_ceiling(&cluster, &edges), 0.25);
+    }
+
+    #[test]
+    fn cluster_toon_includes_value_bearing_endpoint_nodes() {
+        let edges = vec![cluster_edge(0.5)];
+        let cluster = Cluster {
+            hub: "source".to_string(),
+            edge_indices: vec![0],
+            node_ids: vec!["source".to_string(), "target".to_string()],
+            view_mass: 0.0,
+        };
+        let nodes = HashMap::from([
+            (
+                "source".to_string(),
+                Node {
+                    node_type: "synthesis".to_string(),
+                    body: "An abstraction".to_string(),
+                    date: String::new(),
+                },
+            ),
+            (
+                "target".to_string(),
+                Node {
+                    node_type: "entity".to_string(),
+                    body: String::new(),
+                    date: String::new(),
+                },
+            ),
+        ]);
+        let first = cluster_toon(&cluster, &edges, &nodes);
+        let second = cluster_toon(&cluster, &edges, &nodes);
+        assert!(first.contains("An abstraction"));
+        assert_eq!(first, second);
     }
 }
