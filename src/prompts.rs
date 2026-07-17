@@ -46,7 +46,7 @@ The "Beliefs injected into this turn" section, when present, is what memory retr
 
 - Use open_loop for a real intended future action or expected event stated by the user or assistant ("remind me", "next time", "I'll send it tomorrow"). Be conservative: ordinary future-tense discussion is not an intention.
 - ONE loop per intention. Before open_loop, check the loops you already opened this response and the Open loops section: never open a second loop that restates an existing one in different words.
-- Choose the topic whose appearance should trigger the intention as anchor. It must already exist, or emit its upsert_node before open_loop. Resolve a relative due date to YYYY-MM-DD; omit due for a purely contextual trigger.
+- Choose the topic whose appearance should trigger the intention as anchor. The anchor is created automatically if missing. Resolve a relative due date to YYYY-MM-DD; omit due for a purely contextual trigger.
 - Use close_loop only when this exchange confirms the intention was done, deliberately abandoned, or an expected event did not happen. Never infer absence from silence or auto-close merely because a due date passed.
 - No respond call; always set date=today on every upsert_edge.
 - Emit at most 8 tool calls in this response. If more work remains you will be asked to continue, so never rush the rest in."#;
@@ -129,7 +129,7 @@ record_outcome — record the game's end result, from your (the assistant's) per
 {"tool":"record_outcome","args":{"result":"loss","comment":"resigned after losing the queen"}}
 
 open_loop — remember one concrete intended future action or expected event ("remind me", "I'll send it tomorrow"). NOT a move; never wrap an intention in record_move.
-- intention: one sentence; anchor: existing topic node (emit its upsert_node first if needed); due: optional YYYY-MM-DD, empty for contextual-only
+- intention: one sentence; anchor: topic node, created automatically if missing; due: optional YYYY-MM-DD, empty for contextual-only
 - ONE loop per intention — never open a second loop restating an existing one
 {"tool":"open_loop","args":{"intention":"ask the user whether the systemd unit file arrived","anchor":"systemd-unit-file","due":"2026-07-15"}}
 
@@ -139,10 +139,9 @@ inbox_add — queue material the user asks to study later. Copy the URL or file 
 close_loop — close a live loop only when this exchange confirms it: done, deliberately abandoned, or the expected event confirmed missing. Never from silence or a passed deadline alone.
 {"tool":"close_loop","args":{"loop":"kebab-loop-id","resolution":"done | abandoned | absence","note":"brief evidence"}}
 
-upsert_node — create or update a node (non-move task facts only).
-- type "entity": body="" date="" always
-- type "fact": body is one atomic sentence, no period; date YYYY-MM-DD when event occurred, empty if unknown
-{"tool":"upsert_node","args":{"name":"kebab-case-string","type":"entity | fact","body":"","date":""}}
+upsert_node — create or update a fact node (non-move task facts only). Edge endpoints that don't exist yet become entity nodes automatically — never declare them.
+- type is always "fact"; body is one atomic sentence, no period; date YYYY-MM-DD when event occurred, empty if unknown
+{"tool":"upsert_node","args":{"name":"kebab-case-string","type":"fact","body":"one atomic sentence","date":""}}
 
 upsert_edge — create or update a directed edge (non-move task facts only; never for moves).
 - content: "<subject> verb <target>"; describe exactly what happened this turn
@@ -215,10 +214,9 @@ pub fn build_scribe_prompt(user_msg: &str, assistant_msg: &str) -> String {
 
 pub const TOOL_DEFINITIONS: &str = r#"TOOLS
 
-upsert_node — create or update a node.
-- type "entity": body="" date="" always
-- type "fact": body is one atomic sentence, no period; date YYYY-MM-DD when event occurred, empty if unknown
-{"tool":"upsert_node","args":{"name":"kebab-case-string","type":"entity | fact","body":"","date":""}}
+upsert_node — create or update a fact node. Edge endpoints that don't exist yet become entity nodes automatically — never declare them.
+- type is always "fact"; body is one atomic sentence, no period; date YYYY-MM-DD when event occurred, empty if unknown
+{"tool":"upsert_node","args":{"name":"kebab-case-string","type":"fact","body":"one atomic sentence","date":""}}
 
 upsert_edge — create or update a directed edge.
 - content: "<subject> verb <target>" or "<subject> verb <fact>"; "implies" for fact→fact; empty when subject=true
@@ -242,7 +240,7 @@ expire_edge — mark an edge historical instead of deleting it.
 
 open_loop — remember one concrete intended future action or expected event until it is honestly resolved.
 - intention: one sentence describing what should happen
-- anchor: existing topic node whose appearance should surface the loop; emit upsert_node first if needed
+- anchor: topic node whose appearance should surface the loop; the anchor is created automatically if missing
 - due: optional YYYY-MM-DD deadline or expected-by date; empty for contextual-only loops
 {"tool":"open_loop","args":{"intention":"ask Markus whether the systemd unit survived the reboot","anchor":"home-server","due":"2026-07-15"}}
 
@@ -261,7 +259,7 @@ record_outcome — when a game genuinely ended this turn (checkmate, resignation
 - result: "win" | "loss" | "draw"
 {"tool":"record_outcome","args":{"result":"win","comment":"opponent resigned"}}"#;
 
-pub const MEMORY_RULES: &str = r#"Node types: entity (person, place, technology, named concept; body and date always empty) or fact (one atomic claim; body is one sentence, no period; date YYYY-MM-DD when event occurred, empty if unknown; use today for current events; resolve relative dates to YYYY-MM-DD).
+pub const MEMORY_RULES: &str = r#"Node types: Rust creates entity nodes automatically from edge endpoints. Use upsert_node only for fact nodes (one atomic claim; body is one sentence, no period; date YYYY-MM-DD when event occurred, empty if unknown; use today for current events; resolve relative dates to YYYY-MM-DD).
 
 Direct edges vs fact nodes: use a direct edge for simple relationships. Create a fact node only when the claim needs a sentence — attribution, uncertainty, temporal context, or multiple entities.
 - Simple: entity-a → entity-b, content "<subject> verb <target>"
@@ -277,14 +275,14 @@ One-way only. Never add reverse links.
 
 Never hallucinate. Only store what was explicitly stated.
 
-Extract aggressively. Every named entity gets a node. Every stated relationship becomes an edge. If a fact involves multiple entities, add edges from each.
+Extract aggressively. Every named entity should appear as an edge endpoint so Rust creates its node. Every stated relationship becomes an edge. If a fact involves multiple entities, add edges from each.
 
 Taxonomy links must chain through every category level so unrelated nodes can connect through shared concepts."#;
 
 pub const JSON_OUTPUT_RULES: &str = r#"Respond with raw JSON only. No markdown. No prose. No code fences. Start with `{`.
 
-Single call: {"tool":"upsert_node","args":{"name":"example","type":"entity","body":"","date":""}}
-Multiple calls: {"tools":[{"tool":"upsert_node","args":{"name":"example","type":"entity","body":"","date":""}},{"tool":"upsert_edge","args":{"source":"a","target":"b","content":"<subject> verb <target>","stability":1.0,"confidence":1.0,"importance":0.0,"subject":false,"date":"YYYY-MM-DD"}}]}"#;
+Single call: {"tool":"upsert_node","args":{"name":"example-fact","type":"fact","body":"one atomic sentence","date":""}}
+Multiple calls: {"tools":[{"tool":"upsert_node","args":{"name":"example-fact","type":"fact","body":"one atomic sentence","date":""}},{"tool":"upsert_edge","args":{"source":"a","target":"example-fact","content":"<subject> verb <fact>","stability":1.0,"confidence":1.0,"importance":0.0,"subject":false,"date":"YYYY-MM-DD"}}]}"#;
 
 pub struct AgentPrompt<'scope> {
     pub explanation: &'scope str,
@@ -469,9 +467,9 @@ Rules:
 - Prefer precision over coverage. Five solid edges beat twenty speculative ones.
 - If proposals conflict, pick the most defensible or discard both.
 - If the skeptic proposed lower confidence on an existing edge, apply it.
-- You may create concept nodes: if you see fifteen or more edges that all relate to the same high-level theme, create a node with type="concept" and a one-sentence body, then add edges with content="summarizes" from the concept node to the key nodes in the cluster.
+- You may create a higher-order fact for a shared theme: if fifteen or more edges relate to it, create a node with type="fact" and a one-sentence body, then add edges with content="summarizes" from that fact to the key nodes in the cluster.
 - Apply today's date to all edges.
-- Synthesis proposals identify higher-order facts. When you accept a synthesis proposal, forward its upsert_node AND its upsert_edge calls together — a synthesis edge without its node is invalid. Never create edges pointing at nodes that do not exist and are not being created in this same response. Keep synthesis nodes as type="synthesis" and preserve their support-based confidence.
+- Synthesis proposals identify higher-order facts. When you accept a synthesis proposal, forward its upsert_node AND its upsert_edge calls together — every referenced synthesis node must be declared in this same response. Keep synthesis nodes as type="synthesis" and preserve their support-based confidence. Ordinary missing edge endpoints become entity nodes automatically.
 - Prefer expire_edge when a belief was once true but is now superseded. Use delete_edge only for absorbed scaffolding; keep deletions conservative.
 - gist_edge is the default episodic→semantic path. The graph may contain episodic edges (lived experience from an exploration or task session). When several of them — same task hub, same session, or the same recurring pattern — point at one regularity, write that regularity as a NEW semantic edge and cite the episodes in supported_by. Phrase content as the *lesson* ("across three games, early queen sorties were punished by tempo loss"), never as any single episode. Requires at least two supporting episodic edges; each ref is written "source → target". {"tool":"gist_edge","args":{"source":"string","target":"string","content":"string","confidence":0.6,"supported_by":["game3-hub → move-qh5","game4-hub → move-qf3"]}}
 - Strategy from play: when the graph holds a game-definition node (node_type="game") with played move chains linked to it, derive or refine transferable strategy beliefs anchored to that game node. Use gist_edge with the supporting plies in supported_by where the lesson is induced from played moves ("develop knights before bishops", "an early queen sortie gets punished"); a plain upsert_edge onto the game node is allowed only for a lesson implied by the rules alone (e.g. before any game has been lost). Phrase strategies as portable lessons, never as one game's narration.
@@ -502,7 +500,7 @@ pub const DREAM_STRATEGY: &str = r#"You are the strategy consolidator for the ga
 Your job: derive or refine a few portable STRATEGY LESSONS anchored to the game node, learned from how these games actually went.
 
 Rules:
-- Every NEW lesson needs its node created in the same response, BEFORE the edge that points at it: {"tool":"upsert_node","args":{"name":"kebab-lesson","type":"fact","body":"the lesson as one sentence","date":""}} — an edge to a node that does not exist is invalid and will be expired.
+- Every NEW lesson needs its fact node declared in the same response: {"tool":"upsert_node","args":{"name":"kebab-lesson","type":"fact","body":"the lesson as one sentence","date":""}}. Rust applies valid fact declarations before their edges.
 - gist_edge for a lesson INDUCED FROM PLAYED MOVES — cite the supporting chain edges in supported_by (at least two). Each ref is the chain edge written exactly "hub → move-node", e.g. "task-<session> → task-<session>-ply-003" (the hub is the source, the ply node the target — copy them from the chain sections below). Phrase content as the transferable lesson ("an early queen sortie gets punished by tempo loss"), never as one game's narration. {"tool":"gist_edge","args":{"source":"game-<name>","target":"kebab-lesson","content":"string","confidence":0.6,"supported_by":["task-<session> → task-<session>-ply-003","task-<session> → task-<session>-ply-005"]}}
 - upsert_edge onto the game node ONLY for a lesson implied by the rules alone (before any game teaches otherwise). {"tool":"upsert_edge","args":{"source":"game-<name>","target":"kebab-lesson","content":"string","stability":0.4,"confidence":0.5,"importance":0.5,"subject":false,"date":"YYYY-MM-DD"}}
 - REVISE ON EVIDENCE: an existing strategy contradicted by a lost game gets expire_edge (or a rewritten upsert at lower confidence). The outcomes are given to you precisely so a lesson that keeps losing is corrected, not preserved. {"tool":"expire_edge","args":{"source":"game-<name>","target":"kebab-lesson","rewritten_content":"string"}}
@@ -802,8 +800,9 @@ mod tests {
     use super::{
         AgentPrompt, CHAT_SYSTEM_PROMPT, CONSOLIDATE_EXPLANATION, CONTINUE_PASS, DAILY_REPORT,
         DREAM_BIOLOGIST, EXTRACT_EXPLANATION, JSON_OUTPUT_RULES, SCRIBE_EXPLANATION,
-        build_agent_prompt, build_chat_system_prompt, build_classify_prompt, build_continue_prompt,
-        build_dream_prompt, build_scribe_continue_prompt, build_scribe_prompt,
+        SCRIBE_TOOL_DEFINITIONS, TOOL_DEFINITIONS, build_agent_prompt, build_chat_system_prompt,
+        build_classify_prompt, build_continue_prompt, build_dream_prompt,
+        build_scribe_continue_prompt, build_scribe_prompt,
     };
 
     const INJECTED_HEADING: &str = "## Beliefs injected into this turn";
@@ -999,6 +998,27 @@ mod tests {
         let scribe = build_scribe_prompt("user", "assistant");
         assert!(scribe.contains(r#"{"tool":"open_loop""#));
         assert!(scribe.contains(r#"{"tool":"close_loop""#));
+    }
+
+    #[test]
+    fn node_tools_are_fact_only() {
+        for definitions in [SCRIBE_TOOL_DEFINITIONS, TOOL_DEFINITIONS] {
+            assert!(!definitions.contains(r#""type":"entity"#));
+            assert!(!definitions.contains("entity | fact"));
+            assert!(definitions.contains(r#""type":"fact""#));
+            assert!(definitions.contains("never declare them"));
+        }
+    }
+
+    #[test]
+    fn loop_anchors_are_documented_as_automatic() {
+        let heavy = prompt_with(None);
+        let scribe = build_scribe_prompt("user", "assistant");
+        for prompt in [heavy, scribe] {
+            assert!(!prompt.contains("emit its upsert_node before open_loop"));
+            assert!(!prompt.contains("emit its upsert_node first if needed"));
+            assert!(prompt.contains("created automatically if missing"));
+        }
     }
 
     #[test]

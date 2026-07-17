@@ -11,7 +11,10 @@ use crate::prompts::{
 };
 use crate::runlog;
 
-use super::agent::{ToolCall, parse_tool_calls, stream_collect};
+use super::agent::{
+    BatchPreflight, ToolCall, declared_node_denial, parse_tool_calls, preflight_tool_batch,
+    stream_collect,
+};
 use super::db;
 use super::embed::{self, SemanticEdge};
 use super::graph::{
@@ -547,8 +550,8 @@ fn apply_dream_tool_calls(
             events: &mut events,
             apply_state: &mut apply_state,
         };
-        for call in tool_calls {
-            let (description, added_edge) = apply_dream_call(&mut call_ctx, call)?;
+        let outcomes = apply_preflighted_dream_batch(&mut call_ctx, tool_calls)?;
+        for (description, added_edge) in outcomes {
             if !description.is_empty() {
                 send_log(sender, "dream", description);
             }
@@ -568,12 +571,90 @@ fn apply_dream_tool_calls(
     Ok(edge_count)
 }
 
+fn apply_preflighted_dream_batch<'scope, 'policy>(
+    ctx: &mut DreamCallContext<'scope, 'policy>,
+    tool_calls: Vec<ToolCall>,
+) -> Result<Vec<(String, bool)>, Box<dyn Error + Send + Sync>> {
+    let preflight = preflight_tool_batch(
+        ctx.conn,
+        &tool_calls,
+        &ctx.apply_state.synthesis_policy.synthesis_nodes,
+    )?;
+    let mut batch = DreamApplyBatch::new(tool_calls);
+    apply_dream_nodes(ctx, &preflight, &mut batch)?;
+    apply_dream_rest(ctx, &preflight, &mut batch)?;
+    Ok(batch.finish())
+}
+
+struct DreamApplyBatch {
+    pending: Vec<Option<ToolCall>>,
+    outcomes: Vec<Option<(String, bool)>>,
+}
+
+impl DreamApplyBatch {
+    fn new(tool_calls: Vec<ToolCall>) -> Self {
+        let mut pending = Vec::new();
+        for call in tool_calls {
+            pending.push(Some(call));
+        }
+        let outcomes = vec![None; pending.len()];
+        Self { pending, outcomes }
+    }
+
+    fn finish(self) -> Vec<(String, bool)> {
+        let mut finished = Vec::new();
+        for outcome in self.outcomes {
+            finished.push(outcome.unwrap_or_default());
+        }
+        finished
+    }
+}
+
+fn apply_dream_nodes<'scope, 'policy>(
+    ctx: &mut DreamCallContext<'scope, 'policy>,
+    preflight: &BatchPreflight,
+    batch: &mut DreamApplyBatch,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    for idx in 0..batch.pending.len() {
+        if preflight.denial(idx).is_some()
+            || !matches!(batch.pending[idx], Some(ToolCall::UpsertNode { .. }))
+        {
+            continue;
+        }
+        let Some(call) = batch.pending[idx].take() else {
+            continue;
+        };
+        batch.outcomes[idx] = Some(apply_dream_call(ctx, call)?);
+    }
+    Ok(())
+}
+
+fn apply_dream_rest<'scope, 'policy>(
+    ctx: &mut DreamCallContext<'scope, 'policy>,
+    preflight: &BatchPreflight,
+    batch: &mut DreamApplyBatch,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    for idx in 0..batch.pending.len() {
+        if let Some(denial) = preflight.denial(idx) {
+            batch.outcomes[idx] = Some((denial.clone(), false));
+            continue;
+        }
+        let Some(call) = batch.pending[idx].take() else {
+            continue;
+        };
+        batch.outcomes[idx] = Some(apply_dream_call(ctx, call)?);
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn apply_dream_call<'scope, 'policy>(
     ctx: &mut DreamCallContext<'scope, 'policy>,
     call: ToolCall,
 ) -> Result<(String, bool), Box<dyn Error + Send + Sync>> {
-    if super::agent::tool_call_touches_loop(ctx.conn, &call)? {
+    if !matches!(&call, ToolCall::UpsertNode { .. })
+        && super::agent::tool_call_touches_loop(ctx.conn, &call)?
+    {
         return Ok((
             "dream mutation denied: open loops are heavy-owned".to_string(),
             false,
@@ -1026,6 +1107,15 @@ fn apply_dream_upsert_node<'scope, 'policy>(
     node_call: DreamNodeCall,
 ) -> Result<(String, bool), Box<dyn Error + Send + Sync>> {
     let normalized = normalize_id(&node_call.name);
+    if let Some(denial) = declared_node_denial(
+        ctx.conn,
+        &normalized,
+        &node_call.node_type,
+        &ctx.apply_state.synthesis_policy.synthesis_nodes,
+    )? {
+        runlog::log("nodes", &format!("denied: {denial}"));
+        return Ok((denial, false));
+    }
     let node_type = resolved_node_type(&normalized, &node_call.node_type, ctx.apply_state);
     let node = Node {
         node_type: node_type.clone(),
@@ -1224,8 +1314,8 @@ fn send_append(sender: &std::sync::mpsc::Sender<DreamEvent>, phase: &'static str
 #[cfg(test)]
 mod tests {
     use super::{
-        DreamApplyState, DreamCallContext, DreamGistCall, Edge, Event, SynthesisPolicy,
-        apply_dream_gist_edge, dream_edge_values,
+        DreamApplyState, DreamCallContext, DreamGistCall, DreamNodeCall, Edge, Event,
+        SynthesisPolicy, apply_dream_gist_edge, apply_dream_upsert_node, dream_edge_values,
     };
     use crate::memory::agent::{self, ToolCall};
     use crate::memory::db;
@@ -1502,6 +1592,36 @@ mod tests {
         );
         assert_eq!(values.0, 0.15);
         assert_eq!(values.2, "dreamed");
+    }
+
+    #[test]
+    fn synthesis_policy_remains_the_only_non_fact_declaration_exception() {
+        let conn = harness();
+        let mut policy = empty_policy();
+        policy.synthesis_nodes.insert("higher-order".to_string());
+        let mut apply_state = DreamApplyState::new(&policy);
+        let mut events = Vec::new();
+        let ctx = DreamCallContext {
+            conn: &conn,
+            source_id: "dream:test",
+            events: &mut events,
+            apply_state: &mut apply_state,
+        };
+        let call = DreamNodeCall::new(
+            "higher-order".to_string(),
+            "synthesis".to_string(),
+            "a supported synthesis".to_string(),
+            String::new(),
+        );
+        let Ok((description, changed_edge)) = apply_dream_upsert_node(&ctx, call) else {
+            unreachable!("synthesis applies")
+        };
+        assert!(description.contains("(synthesis)"), "{description}");
+        assert!(!changed_edge);
+        let Ok(Some(stored)) = db::load_node(&conn, "higher-order") else {
+            unreachable!("synthesis exists")
+        };
+        assert_eq!(stored.node_type, "synthesis");
     }
 
     #[test]
@@ -1900,7 +2020,8 @@ mod strategy_tests {
         ]}"#;
         let outcomes = apply_all(&conn, response);
         assert_eq!(outcomes.len(), 4);
-        for (description, changed) in outcomes {
+        assert!(!outcomes[0].1 && outcomes[0].0.contains("belongs to a loop node"));
+        for (description, changed) in &outcomes[1..] {
             assert!(!changed && description.contains("open loops are heavy-owned"));
         }
         let stored = must_edge(&conn, "loop-reminder", "topic");

@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::sync::Arc;
 
@@ -1263,6 +1264,16 @@ pub(crate) struct ApplyToolOptions<'scope> {
     pub default_memory_type: &'static str,
 }
 
+pub(crate) struct BatchPreflight {
+    denials: Vec<Option<String>>,
+}
+
+impl BatchPreflight {
+    pub(crate) fn denial(&self, idx: usize) -> Option<&String> {
+        self.denials[idx].as_ref()
+    }
+}
+
 fn apply_tool_calls<'agent_run>(
     agent_run: &AgentRun<'agent_run>,
     conn: &Connection,
@@ -1283,8 +1294,8 @@ fn apply_tool_calls<'agent_run>(
             provenance: PROVENANCE_USER_CONFIRMED,
             default_memory_type,
         };
-        for call in tool_calls {
-            let description = apply_tool_call(call, conn, &options, &mut events)?;
+        let applied = apply_preflighted_batch(conn, tool_calls, &options, &mut events)?;
+        for description in applied {
             agent_run.send_log(phase, description.clone());
             descriptions.push(description);
         }
@@ -1300,6 +1311,271 @@ fn apply_tool_calls<'agent_run>(
     Ok(descriptions)
 }
 
+fn apply_preflighted_batch<'scope>(
+    conn: &Connection,
+    tool_calls: Vec<ToolCall>,
+    options: &ApplyToolOptions<'scope>,
+    events: &mut Vec<Event>,
+) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+    let synthesis_nodes = HashSet::new();
+    let preflight = preflight_tool_batch(conn, &tool_calls, &synthesis_nodes)?;
+    let mut batch = AgentApplyBatch::new(tool_calls);
+    apply_preflight_nodes(conn, options, events, &preflight, &mut batch)?;
+    apply_preflight_rest(conn, options, events, &preflight, &mut batch)?;
+    Ok(batch.finish())
+}
+
+struct AgentApplyBatch {
+    pending: Vec<Option<ToolCall>>,
+    outcomes: Vec<Option<String>>,
+}
+
+impl AgentApplyBatch {
+    fn new(tool_calls: Vec<ToolCall>) -> Self {
+        let mut pending = Vec::new();
+        for call in tool_calls {
+            pending.push(Some(call));
+        }
+        let outcomes = vec![None; pending.len()];
+        Self { pending, outcomes }
+    }
+
+    fn finish(self) -> Vec<String> {
+        let mut finished = Vec::new();
+        for outcome in self.outcomes {
+            finished.push(outcome.unwrap_or_default());
+        }
+        finished
+    }
+}
+
+fn apply_preflight_nodes<'scope>(
+    conn: &Connection,
+    options: &ApplyToolOptions<'scope>,
+    events: &mut Vec<Event>,
+    preflight: &BatchPreflight,
+    batch: &mut AgentApplyBatch,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    for idx in 0..batch.pending.len() {
+        if preflight.denial(idx).is_some() || !is_upsert_node(batch.pending[idx].as_ref()) {
+            continue;
+        }
+        let Some(call) = batch.pending[idx].take() else {
+            continue;
+        };
+        batch.outcomes[idx] = Some(apply_tool_call(call, conn, options, events)?);
+    }
+    Ok(())
+}
+
+fn apply_preflight_rest<'scope>(
+    conn: &Connection,
+    options: &ApplyToolOptions<'scope>,
+    events: &mut Vec<Event>,
+    preflight: &BatchPreflight,
+    batch: &mut AgentApplyBatch,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    for idx in 0..batch.pending.len() {
+        if let Some(denial) = preflight.denial(idx) {
+            batch.outcomes[idx] = Some(denial.clone());
+            continue;
+        }
+        let Some(call) = batch.pending[idx].take() else {
+            continue;
+        };
+        batch.outcomes[idx] = Some(apply_tool_call(call, conn, options, events)?);
+    }
+    Ok(())
+}
+
+fn is_upsert_node(call: Option<&ToolCall>) -> bool {
+    matches!(call, Some(ToolCall::UpsertNode { .. }))
+}
+
+pub(crate) fn preflight_tool_batch(
+    conn: &Connection,
+    calls: &[ToolCall],
+    synthesis_nodes: &HashSet<String>,
+) -> Result<BatchPreflight, Box<dyn Error + Send + Sync>> {
+    let mut denials = vec![None; calls.len()];
+    let mut declared = HashMap::new();
+    preflight_node_declarations(conn, calls, synthesis_nodes, &mut declared, &mut denials)?;
+    preflight_edges(conn, calls, synthesis_nodes, &declared, &mut denials)?;
+    Ok(BatchPreflight { denials })
+}
+
+fn preflight_node_declarations(
+    conn: &Connection,
+    calls: &[ToolCall],
+    synthesis_nodes: &HashSet<String>,
+    declared: &mut HashMap<String, String>,
+    denials: &mut [Option<String>],
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    for (idx, call) in calls.iter().enumerate() {
+        let ToolCall::UpsertNode {
+            name, node_type, ..
+        } = call
+        else {
+            continue;
+        };
+        let node_id = normalize_id(name);
+        match declared_node_denial(conn, &node_id, node_type, synthesis_nodes)? {
+            Some(denial) => set_node_denial(denials, idx, denial),
+            None => {
+                declared.insert(
+                    node_id.clone(),
+                    resolved_declared_type(&node_id, synthesis_nodes),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn preflight_edges(
+    conn: &Connection,
+    calls: &[ToolCall],
+    synthesis_nodes: &HashSet<String>,
+    declared: &HashMap<String, String>,
+    denials: &mut [Option<String>],
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    for (idx, call) in calls.iter().enumerate() {
+        if denials[idx].is_some() {
+            continue;
+        }
+        let ToolCall::UpsertEdge {
+            source,
+            target,
+            content,
+            subject,
+            ..
+        } = call
+        else {
+            continue;
+        };
+        let source_id = normalize_id(source);
+        let target_id = normalize_id(target);
+        let edge = EdgeDeclaration {
+            source: &source_id,
+            target: &target_id,
+            content,
+            subject: *subject,
+        };
+        if let Some(denial) = edge_denial(conn, &edge, synthesis_nodes, declared)? {
+            set_node_denial(denials, idx, denial);
+        }
+    }
+    Ok(())
+}
+
+struct EdgeDeclaration<'scope> {
+    source: &'scope str,
+    target: &'scope str,
+    content: &'scope str,
+    subject: bool,
+}
+
+fn edge_denial<'scope>(
+    conn: &Connection,
+    edge: &EdgeDeclaration<'scope>,
+    synthesis_nodes: &HashSet<String>,
+    declared: &HashMap<String, String>,
+) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+    if synthesis_reference_missing(edge.source, edge.target, synthesis_nodes, declared) {
+        return Ok(Some(
+            "upsert_edge denied: synthesis endpoints must be declared in the same batch"
+                .to_string(),
+        ));
+    }
+    let source_fact = endpoint_is_fact_like(conn, edge.source, declared)?;
+    let target_fact = endpoint_is_fact_like(conn, edge.target, declared)?;
+    if edge.subject && !source_fact {
+        return Ok(Some(format!(
+            "upsert_edge denied: subject source {} must be fact or synthesis",
+            edge.source
+        )));
+    }
+    if edge.content.trim().eq_ignore_ascii_case("implies") && (!source_fact || !target_fact) {
+        return Ok(Some(
+            "upsert_edge denied: implies endpoints must be fact or synthesis".to_string(),
+        ));
+    }
+    Ok(None)
+}
+
+fn synthesis_reference_missing(
+    source: &str,
+    target: &str,
+    synthesis_nodes: &HashSet<String>,
+    declared: &HashMap<String, String>,
+) -> bool {
+    for node_id in [source, target] {
+        let declared_synthesis = match declared.get(node_id) {
+            Some(node_type) => node_type == "synthesis",
+            None => false,
+        };
+        if synthesis_nodes.contains(node_id) && !declared_synthesis {
+            return true;
+        }
+    }
+    false
+}
+
+fn endpoint_is_fact_like(
+    conn: &Connection,
+    node_id: &str,
+    declared: &HashMap<String, String>,
+) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    if let Some(node_type) = declared.get(node_id) {
+        return Ok(matches!(node_type.as_str(), "fact" | "synthesis"));
+    }
+    let node = db::load_node(conn, node_id)?;
+    Ok(node
+        .as_ref()
+        .is_some_and(|stored| matches!(stored.node_type.as_str(), "fact" | "synthesis")))
+}
+
+fn set_node_denial(denials: &mut [Option<String>], idx: usize, denial: String) {
+    runlog::log("nodes", &format!("denied: {denial}"));
+    denials[idx] = Some(denial);
+}
+
+fn resolved_declared_type(node_id: &str, synthesis_nodes: &HashSet<String>) -> String {
+    if synthesis_nodes.contains(node_id) {
+        return "synthesis".to_string();
+    }
+    "fact".to_string()
+}
+
+pub(crate) fn declared_node_denial(
+    conn: &Connection,
+    node_id: &str,
+    requested: &str,
+    synthesis_nodes: &HashSet<String>,
+) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+    let resolved = resolved_declared_type(node_id, synthesis_nodes);
+    if resolved == "fact" && requested != "fact" {
+        return Ok(Some(
+            "upsert_node denied: only fact nodes may be declared; entities are created automatically from edge endpoints".to_string(),
+        ));
+    }
+    let Some(stored) = db::load_node(conn, node_id)? else {
+        return Ok(None);
+    };
+    if stored.node_type == resolved {
+        return Ok(None);
+    }
+    if stored.node_type == "entity" {
+        return Ok(Some(
+            "upsert_node denied: entity collision; an entity is an identity, a fact is a claim about one — use a distinct fact id and connect them with an edge".to_string(),
+        ));
+    }
+    Ok(Some(format!(
+        "upsert_node denied: id {node_id} belongs to a {} node",
+        stored.node_type
+    )))
+}
+
 #[rustfmt::skip]
 pub(crate) fn apply_tool_call<'scope>(
     call: ToolCall,
@@ -1307,12 +1583,12 @@ pub(crate) fn apply_tool_call<'scope>(
     options: &ApplyToolOptions<'scope>,
     events: &mut Vec<Event>,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
-    if tool_call_touches_loop(conn, &call)? {
+    if !matches!(&call, ToolCall::UpsertNode { .. }) && tool_call_touches_loop(conn, &call)? {
         return Ok("mutation denied: loop lifecycle requires open_loop or close_loop".to_string());
     }
     match call {
         ToolCall::UpsertNode { name, node_type, body, date } =>
-            apply_upsert_node(conn, name, node_type, body, date),
+            apply_declared_upsert_node(conn, name, node_type, body, date),
         ToolCall::UpsertEdge { source, target, content, stability, confidence, importance, subject, date, memory_type, inferred_from } =>
             apply_upsert_edge_call(conn, options, events, UpsertEdgeCall { source, target, content, stability, confidence, importance, subject, date, memory_type, inferred_from }),
         ToolCall::DeleteNode { name } =>
@@ -1793,16 +2069,11 @@ fn apply_open_loop_call<'scope>(
         return Ok("open_loop denied: open_loop is a heavy tool".to_string());
     }
     let anchor_id = normalize_id(&call.anchor);
-    let Some(anchor_node) = db::load_node(conn, &anchor_id)? else {
-        return Ok(format!("open_loop denied: anchor {anchor_id} not found"));
-    };
-    if anchor_node.node_type == "loop" {
-        return Ok(format!("open_loop denied: anchor {anchor_id} is a loop"));
-    }
     let loop_id = normalize_id(&call.intention);
     if let Some(reason) = open_loop_block_reason(conn, &loop_id, &anchor_id)? {
         return Ok(format!("open_loop denied: {reason}"));
     }
+    db::ensure_entity_endpoints(conn, &anchor_id, &anchor_id)?;
     let due = validated_loop_due(call.due);
     apply_upsert_node(
         conn,
@@ -2147,6 +2418,22 @@ fn apply_upsert_node(
     Ok(format!("upsert_node: {name} ({node_type})"))
 }
 
+fn apply_declared_upsert_node(
+    conn: &Connection,
+    name: String,
+    node_type: String,
+    body: String,
+    date: String,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let normalized = normalize_id(&name);
+    let synthesis_nodes = HashSet::new();
+    if let Some(denial) = declared_node_denial(conn, &normalized, &node_type, &synthesis_nodes)? {
+        runlog::log("nodes", &format!("denied: {denial}"));
+        return Ok(denial);
+    }
+    apply_upsert_node(conn, name, "fact".to_string(), body, date)
+}
+
 fn apply_upsert_edge<'scope>(
     conn: &Connection,
     mut edge: Edge,
@@ -2317,6 +2604,7 @@ mod tests {
         parse_tool_calls, parse_turn_mode, says_done, stream_collect,
     };
     use crate::api::{Chunk, LlmClient, Stats, TurnOutcome};
+    use crate::memory::ledger::Event;
     use std::error::Error;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -2599,7 +2887,7 @@ mod tests {
         use super::{ApplyToolOptions, apply_tool_call};
         use crate::memory::db;
         use crate::memory::graph::Edge;
-        use crate::memory::ledger::{Actor, Event, EventContext};
+        use crate::memory::ledger::{Actor, EventContext};
         use turso::Builder;
 
         let conn = db::block_on(async {
@@ -2667,7 +2955,7 @@ mod tests {
         use super::{ApplyToolOptions, apply_tool_call};
         use crate::memory::db;
         use crate::memory::graph::Edge;
-        use crate::memory::ledger::{Actor, Event, EventContext};
+        use crate::memory::ledger::{Actor, EventContext};
         use turso::Builder;
 
         let conn = db::block_on(async {
@@ -3580,6 +3868,198 @@ mod tests {
         }
     }
 
+    mod node_contract {
+        use super::super::{ApplyToolOptions, ToolCall, apply_preflighted_batch, apply_tool_call};
+        use crate::memory::db;
+        use crate::memory::graph::{Node, PROVENANCE_USER_CONFIRMED};
+        use crate::memory::ledger::{Actor, EventContext};
+        use turso::{Builder, Connection};
+
+        const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
+        const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', ceiling REAL, PRIMARY KEY (source, target))";
+
+        fn harness() -> Connection {
+            db::block_on(async {
+                let Ok(database) = Builder::new_local(":memory:").build().await else {
+                    unreachable!("database builds")
+                };
+                let Ok(conn) = database.connect() else {
+                    unreachable!("database connects")
+                };
+                let _ = conn.execute(NODES_DDL, ()).await;
+                let _ = conn.execute(EDGES_DDL, ()).await;
+                conn
+            })
+        }
+
+        fn options() -> ApplyToolOptions<'static> {
+            ApplyToolOptions {
+                actor: Actor::new("system", "extract"),
+                context: EventContext::new("session", "turn"),
+                source_message_id: "message",
+                event_payload: "",
+                confidence_cap: None,
+                provenance: PROVENANCE_USER_CONFIRMED,
+                default_memory_type: "semantic",
+            }
+        }
+
+        fn node(name: &str, node_type: &str, body: &str) -> ToolCall {
+            ToolCall::UpsertNode {
+                name: name.to_string(),
+                node_type: node_type.to_string(),
+                body: body.to_string(),
+                date: String::new(),
+            }
+        }
+
+        fn edge(source: &str, target: &str, subject: bool) -> ToolCall {
+            ToolCall::UpsertEdge {
+                source: source.to_string(),
+                target: target.to_string(),
+                content: if subject {
+                    String::new()
+                } else {
+                    "relates to".to_string()
+                },
+                stability: 0.7,
+                confidence: 1.0,
+                importance: 1.0,
+                subject,
+                date: "2026-07-17".to_string(),
+                memory_type: None,
+                inferred_from: None,
+            }
+        }
+
+        fn write_node(conn: &Connection, node_id: &str, node_type: &str, body: &str) {
+            let stored = Node {
+                node_type: node_type.to_string(),
+                body: body.to_string(),
+                date: String::new(),
+            };
+            assert!(db::write_node(conn, node_id, &stored).is_ok());
+        }
+
+        fn apply_one(conn: &Connection, call: ToolCall) -> String {
+            let mut events = Vec::new();
+            apply_tool_call(call, conn, &options(), &mut events).unwrap_or_default()
+        }
+
+        #[test]
+        fn declared_nodes_are_fact_only() {
+            let conn = harness();
+            for denied_type in ["entity", "game", "anything"] {
+                let result = apply_one(&conn, node(denied_type, denied_type, ""));
+                assert!(
+                    result.contains("only fact nodes may be declared"),
+                    "{result}"
+                );
+            }
+            let accepted = apply_one(&conn, node("claim", "fact", "one claim"));
+            assert!(accepted.contains("upsert_node:"), "{accepted}");
+            let Ok(Some(stored)) = db::load_node(&conn, "claim") else {
+                unreachable!("fact exists")
+            };
+            assert_eq!(
+                (stored.node_type.as_str(), stored.body.as_str()),
+                ("fact", "one claim")
+            );
+        }
+
+        #[test]
+        fn fact_collision_matrix_never_overwrites_other_node_types() {
+            let conn = harness();
+            write_node(&conn, "fact-id", "fact", "old");
+            write_node(&conn, "entity-id", "entity", "");
+            for node_type in ["game", "loop", "interest", "task"] {
+                write_node(&conn, node_type, node_type, "protected");
+            }
+            assert!(apply_one(&conn, node("new-id", "fact", "new")).contains("upsert_node:"));
+            assert!(apply_one(&conn, node("fact-id", "fact", "updated")).contains("upsert_node:"));
+            let entity_denial = apply_one(&conn, node("entity-id", "fact", "claim"));
+            assert!(
+                entity_denial.contains("an entity is an identity"),
+                "{entity_denial}"
+            );
+            for node_type in ["game", "loop", "interest", "task"] {
+                let denial = apply_one(&conn, node(node_type, "fact", "overwrite"));
+                assert!(
+                    denial.contains(&format!("belongs to a {node_type} node")),
+                    "{denial}"
+                );
+                let Ok(Some(stored)) = db::load_node(&conn, node_type) else {
+                    unreachable!("protected node exists")
+                };
+                assert_eq!(
+                    (stored.node_type.as_str(), stored.body.as_str()),
+                    (node_type, "protected")
+                );
+            }
+            let Ok(Some(entity)) = db::load_node(&conn, "entity-id") else {
+                unreachable!("entity remains")
+            };
+            assert_eq!(entity.node_type, "entity");
+        }
+
+        #[test]
+        fn preflight_applies_valid_calls_individually_and_facts_before_edges() {
+            let conn = harness();
+            let calls = vec![
+                edge("later-fact", "topic", true),
+                node("invalid", "entity", ""),
+                node("later-fact", "fact", "the later declaration"),
+                edge("plain-entity", "other", true),
+            ];
+            let mut events = Vec::new();
+            let outcomes =
+                apply_preflighted_batch(&conn, calls, &options(), &mut events).unwrap_or_default();
+            assert!(outcomes[0].contains("upsert_edge:"), "{outcomes:?}");
+            assert!(outcomes[1].contains("only fact nodes"), "{outcomes:?}");
+            assert!(outcomes[2].contains("upsert_node:"), "{outcomes:?}");
+            assert!(outcomes[3].contains("subject source"), "{outcomes:?}");
+            assert!(
+                db::load_edge(&conn, "later-fact", "topic")
+                    .ok()
+                    .flatten()
+                    .is_some()
+            );
+            assert!(
+                db::load_edge(&conn, "plain-entity", "other")
+                    .ok()
+                    .flatten()
+                    .is_none()
+            );
+        }
+
+        #[test]
+        fn implicit_endpoints_create_entities_and_preserve_typed_nodes() {
+            let conn = harness();
+            assert!(apply_one(&conn, edge("left", "right", false)).contains("upsert_edge:"));
+            for node_id in ["left", "right"] {
+                let Ok(Some(stored)) = db::load_node(&conn, node_id) else {
+                    unreachable!("implicit endpoint exists")
+                };
+                assert_eq!(stored.node_type, "entity");
+                assert!(stored.body.is_empty());
+            }
+            write_node(&conn, "fact", "fact", "claim");
+            write_node(&conn, "game", "game", "rules");
+            assert!(apply_one(&conn, edge("fact", "game", false)).contains("upsert_edge:"));
+            for (node_id, expected_type, expected_body) in
+                [("fact", "fact", "claim"), ("game", "game", "rules")]
+            {
+                let Ok(Some(stored)) = db::load_node(&conn, node_id) else {
+                    unreachable!("endpoint remains")
+                };
+                assert_eq!(
+                    (stored.node_type.as_str(), stored.body.as_str()),
+                    (expected_type, expected_body)
+                );
+            }
+        }
+    }
+
     mod loops {
         use super::super::{ApplyToolOptions, ToolCall, apply_tool_call, parse_tool_calls};
         use crate::memory::db;
@@ -3807,17 +4287,35 @@ mod tests {
         }
 
         #[test]
-        fn open_loop_requires_an_existing_anchor() {
+        fn open_loop_creates_a_missing_anchor() {
             let conn = db::block_on(harness());
             let description = apply(&conn, "extract", open("check the unit", "missing", ""));
-            assert!(
-                description.contains("anchor missing not found"),
-                "{description}"
-            );
-            let Ok(node) = db::load_node(&conn, "check-the-unit") else {
-                unreachable!("node lookup succeeds")
+            assert!(description.contains("open_loop:"), "{description}");
+            let Ok(Some(anchor)) = db::load_node(&conn, "missing") else {
+                unreachable!("anchor exists")
             };
-            assert!(node.is_none());
+            assert_eq!(anchor.node_type, "entity");
+            assert!(anchor.body.is_empty());
+        }
+
+        #[test]
+        fn open_loop_preserves_an_existing_typed_anchor() {
+            let conn = db::block_on(harness());
+            let fact = Node {
+                node_type: "fact".to_string(),
+                body: "the service is important".to_string(),
+                date: String::new(),
+            };
+            assert!(db::write_node(&conn, "home-server", &fact).is_ok());
+            let opened = apply(&conn, "extract", open("check the unit", "home-server", ""));
+            assert!(opened.contains("open_loop:"), "{opened}");
+            let Ok(Some(anchor)) = db::load_node(&conn, "home-server") else {
+                unreachable!("anchor remains")
+            };
+            assert_eq!(
+                (anchor.node_type.as_str(), anchor.body.as_str()),
+                ("fact", "the service is important")
+            );
         }
 
         #[test]

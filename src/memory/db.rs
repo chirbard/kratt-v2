@@ -1627,6 +1627,7 @@ pub fn write_edge(
     source_message_id: &str,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     runtime().block_on(async {
+        ensure_entity_endpoints_async(conn, &edge.source, &edge.target).await?;
         conn.execute(
             "INSERT OR REPLACE INTO edges (source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, source_message_id, memory_type, origin_session, provenance, ceiling) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
@@ -1650,6 +1651,43 @@ pub fn write_edge(
         .await?;
         Ok(())
     })
+}
+
+pub(crate) fn ensure_entity_endpoints(
+    conn: &Connection,
+    source: &str,
+    target: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    runtime().block_on(ensure_entity_endpoints_async(conn, source, target))
+}
+
+async fn ensure_entity_endpoints_async(
+    conn: &Connection,
+    source: &str,
+    target: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    ensure_entity_node(conn, source).await?;
+    if target != source {
+        ensure_entity_node(conn, target).await?;
+    }
+    Ok(())
+}
+
+async fn ensure_entity_node(
+    conn: &Connection,
+    node_id: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let inserted = conn
+        .execute(
+            "INSERT OR IGNORE INTO nodes (id, node_type, body, date)
+             VALUES (?1, 'entity', '', '')",
+            params![node_id],
+        )
+        .await?;
+    if inserted > 0 {
+        crate::runlog::log("nodes", &format!("implicit entity: {node_id}"));
+    }
+    Ok(())
 }
 
 pub(crate) fn nearest_live_edges(
@@ -3897,6 +3935,7 @@ mod tests {
         let Ok(conn) = database.connect() else {
             unreachable!("in-memory database connects")
         };
+        let _ = conn.execute(NODES_DDL, ()).await;
         let _ = conn.execute(EDGES_DDL, ()).await;
         conn
     }
