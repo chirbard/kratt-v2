@@ -494,11 +494,9 @@ impl<'run> AgentRun<'run> {
 
     fn decayed_graph(&self) -> Result<super::graph::Graph, Box<dyn Error + Send + Sync>> {
         let mut graph = db::load_graph();
-        let decay_ran = decay::apply_decay_if_needed(&mut graph);
-        if decay_ran && let Err(err) = db::save_graph(&graph) {
-            self.send_log("memory", format!("error: {err}"));
-            return Err(err);
-        }
+        // Decay persists itself with targeted updates; the whole-graph rewrite
+        // that used to follow here destroyed embeddings on every run.
+        decay::apply_decay_if_needed(&mut graph);
         Ok(graph)
     }
 

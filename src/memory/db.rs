@@ -1563,6 +1563,53 @@ pub async fn load_inbox_outcomes(
     Ok(outcomes)
 }
 
+// Bootstrap for an EMPTY database only (db_init returns early when any node
+// exists). Unlike the whole-graph rewrite this replaced, it never runs against
+// a populated graph, so it cannot destroy embeddings or message attribution.
+// Decay and every other mutation use targeted updates.
+async fn seed_empty_graph(
+    conn: &Connection,
+    graph: &Graph,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    conn.execute("BEGIN", ()).await?;
+    for (node_id, node) in &graph.nodes {
+        conn.execute(
+            "INSERT INTO nodes (id, node_type, body, date) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                node_id.as_str(),
+                node.node_type.as_str(),
+                node.body.as_str(),
+                node.date.as_str()
+            ],
+        )
+        .await?;
+    }
+    for edge in &graph.edges {
+        conn.execute(
+            "INSERT INTO edges (source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session, provenance, ceiling) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                edge.source.as_str(),
+                edge.target.as_str(),
+                edge.content.as_str(),
+                round2(edge.stability),
+                clamped_confidence(edge.confidence, &edge.provenance, edge.ceiling),
+                round2(edge.importance),
+                edge.subject as i64,
+                edge.date.as_str(),
+                edge.occurred_at.as_deref(),
+                edge.expired_at.as_deref(),
+                edge.memory_type.as_str(),
+                edge.origin_session.as_str(),
+                edge.provenance.as_str(),
+                edge.ceiling,
+            ],
+        )
+        .await?;
+    }
+    conn.execute("COMMIT", ()).await?;
+    Ok(())
+}
+
 pub fn db_init() -> Result<(), Box<dyn Error + Send + Sync>> {
     let conn = open_connection()?;
     let count = runtime().block_on(node_count(&conn))?;
@@ -1573,7 +1620,7 @@ pub fn db_init() -> Result<(), Box<dyn Error + Send + Sync>> {
     if graph.nodes.is_empty() && graph.edges.is_empty() {
         return Ok(());
     }
-    runtime().block_on(write_graph(&conn, &graph))?;
+    runtime().block_on(seed_empty_graph(&conn, &graph))?;
     let _ = runtime().block_on(migrate_entity_bodies_matching_ids(&conn))?;
     Ok(())
 }
@@ -1649,10 +1696,6 @@ async fn load_edges(conn: &Connection, graph: &mut Graph) {
     }
 }
 
-pub fn save_graph(graph: &Graph) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let conn = open_connection()?;
-    runtime().block_on(write_graph(&conn, graph))
-}
 
 pub fn begin_transaction(conn: &Connection) -> Result<(), Box<dyn Error + Send + Sync>> {
     runtime().block_on(async {
@@ -3121,65 +3164,8 @@ pub fn edge_count() -> usize {
     result.unwrap_or_default()
 }
 
-async fn write_graph(conn: &Connection, graph: &Graph) -> Result<(), Box<dyn Error + Send + Sync>> {
-    conn.execute("BEGIN", ()).await?;
-    conn.execute("DELETE FROM nodes", ()).await?;
-    conn.execute("DELETE FROM edges", ()).await?;
-    for (node_id, node) in &graph.nodes {
-        insert_graph_node(conn, node_id, node).await?;
-    }
-    for edge in &graph.edges {
-        insert_graph_edge(conn, edge).await?;
-    }
-    conn.execute("COMMIT", ()).await?;
-    Ok(())
-}
 
-async fn insert_graph_node(
-    conn: &Connection,
-    node_id: &str,
-    node: &Node,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    conn.execute(
-        "INSERT INTO nodes (id, node_type, body, date) VALUES (?1, ?2, ?3, ?4)",
-        params![
-            node_id,
-            node.node_type.as_str(),
-            node.body.as_str(),
-            node.date.as_str()
-        ],
-    )
-    .await?;
-    Ok(())
-}
 
-async fn insert_graph_edge(
-    conn: &Connection,
-    edge: &Edge,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    conn.execute(
-            "INSERT INTO edges (source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, source_message_id, memory_type, origin_session, provenance, ceiling, last_decayed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-        params![
-            edge.source.as_str(),
-            edge.target.as_str(),
-            edge.content.as_str(),
-            round2(edge.stability),
-            clamped_confidence(edge.confidence, &edge.provenance, edge.ceiling),
-            round2(edge.importance),
-            edge.subject as i64,
-            edge.date.as_str(),
-            edge.occurred_at.as_deref(),
-            edge.expired_at.as_deref(),
-            "",
-            edge.memory_type.as_str(),
-            edge.origin_session.as_str(),
-            edge.provenance.as_str(),
-            edge.ceiling,
-        ],
-    )
-    .await?;
-    Ok(())
-}
 
 pub fn register_session(session_id: &str, created_at: &str) {
     let Ok(conn) = open_connection() else {
@@ -3803,12 +3789,56 @@ pub fn load_last_decay() -> String {
     })
 }
 
-pub fn save_last_decay(date: &str) {
-    let Ok(conn) = open_connection() else { return };
-    let _ = runtime().block_on(conn.execute(
-        "INSERT OR REPLACE INTO meta (key, value) VALUES ('last_decay', ?1)",
-        params![date],
-    ));
+// One decayed edge: only the two fields decay is allowed to change.
+pub struct DecayChange {
+    pub source: String,
+    pub target: String,
+    pub confidence: f64,
+    pub last_decayed_at: String,
+}
+
+// Decay persistence is targeted UPDATEs plus the checkpoint in one transaction.
+// It must never go through a whole-graph rewrite: the in-memory Graph carries
+// neither embeddings nor source_message_id, so a rewrite silently destroyed
+// both every night and left the embedding backfill to pay for it. Writing the
+// checkpoint in the same transaction means a failed persist is retried rather
+// than skipped until tomorrow.
+pub fn persist_decay(
+    changes: &[DecayChange],
+    date: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let conn = open_connection()?;
+    persist_decay_with(&conn, changes, date)
+}
+
+pub(crate) fn persist_decay_with(
+    conn: &Connection,
+    changes: &[DecayChange],
+    date: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    runtime().block_on(async {
+        conn.execute("BEGIN", ()).await?;
+        for change in changes {
+            conn.execute(
+                "UPDATE edges SET confidence = ?1, last_decayed_at = ?2
+                 WHERE source = ?3 AND target = ?4",
+                params![
+                    round2(change.confidence),
+                    change.last_decayed_at.as_str(),
+                    change.source.as_str(),
+                    change.target.as_str()
+                ],
+            )
+            .await?;
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('last_decay', ?1)",
+            params![date],
+        )
+        .await?;
+        conn.execute("COMMIT", ()).await?;
+        Ok(())
+    })
 }
 
 pub fn graph_diff_toon(pre: &Graph, post: &Graph) -> String {
@@ -3941,8 +3971,9 @@ pub(crate) fn int(val: Value) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_PING_MUTED_UNTIL, add_edge_ceiling_column, backfill_edge_epistemics, block_on,
-        count_findings_in_window, count_new_embedding_neighbours_async, divert_ping_topic,
+        DEFAULT_PING_MUTED_UNTIL, DecayChange, add_edge_ceiling_column, backfill_edge_epistemics,
+        block_on, count_findings_in_window, count_new_embedding_neighbours_async, divert_ping_topic,
+        int, persist_decay_with, real, text,
         finish_pass_run_async, insert_finding, insert_interest, interest_density_with,
         last_successful_pass_async, load_all_edges_semantic_async, load_due_loops, load_game_edges,
         load_loops_for_anchors, load_ping_policy, load_recent_attention_counts_async,
@@ -4284,6 +4315,70 @@ mod tests {
                 .is_ok()
         );
         assert!(handle.join().is_ok());
+    }
+
+    // The decay persistence path is the one that silently broke: a parameter
+    // count mismatch made every write fail, and the whole-graph rewrite it used
+    // would have erased embeddings the moment the count was fixed. This drives
+    // the real functions, not hand-written SQL.
+    #[test]
+    fn decay_persistence_updates_values_and_preserves_embeddings() {
+        let conn = block_on(harness());
+        block_on(seed_embedded_edge(&conn));
+
+        let changes = vec![DecayChange {
+            source: "a".to_string(),
+            target: "b".to_string(),
+            confidence: 0.42,
+            last_decayed_at: "2026-07-20".to_string(),
+        }];
+        assert!(
+            persist_decay_with(&conn, &changes, "2026-07-20").is_ok(),
+            "decay persistence succeeds"
+        );
+
+        block_on(async {
+            let Ok(mut rows) = conn
+                .query(
+                    "SELECT confidence, last_decayed_at, embedding IS NOT NULL FROM edges WHERE source = 'a'",
+                    (),
+                )
+                .await
+            else {
+                unreachable!("edge query succeeds")
+            };
+            let Ok(Some(row)) = rows.next().await else {
+                unreachable!("edge still exists")
+            };
+            let (Ok(conf), Ok(clock), Ok(has_embedding)) =
+                (row.get_value(0), row.get_value(1), row.get_value(2))
+            else {
+                unreachable!("row columns read")
+            };
+            assert!((real(conf) - 0.42).abs() < 1e-9);
+            assert_eq!(text(clock), "2026-07-20");
+            assert_eq!(
+                int(has_embedding),
+                1,
+                "embedding survives decay — the rewrite path used to drop it"
+            );
+        });
+    }
+
+    async fn seed_embedded_edge(conn: &Connection) {
+        let _ = conn
+            .execute(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '')",
+                (),
+            )
+            .await;
+        let _ = conn
+            .execute(
+                "INSERT INTO edges (source, target, content, stability, confidence, importance, subject, date, memory_type, origin_session, provenance, embedding)
+                 VALUES ('a', 'b', 'belief', 0.5, 0.9, 0.5, 0, '2026-07-01', 'semantic', '', 'legacy', vector32('[1.0, 0.0]'))",
+                (),
+            )
+            .await;
     }
 
     async fn harness() -> Connection {
