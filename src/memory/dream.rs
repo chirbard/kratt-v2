@@ -27,7 +27,7 @@ use super::synthesis::{self, SynthesisPolicy};
 
 const GIST_IMPORTANCE: f64 = 0.5; // replay-tunable.
 const MAX_PRUNES_PER_PASS: usize = 3; // replay-tunable.
-const PRUNE_GUARD_THRESHOLD: f64 = 0.7; // replay-tunable.
+pub(crate) const PRUNE_GUARD_THRESHOLD: f64 = 0.7; // replay-tunable.
 pub const DOMAIN_AGENT_NAMES: [&str; 3] = ["biologist", "historian", "economist"];
 const BIOLOGIST_ANCHOR: &str =
     "biology ecosystem evolution adaptation living organisms life systems";
@@ -1367,7 +1367,7 @@ fn apply_dream_expire_edge<'scope, 'policy>(
     ))
 }
 
-fn prune_block_reason(edge: &Edge, prunes_used: usize) -> Option<String> {
+pub(crate) fn prune_block_reason(edge: &Edge, prunes_used: usize) -> Option<String> {
     if prunes_used >= MAX_PRUNES_PER_PASS {
         return Some(format!("prune cap {}", MAX_PRUNES_PER_PASS));
     }

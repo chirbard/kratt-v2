@@ -760,6 +760,20 @@ fn rank_score(
     let sim = similarity_term(routing_vector, edge.embedding.as_deref());
     let recency = recency_term(&edge.date);
     let novelty = novelty_term(edge, user_views);
+    weighted_rank_score(edge, sim, recency, novelty)
+}
+
+pub(crate) fn replay_rank_score(
+    edge: &SemanticEdge,
+    routing_vector: &[f64],
+    reference_date: &str,
+) -> f64 {
+    let sim = similarity_term(routing_vector, edge.embedding.as_deref());
+    let recency = recency_term_at(&edge.date, reference_date);
+    weighted_rank_score(edge, sim, recency, 0.0)
+}
+
+fn weighted_rank_score(edge: &SemanticEdge, sim: f64, recency: f64, novelty: f64) -> f64 {
     let base = W_SIM * sim + W_CONF * edge.confidence + W_RECENCY * recency + W_NOVELTY * novelty;
     if edge.memory_type == "episodic" {
         base + EPISODIC_RANK_BONUS
@@ -808,6 +822,31 @@ fn days_since_edge_date(date: &str) -> Option<f64> {
         return Some(0.0);
     }
     Some(seconds as f64 / 86_400.0)
+}
+
+fn recency_term_at(date: &str, reference_date: &str) -> f64 {
+    let Some(edge_epoch) = date_epoch(date) else {
+        return 0.0;
+    };
+    let Some(reference_epoch) = date_epoch(reference_date) else {
+        return 0.0;
+    };
+    let seconds = reference_epoch.saturating_sub(edge_epoch);
+    if seconds <= 0 {
+        return 1.0;
+    }
+    1.0 / (1.0 + seconds as f64 / 86_400.0)
+}
+
+fn date_epoch(date: &str) -> Option<i64> {
+    let trimmed = date.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.contains('T') {
+        return timeutil::timestamp_to_epoch_seconds(trimmed);
+    }
+    timeutil::timestamp_to_epoch_seconds(&format!("{trimmed}T00:00:00"))
 }
 
 fn chat_rank_cmp(left: &ChatScoredEdge, right: &ChatScoredEdge) -> std::cmp::Ordering {

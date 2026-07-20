@@ -1,6 +1,8 @@
 mod agent;
 mod db;
 mod decay;
+pub mod decay_curve;
+mod decay_simulator;
 mod dream;
 mod embed;
 mod explore;
@@ -38,6 +40,7 @@ pub(crate) use db::{
 #[cfg(test)]
 pub(crate) use db::{insert_interest, top_interests_with};
 pub use dream::{DreamEvent, run_dream_pass};
+pub use decay_simulator::run as run_decay_simulator;
 pub use embed::{SemanticEdge, edges_to_toon, run_embed_pass, select_semantic_edges_routed};
 pub use explore::{ExploreEvent, run_exploration_pass};
 pub use ingest::{IngestEvent, run_focused_ingestion_pass, run_ingestion_pass};

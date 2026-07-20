@@ -23,11 +23,19 @@ mod timeutil;
 mod tui;
 mod web;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 const DEFAULT_CHAT_MODEL: &str = "deepseek/deepseek-v4-flash";
 const DEFAULT_MEMORY_MODEL: &str = "openai/gpt-oss-20b:nitro";
 const DEFAULT_EMBED_MODEL: &str = "perplexity/pplx-embed-v1-0.6b";
+
+type MainResult<Output> = Result<Output, Box<dyn std::error::Error>>;
+
+struct DecaySimulationRequest {
+    snapshot: PathBuf,
+    today: Option<String>,
+}
 
 // Panics land in the runlog before the default hook prints them — under a
 // daemon (systemd, detached terminal) the runlog is the only place they are
@@ -41,12 +49,20 @@ fn install_panic_runlog() {
     }));
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> MainResult<()> {
+    let decay_simulation = decay_simulation_request()?;
     // All data paths (kratt-data/, logs, .env) are relative — pin the working
     // directory to the crate root so `cargo run` from a subdirectory doesn't
     // scatter kratt-data/ copies around the repo.
     std::env::set_current_dir(env!("CARGO_MANIFEST_DIR"))?;
     install_panic_runlog();
+    if let Some(request) = decay_simulation {
+        return memory::run_decay_simulator(&request.snapshot, request.today.as_deref());
+    }
+    run_application()
+}
+
+fn run_application() -> MainResult<()> {
     dotenvy::dotenv()?;
     let api_key = std::env::var("OPENROUTER_API_KEY")?;
     let tavily_key = std::env::var("TAVILY_API_KEY").unwrap_or_default();
@@ -87,6 +103,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     memory::sync_push_best_effort("app exit");
     result
+}
+
+fn decay_simulation_request() -> MainResult<Option<DecaySimulationRequest>> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg != "--simulate-decay" {
+            continue;
+        }
+        let snapshot = args
+            .next()
+            .ok_or("--simulate-decay requires a snapshot.db path")?;
+        let path = absolute_input_path(&snapshot)?;
+        let today = parse_simulation_today(&mut args)?;
+        return Ok(Some(DecaySimulationRequest {
+            snapshot: path,
+            today,
+        }));
+    }
+    Ok(None)
+}
+
+fn absolute_input_path(raw: &str) -> MainResult<PathBuf> {
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    Ok(std::env::current_dir()?.join(path))
+}
+
+fn parse_simulation_today(args: &mut impl Iterator<Item = String>) -> MainResult<Option<String>> {
+    let Some(flag) = args.next() else {
+        return Ok(None);
+    };
+    if flag != "--today" {
+        return Err(format!("unexpected decay simulator argument: {flag}").into());
+    }
+    let today = args.next().ok_or("--today requires a YYYY-MM-DD value")?;
+    if let Some(extra) = args.next() {
+        return Err(format!("unexpected decay simulator argument: {extra}").into());
+    }
+    Ok(Some(today))
 }
 
 fn initialize_database() -> Result<(), Box<dyn std::error::Error>> {
