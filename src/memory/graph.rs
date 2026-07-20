@@ -67,6 +67,10 @@ pub fn stability_seed_max(provenance: &str) -> f64 {
     }
 }
 
+pub fn clamp_stability_to_seed(stability: f64, provenance: &str) -> f64 {
+    stability.min(stability_seed_max(provenance))
+}
+
 pub fn provenance_ceiling(tier: &str) -> f64 {
     match tier {
         PROVENANCE_USER_CONFIRMED => 1.0, // replay-tunable.

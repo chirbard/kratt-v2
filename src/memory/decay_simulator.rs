@@ -7,7 +7,7 @@ use turso::{Builder, Connection, Value};
 use super::decay_curve::decay_factor_with;
 use super::embed::{SemanticEdge, TOP_K, replay_rank_score};
 use super::graph::{
-    Edge, PROVENANCE_LEGACY, PROVENANCE_USER_CONFIRMED, edge_is_pinned, stability_seed_max,
+    Edge, PROVENANCE_LEGACY, PROVENANCE_USER_CONFIRMED, clamp_stability_to_seed, edge_is_pinned,
 };
 
 const SWEEP_VALUES: [f64; 3] = [0.10, 0.15, 0.20]; // replay-tunable.
@@ -412,10 +412,7 @@ fn simulate(
 fn clamped_edges(edges: &[SimulationEdge]) -> Vec<SimulationEdge> {
     let mut clamped = edges.to_vec();
     for edge in &mut clamped {
-        edge.edge.stability = edge
-            .edge
-            .stability
-            .min(stability_seed_max(&edge.edge.provenance));
+        edge.edge.stability = clamp_stability_to_seed(edge.edge.stability, &edge.edge.provenance);
     }
     clamped
 }
