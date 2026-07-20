@@ -590,7 +590,7 @@ async fn create_base_tables(conn: &Connection) -> Result<(), Box<dyn Error + Sen
         (),
     ).await?;
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', PRIMARY KEY (source, target))",
+        "CREATE TABLE IF NOT EXISTS edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', last_decayed_at TEXT NOT NULL DEFAULT '', PRIMARY KEY (source, target))",
         (),
     ).await?;
     conn.execute(
@@ -715,7 +715,19 @@ async fn add_edge_columns(conn: &Connection) {
     add_edge_time_columns(conn).await;
     add_edge_memory_type_columns(conn).await;
     add_edge_epistemics_column(conn).await;
+    add_edge_decay_clock_column(conn).await;
     add_edge_ceiling_column(conn).await;
+}
+
+async fn add_edge_decay_clock_column(conn: &Connection) {
+    // Decay charged each edge's full age on every run because nothing advanced
+    // a per-edge clock — the exponent compounded as n(n+1)/14 instead of n/7.
+    let _ = conn
+        .execute(
+            "ALTER TABLE edges ADD COLUMN last_decayed_at TEXT NOT NULL DEFAULT ''",
+            (),
+        )
+        .await;
 }
 
 async fn add_edge_epistemics_column(conn: &Connection) {
@@ -1623,7 +1635,7 @@ async fn load_edges(conn: &Connection, graph: &mut Graph) {
             // Stable order: TOON emission preserves row order, so an unordered scan
             // makes graph serializations engine-dependent — deterministic bytes are
             // a precondition for any prompt prefix reuse across calls.
-            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session, provenance, ceiling FROM edges ORDER BY source, target",
+            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session, provenance, ceiling, last_decayed_at FROM edges ORDER BY source, target",
             (),
         )
         .await
@@ -1901,7 +1913,7 @@ pub fn write_edge(
     runtime().block_on(async {
         ensure_entity_endpoints_async(conn, &edge.source, &edge.target).await?;
         conn.execute(
-            "INSERT OR REPLACE INTO edges (source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, source_message_id, memory_type, origin_session, provenance, ceiling) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            "INSERT OR REPLACE INTO edges (source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, source_message_id, memory_type, origin_session, provenance, ceiling, last_decayed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 edge.source.as_str(),
                 edge.target.as_str(),
@@ -1918,6 +1930,7 @@ pub fn write_edge(
                 edge.origin_session.as_str(),
                 edge.provenance.as_str(),
                 edge.ceiling,
+                edge.last_decayed_at.as_str(),
             ],
         )
         .await?;
@@ -2184,7 +2197,7 @@ pub fn load_game_edges(
     runtime().block_on(async {
         let mut rows = conn
             .query(
-                "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session, provenance, ceiling FROM edges WHERE (source = ?1 OR target = ?1) AND memory_type = 'semantic' AND expired_at IS NULL ORDER BY confidence DESC LIMIT ?2",
+                "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session, provenance, ceiling, last_decayed_at FROM edges WHERE (source = ?1 OR target = ?1) AND memory_type = 'semantic' AND expired_at IS NULL ORDER BY confidence DESC LIMIT ?2",
                 params![game_id, cap as i64],
             )
             .await?;
@@ -2353,7 +2366,7 @@ pub fn load_task_chain(
     runtime().block_on(async {
         let mut rows = conn
             .query(
-                "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session, provenance, ceiling FROM edges WHERE source = ?1 AND target LIKE ?2 AND memory_type = 'episodic' AND expired_at IS NULL ORDER BY target DESC LIMIT ?3",
+                "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session, provenance, ceiling, last_decayed_at FROM edges WHERE source = ?1 AND target LIKE ?2 AND memory_type = 'episodic' AND expired_at IS NULL ORDER BY target DESC LIMIT ?3",
                 params![hub_id.as_str(), pattern.as_str(), cap as i64],
             )
             .await?;
@@ -2434,7 +2447,7 @@ async fn load_edge_async(
 ) -> Result<Option<Edge>, Box<dyn Error + Send + Sync>> {
     let mut rows = conn
         .query(
-            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session, provenance, ceiling FROM edges WHERE source = ?1 AND target = ?2 LIMIT 1",
+            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session, provenance, ceiling, last_decayed_at FROM edges WHERE source = ?1 AND target = ?2 LIMIT 1",
             params![source, target],
         )
         .await?;
@@ -2459,7 +2472,7 @@ pub(super) async fn touch_edge_dates(
         }
         let changed = conn
             .execute(
-                "UPDATE edges SET date = ?1 WHERE source = ?2 AND target = ?3 AND expired_at IS NULL",
+                "UPDATE edges SET date = ?1, last_decayed_at = ?1 WHERE source = ?2 AND target = ?3 AND expired_at IS NULL",
                 params![today, edge.source.as_str(), edge.target.as_str()],
             )
             .await?;
@@ -2476,7 +2489,7 @@ async fn load_edges_for_node_async(
 ) -> Result<Vec<Edge>, Box<dyn Error + Send + Sync>> {
     let mut rows = conn
         .query(
-            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session, provenance, ceiling FROM edges WHERE source = ?1 OR target = ?1",
+            "SELECT source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session, provenance, ceiling, last_decayed_at FROM edges WHERE source = ?1 OR target = ?1",
             params![node_id],
         )
         .await?;
@@ -3145,7 +3158,7 @@ async fn insert_graph_edge(
     edge: &Edge,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     conn.execute(
-            "INSERT INTO edges (source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, source_message_id, memory_type, origin_session, provenance, ceiling) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            "INSERT INTO edges (source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, source_message_id, memory_type, origin_session, provenance, ceiling, last_decayed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         params![
             edge.source.as_str(),
             edge.target.as_str(),
@@ -3867,6 +3880,7 @@ pub(super) fn parse_edge_row(row: &turso::Row) -> Option<Edge> {
         origin_session: text_or(row.get_value(11), ""),
         provenance: text_or(row.get_value(12), PROVENANCE_LEGACY),
         ceiling: optional_real(row.get_value(13).ok()),
+        last_decayed_at: text_or(row.get_value(14), ""),
     })
 }
 
@@ -3943,7 +3957,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use turso::{Builder, Connection, params};
 
-    const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', ceiling REAL, embedding BLOB, PRIMARY KEY (source, target))";
+    const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', ceiling REAL, embedding BLOB, last_decayed_at TEXT NOT NULL DEFAULT '', PRIMARY KEY (source, target))";
     const EVENTS_DDL: &str = "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')";
     const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
     const FINDINGS_DDL: &str = "CREATE TABLE findings (id INTEGER PRIMARY KEY AUTOINCREMENT, interest_topic TEXT NOT NULL, title TEXT NOT NULL, url TEXT NOT NULL, snippet TEXT NOT NULL DEFAULT '', novelty REAL NOT NULL, found_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'candidate', surfaced_at TEXT NOT NULL DEFAULT '')";
@@ -4300,6 +4314,7 @@ mod tests {
             origin_session: String::new(),
             provenance: provenance.to_string(),
             ceiling: None,
+            last_decayed_at: String::new(),
         }
     }
 
@@ -4446,7 +4461,7 @@ mod tests {
                 source TEXT NOT NULL, target TEXT NOT NULL, confidence REAL NOT NULL,
                 origin_session TEXT NOT NULL DEFAULT '',
                 provenance TEXT NOT NULL DEFAULT '',
-                PRIMARY KEY (source, target)
+                last_decayed_at TEXT NOT NULL DEFAULT '', PRIMARY KEY (source, target)
             )",
                 (),
             )

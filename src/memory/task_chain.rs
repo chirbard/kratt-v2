@@ -152,6 +152,7 @@ mod tests {
             origin_session: String::new(),
             provenance: "legacy".to_string(),
             ceiling: None,
+            last_decayed_at: String::new(),
         }
     }
 
@@ -196,6 +197,7 @@ mod tests {
             origin_session: "game-1".to_string(),
             provenance: "user-confirmed".to_string(),
             ceiling: None,
+            last_decayed_at: String::new(),
         }
     }
 

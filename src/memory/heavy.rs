@@ -414,6 +414,7 @@ mod tests {
             origin_session: String::new(),
             provenance: PROVENANCE_LEGACY.to_string(),
             ceiling: None,
+            last_decayed_at: String::new(),
         }
     }
 
