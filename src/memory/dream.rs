@@ -19,7 +19,8 @@ use super::db;
 use super::embed::{self, SemanticEdge};
 use super::graph::{
     Edge, Graph, Node, PROVENANCE_DREAMED, PROVENANCE_INFERRED, PROVENANCE_SYNTHESIZED,
-    graph_to_json, inferred_ceiling, node_carries_value, normalize_id, stability_seed_max, synthesized_ceiling,
+    edge_is_pinned, graph_to_json, inferred_ceiling, node_carries_value, normalize_id,
+    stability_seed_max, synthesized_ceiling,
 };
 use super::hygiene;
 use super::ledger::{self, Actor, EdgeRef, Event, EventContext};
@@ -1274,7 +1275,7 @@ fn delete_existing_edge<'scope, 'policy>(
     edge_call: DreamDeleteEdgeCall,
     edge: Edge,
 ) -> Result<(String, bool), Box<dyn Error + Send + Sync>> {
-    if let Some(reason) = prune_block_reason(&edge, ctx.apply_state.prunes_used) {
+    if let Some(reason) = prune_block_reason_in_db(ctx.conn, &edge, ctx.apply_state.prunes_used)? {
         return Ok((
             format!(
                 "delete_edge skipped: {} → {} ({reason})",
@@ -1308,7 +1309,9 @@ fn apply_dream_delete_node<'scope, 'policy>(
     if deleted_edges.is_empty() {
         return Ok((format!("delete_node skipped: {name} (not found)"), false));
     }
-    if let Some(reason) = delete_node_block_reason(&deleted_edges, ctx.apply_state.prunes_used) {
+    if let Some(reason) =
+        delete_node_block_reason(ctx.conn, &deleted_edges, ctx.apply_state.prunes_used)?
+    {
         return Ok((format!("delete_node skipped: {name} ({reason})"), false));
     }
     db::erase_node(ctx.conn, &normalized)?;
@@ -1322,18 +1325,22 @@ fn apply_dream_delete_node<'scope, 'policy>(
     Ok((format!("delete_node: {name}"), false))
 }
 
-fn delete_node_block_reason(edges: &[Edge], used_prunes: usize) -> Option<String> {
+fn delete_node_block_reason(
+    conn: &Connection,
+    edges: &[Edge],
+    used_prunes: usize,
+) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
     let mut idx = 0usize;
     while idx < edges.len() {
-        if let Some(reason) = prune_block_reason(&edges[idx], used_prunes + idx) {
-            return Some(reason);
+        if let Some(reason) = prune_block_reason_in_db(conn, &edges[idx], used_prunes + idx)? {
+            return Ok(Some(reason));
         }
         idx += 1;
     }
     if used_prunes + edges.len() > MAX_PRUNES_PER_PASS {
-        return Some(format!("prune cap {}", MAX_PRUNES_PER_PASS));
+        return Ok(Some(format!("prune cap {}", MAX_PRUNES_PER_PASS)));
     }
-    None
+    Ok(None)
 }
 
 fn apply_dream_expire_edge<'scope, 'policy>(
@@ -1367,18 +1374,35 @@ fn apply_dream_expire_edge<'scope, 'policy>(
     ))
 }
 
-pub(crate) fn prune_block_reason(edge: &Edge, prunes_used: usize) -> Option<String> {
+fn prune_block_reason_in_db(
+    conn: &Connection,
+    edge: &Edge,
+    prunes_used: usize,
+) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+    let source = db::load_node(conn, &edge.source)?;
+    let source_type = match source.as_ref() {
+        Some(node) => node.node_type.as_str(),
+        None => "",
+    };
+    Ok(prune_block_reason(edge, source_type, prunes_used))
+}
+
+pub(crate) fn prune_block_reason(
+    edge: &Edge,
+    source_node_type: &str,
+    prunes_used: usize,
+) -> Option<String> {
     if prunes_used >= MAX_PRUNES_PER_PASS {
         return Some(format!("prune cap {}", MAX_PRUNES_PER_PASS));
     }
-    if edge.importance >= 1.0 {
-        return Some("importance >= 1.0".to_string());
+    if edge.subject {
+        return Some("subject edge".to_string());
     }
     if edge.confidence >= PRUNE_GUARD_THRESHOLD {
         return Some(format!("confidence >= {}", PRUNE_GUARD_THRESHOLD));
     }
-    if edge.stability >= PRUNE_GUARD_THRESHOLD {
-        return Some(format!("stability >= {}", PRUNE_GUARD_THRESHOLD));
+    if edge_is_pinned(edge, source_node_type) {
+        return Some("pinned edge".to_string());
     }
     None
 }
@@ -1506,6 +1530,34 @@ mod tests {
             ceiling: None,
             last_decayed_at: String::new(),
         }
+    }
+
+    #[test]
+    fn prune_guard_uses_belief_and_structure_not_durability_proxies() {
+        let mut candidate = edge("fact", "topic", "semantic");
+        candidate.stability = 0.95;
+        candidate.importance = 1.0;
+        assert!(super::prune_block_reason(&candidate, "fact", 0).is_none());
+
+        candidate.subject = true;
+        candidate.importance = 0.2;
+        assert_eq!(
+            super::prune_block_reason(&candidate, "fact", 0).as_deref(),
+            Some("subject edge")
+        );
+
+        candidate.subject = false;
+        candidate.confidence = super::PRUNE_GUARD_THRESHOLD;
+        assert!(
+            super::prune_block_reason(&candidate, "fact", 0)
+                .is_some_and(|reason| reason.starts_with("confidence"))
+        );
+
+        candidate.confidence = 0.3;
+        assert_eq!(
+            super::prune_block_reason(&candidate, "loop", 0).as_deref(),
+            Some("pinned edge")
+        );
     }
 
     fn insert(conn: &Connection, source: &str, target: &str, memory_type: &str) {

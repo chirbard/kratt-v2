@@ -6,7 +6,9 @@ use turso::{Builder, Connection, Value};
 
 use super::decay_curve::decay_factor_with;
 use super::embed::{SemanticEdge, TOP_K, replay_rank_score};
-use super::graph::{Edge, PROVENANCE_LEGACY, PROVENANCE_USER_CONFIRMED, stability_seed_max};
+use super::graph::{
+    Edge, PROVENANCE_LEGACY, PROVENANCE_USER_CONFIRMED, edge_is_pinned, stability_seed_max,
+};
 
 const SWEEP_VALUES: [f64; 3] = [0.10, 0.15, 0.20]; // replay-tunable.
 const HORIZONS: [usize; 4] = [1, 7, 30, 90]; // replay-tunable.
@@ -441,7 +443,7 @@ fn charge_night(
     current_day: i64,
 ) {
     for edge in edges {
-        if edge.edge.expired_at.is_some() {
+        if edge.edge.expired_at.is_some() || simulation_edge_is_pinned(edge) {
             continue;
         }
         let key = edge_key(edge);
@@ -538,20 +540,17 @@ fn prune_counts(edges: &[SimulationEdge], memory_type: &str) -> BTreeMap<String,
 }
 
 fn today_prune_eligible(edge: &SimulationEdge) -> bool {
-    super::dream::prune_block_reason(&edge.edge, 0).is_none()
+    super::dream::prune_block_reason(&edge.edge, &edge.source_node_type, 0).is_none()
 }
 
 fn replacement_prune_eligible(edge: &SimulationEdge) -> bool {
-    !edge_is_pinned(edge)
+    !simulation_edge_is_pinned(edge)
         && !edge.edge.subject
         && edge.edge.confidence < super::dream::PRUNE_GUARD_THRESHOLD
 }
 
-fn edge_is_pinned(edge: &SimulationEdge) -> bool {
-    edge.edge.expired_at.is_none()
-        && edge.edge.memory_type == "semantic"
-        && edge.source_node_type == "loop"
-        && edge.edge.content.starts_with("open loop:")
+fn simulation_edge_is_pinned(edge: &SimulationEdge) -> bool {
+    edge_is_pinned(&edge.edge, &edge.source_node_type)
 }
 
 fn append_count_table(output: &mut String, states: &[(usize, Vec<SimulationEdge>)]) {
@@ -947,12 +946,17 @@ mod tests {
         edge.edge.confidence = 0.6;
         assert!(today_prune_eligible(&edge));
         edge.edge.stability = 0.7;
-        assert!(!today_prune_eligible(&edge));
+        assert!(today_prune_eligible(&edge));
         edge.edge.stability = 0.6;
         edge.edge.confidence = 0.7;
         assert!(!today_prune_eligible(&edge));
         edge.edge.confidence = 0.6;
         edge.edge.importance = 1.0;
+        assert!(today_prune_eligible(&edge));
+        edge.edge.subject = true;
+        assert!(!today_prune_eligible(&edge));
+        edge.edge.subject = false;
+        edge.source_node_type = "loop".to_string();
         assert!(!today_prune_eligible(&edge));
     }
 

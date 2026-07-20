@@ -48,6 +48,16 @@ pub const INFERENCE_DISCOUNT: f64 = 0.9; // replay-tunable.
 pub const SYNTHESIS_DISCOUNT: f64 = 0.9; // replay-tunable.
 pub const CLOSURE_NODE_CAP: usize = 40; // replay-tunable.
 
+pub fn node_type_is_loop(node_type: &str) -> bool {
+    node_type == "loop"
+}
+
+pub fn edge_is_pinned(edge: &Edge, source_node_type: &str) -> bool {
+    node_type_is_loop(source_node_type)
+        && edge.memory_type == "semantic"
+        && edge.expired_at.is_none()
+}
+
 pub fn stability_seed_max(provenance: &str) -> f64 {
     match provenance {
         PROVENANCE_USER_CONFIRMED | PROVENANCE_WEB_CONFIRMED => 0.5, // replay-tunable.
@@ -380,7 +390,7 @@ mod tests {
         CLOSURE_NODE_CAP, Edge, Graph, Node, PROVENANCE_DREAMED, PROVENANCE_INFERRED,
         PROVENANCE_LEGACY, PROVENANCE_SYNTHESIZED, PROVENANCE_USER_CONFIRMED,
         PROVENANCE_WEB_CONFIRMED, PROVENANCE_WEB_SURFACED, closure_nodes, edge_ceiling,
-        graph_to_json, inferred_ceiling, node_carries_value, normalize_memory_type,
+        edge_is_pinned, graph_to_json, inferred_ceiling, node_carries_value, normalize_memory_type,
         provenance_ceiling, stability_seed_max, synthesized_ceiling,
     };
 
@@ -537,5 +547,37 @@ mod tests {
         assert_eq!(synthesized_ceiling(&[0.25; 10]), Some(0.25));
         assert_eq!(inferred_ceiling(&[]), None);
         assert_eq!(synthesized_ceiling(&[]), None);
+    }
+
+    #[test]
+    fn only_live_semantic_loop_source_edges_are_pinned() {
+        let mut edge = Edge {
+            source: "loop".to_string(),
+            target: "topic".to_string(),
+            content: "open loop: check service".to_string(),
+            stability: 0.9,
+            confidence: 0.9,
+            importance: 1.0,
+            date: String::new(),
+            subject: false,
+            occurred_at: None,
+            expired_at: None,
+            memory_type: "semantic".to_string(),
+            origin_session: String::new(),
+            provenance: PROVENANCE_USER_CONFIRMED.to_string(),
+            ceiling: None,
+            last_decayed_at: String::new(),
+        };
+        assert!(edge_is_pinned(&edge, "loop"));
+        assert!(!edge_is_pinned(&edge, "interest"));
+        assert!(!edge_is_pinned(&edge, "fact"));
+        edge.target = "loop".to_string();
+        assert!(!edge_is_pinned(&edge, "fact"));
+
+        edge.memory_type = "episodic".to_string();
+        assert!(!edge_is_pinned(&edge, "loop"));
+        edge.memory_type = "semantic".to_string();
+        edge.expired_at = Some("2026-07-20".to_string());
+        assert!(!edge_is_pinned(&edge, "loop"));
     }
 }

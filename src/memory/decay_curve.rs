@@ -1,10 +1,9 @@
 pub const SEMANTIC_BASE_HALF_LIFE: f64 = 7.0; // replay-tunable.
-#[allow(dead_code)] // Staged for the production-decay step; simulator sweeps the `_with` variant.
-pub const STABILITY_DOUBLING: f64 = 0.15; // replay-tunable.
+pub const STABILITY_DOUBLING: f64 = 0.10; // replay-tunable.
 pub const EPISODIC_HALF_LIFE_DAYS: f64 = 1.0; // replay-tunable.
 pub const EPISODIC_MAX_HALF_LIFE_DAYS: f64 = 3.0; // replay-tunable.
 
-#[allow(dead_code)] // Pure public curve required before production wiring.
+#[allow(dead_code)] // Public curve probe retained for simulator and regression tests.
 pub fn semantic_half_life_days(stability: f64) -> f64 {
     semantic_half_life_days_with(stability, STABILITY_DOUBLING)
 }
@@ -19,7 +18,6 @@ pub fn episodic_half_life_days(stability: f64) -> f64 {
     EPISODIC_HALF_LIFE_DAYS.min(EPISODIC_MAX_HALF_LIFE_DAYS)
 }
 
-#[allow(dead_code)] // Pure public curve required before production wiring.
 pub fn decay_factor(memory_type: &str, stability: f64, elapsed_days: f64) -> f64 {
     decay_factor_with(memory_type, stability, elapsed_days, STABILITY_DOUBLING)
 }
@@ -47,7 +45,7 @@ mod tests {
 
     #[test]
     fn semantic_curve_matches_spec_table() {
-        let cases = [(0.15, 14.0), (0.30, 28.0), (0.50, 71.0), (1.0, 711.0)];
+        let cases = [(0.15, 19.8), (0.30, 56.0), (0.50, 224.0), (1.0, 7168.0)];
         for (stability, expected) in cases {
             let actual = semantic_half_life_days(stability);
             assert!(
