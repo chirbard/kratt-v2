@@ -233,12 +233,12 @@ fn session_path_for_today(today: &str) -> std::path::PathBuf {
 fn render_digest(digest: &DayDigest) -> String {
     let mut lines = Vec::new();
     lines.push(format!("Day: {}", digest.day));
-    lines.push(format!("Turns handled: {}", digest.turns));
+    push_conversation_lines(&mut lines, digest);
     lines.push(format!(
         "Edges created {}, updated {}, pruned {}",
         digest.created, digest.updated, digest.pruned
     ));
-    lines.push(format!("Overnight dream events: {}", digest.dream_events));
+    push_dream_lines(&mut lines, digest);
     if let Some(line) = digest.autonomy.line() {
         lines.push(line);
     }
@@ -246,6 +246,23 @@ fn render_digest(digest: &DayDigest) -> String {
     push_ref_line(&mut lines, "Due loops", &digest.due_loops);
     push_ref_line(&mut lines, "Inbox", &digest.inbox_outcomes);
     push_ref_line(&mut lines, "Held for you", &digest.held_findings);
+    push_ref_line(&mut lines, "Most-used beliefs", &digest.top_injected);
+    push_ref_line(&mut lines, "Example new edges", &digest.new_edges);
+    lines.join("\n")
+}
+
+fn push_conversation_lines(lines: &mut Vec<String>, digest: &DayDigest) {
+    if digest.conversation_user_messages == 0 {
+        lines.push("Conversation: none today.".to_string());
+        return;
+    }
+    if digest.turn_groups.is_empty() {
+        lines.push(format!(
+            "Conversation: {} messages, but no durable learning was recorded.",
+            digest.conversation_user_messages
+        ));
+        return;
+    }
     let mut index = 0usize;
     while index < digest.turn_groups.len() {
         lines.push(format!(
@@ -255,9 +272,68 @@ fn render_digest(digest: &DayDigest) -> String {
         ));
         index += 1;
     }
-    push_ref_line(&mut lines, "Most-used beliefs", &digest.top_injected);
-    push_ref_line(&mut lines, "Example new edges", &digest.new_edges);
-    lines.join("\n")
+}
+
+fn push_dream_lines(lines: &mut Vec<String>, digest: &DayDigest) {
+    let Some(run) = digest.dream_runs.last() else {
+        lines.push("Dream: did not run (no recorded outcome).".to_string());
+        return;
+    };
+    match run.outcome.as_str() {
+        "ok" => {
+            let attempts = attempt_suffix(digest.dream_runs.len());
+            lines.push(format!(
+                "Dream: ok — {} edges written{attempts}.",
+                run.items_added
+            ));
+            lines.push(format!("Overnight dream events: {}", digest.dream_events));
+        }
+        "failed" => lines.push(failed_dream_line(digest, &run.reason_class)),
+        "skipped" if run.reason_class == "no_material" => {
+            lines.push("Dream: did not run (no unconsolidated experience).".to_string());
+        }
+        "skipped" => lines.push(format!("Dream: skipped ({}).", run.reason_class)),
+        _ => lines.push("Dream: did not run (invalid recorded outcome).".to_string()),
+    }
+}
+
+fn failed_dream_line(digest: &DayDigest, reason_class: &str) -> String {
+    let mut line = format!("Dream: failed ({reason_class})");
+    if digest.dream_consecutive_failures > 1 {
+        line.push_str(&format!(
+            ", {} consecutive night",
+            ordinal(digest.dream_consecutive_failures)
+        ));
+    }
+    if let Some(timestamp) = &digest.dream_last_successful_at {
+        line.push_str(&format!(", last success {}", date_prefix(timestamp)));
+    }
+    line.push('.');
+    line
+}
+
+fn attempt_suffix(attempts: usize) -> String {
+    if attempts > 1 {
+        return format!(" after {attempts} attempts");
+    }
+    String::new()
+}
+
+fn ordinal(value: usize) -> String {
+    let suffix = match value % 100 {
+        11..=13 => "th",
+        _ => match value % 10 {
+            1 => "st",
+            2 => "nd",
+            3 => "rd",
+            _ => "th",
+        },
+    };
+    format!("{value}{suffix}")
+}
+
+fn date_prefix(timestamp: &str) -> &str {
+    timestamp.get(..10).unwrap_or(timestamp)
 }
 
 fn push_ref_line(lines: &mut Vec<String>, label: &str, refs: &[String]) {
@@ -274,6 +350,7 @@ mod tests {
     use std::sync::mpsc::Sender;
 
     use crate::api::{Chunk, LlmClient, TurnOutcome};
+    use crate::memory::PassRun;
 
     use super::{DayDigest, ReportGate, parse_verdict, render_digest, verdict_session_ids};
 
@@ -405,14 +482,83 @@ mod tests {
         let digest = DayDigest {
             day: "2026-07-10".to_string(),
             turns: 4,
+            conversation_user_messages: 4,
             created: 2,
             ..DayDigest::default()
         };
         let text = render_digest(&digest);
-        assert!(text.contains("Turns handled: 4"));
+        assert!(text.contains("Conversation: 4 messages, but no durable learning was recorded."));
         assert!(text.contains("Edges created 2"));
         assert!(!text.contains("Gists consolidated"));
         assert!(!text.contains("Due loops"));
+    }
+
+    fn pass_run(outcome: &str, reason_class: &str, items_added: usize) -> PassRun {
+        PassRun {
+            run_id: 1,
+            pass_type: "dream".to_string(),
+            started_at: String::new(),
+            finished_at: String::new(),
+            outcome: outcome.to_string(),
+            reason_class: reason_class.to_string(),
+            items_added,
+        }
+    }
+
+    #[test]
+    fn render_asserts_all_three_conversation_states() {
+        let none = render_digest(&DayDigest::default());
+        assert!(none.contains("Conversation: none today."));
+        assert!(!none.contains("Thread 1:"));
+
+        let messages_only = DayDigest {
+            conversation_user_messages: 2,
+            ..DayDigest::default()
+        };
+        let messages_text = render_digest(&messages_only);
+        assert!(
+            messages_text
+                .contains("Conversation: 2 messages, but no durable learning was recorded.")
+        );
+
+        let learned = DayDigest {
+            conversation_user_messages: 2,
+            turn_groups: vec!["a → b".to_string()],
+            ..DayDigest::default()
+        };
+        let learned_text = render_digest(&learned);
+        assert!(learned_text.contains("Thread 1: a → b"));
+        assert!(!learned_text.contains("no durable learning"));
+        assert!(!learned_text.contains("none today"));
+    }
+
+    #[test]
+    fn failed_dream_renders_outcome_and_omits_event_count() {
+        let last_success = crate::timeutil::yesterday_iso();
+        let digest = DayDigest {
+            dream_events: 451,
+            dream_runs: vec![pass_run("failed", "context_length", 0)],
+            dream_consecutive_failures: 3,
+            dream_last_successful_at: Some(format!("{last_success}T04:00:00Z")),
+            ..DayDigest::default()
+        };
+        let text = render_digest(&digest);
+        assert!(text.contains(&format!(
+            "Dream: failed (context_length), 3rd consecutive night, last success {last_success}."
+        )));
+        assert!(!text.contains("Overnight dream events"));
+    }
+
+    #[test]
+    fn successful_dream_renders_written_edges_and_event_count() {
+        let digest = DayDigest {
+            dream_events: 12,
+            dream_runs: vec![pass_run("ok", "none", 3)],
+            ..DayDigest::default()
+        };
+        let text = render_digest(&digest);
+        assert!(text.contains("Dream: ok — 3 edges written."));
+        assert!(text.contains("Overnight dream events: 12"));
     }
 
     #[test]

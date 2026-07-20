@@ -22,9 +22,11 @@ mod task_chain;
 
 pub use agent::{MemoryEvent, MemorySeats, run_memory_agent};
 pub(crate) use agent::{classify_reply_label, describe_tool_call, parse_tool_calls};
+#[allow(unused_imports)]
 pub use db::{
-    db_init, insert_message, last_sync_error, latest_session_id, read_message_context,
-    register_session, search_messages_fts, startup_database, sync_now, sync_push_best_effort,
+    PassRun, db_init, finish_pass_run, insert_message, last_sync_error, latest_session_id,
+    read_message_context, register_session, search_messages_fts, start_pass_run, startup_database,
+    sync_now, sync_push_best_effort,
 };
 pub(crate) use db::{Finding, InboxItem, acquire_write_lock, oldest_queued_inbox, open_connection, resolve_inbox_item};
 pub(crate) use db::{
