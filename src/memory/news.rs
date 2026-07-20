@@ -111,7 +111,7 @@ fn process_interest_result(
         return 0;
     };
     let closest = nearest.first();
-    if matches!(closest, Some(edge) if edge.similarity >= CORROBORATION_MIN) {
+    if auto_promotion_enabled() && matches!(closest, Some(edge) if edge.similarity >= CORROBORATION_MIN) {
         promote_news_match(conn, closest, item);
         return 0;
     }
@@ -120,6 +120,19 @@ fn process_interest_result(
         None => 1.0,
     };
     record_novel_finding(conn, interest, item, &vector, novelty)
+}
+
+// Kill switch (2026-07-20). Automatic web promotion was corroborating beliefs
+// against articles that merely share surface words — a football story promoted
+// a language-runtime belief — and each match also bumped stability, which at
+// 1.0 freezes an edge against decay permanently. One confabulated edge reached
+// 1.0 in prod before this was caught. Promotion stays off until corroboration
+// can distinguish support from word overlap (see kratt-roadmap/autonomy/
+// honest-reporting-and-input-quality.md D4). Set KRATT_WEB_PROMOTION=1 to
+// re-enable for experiments; when off, near-matches fall through to the
+// novelty gate and are discarded, exactly as before promotion existed.
+fn auto_promotion_enabled() -> bool {
+    std::env::var("KRATT_WEB_PROMOTION").is_ok()
 }
 
 fn promote_news_match(conn: &Connection, closest: Option<&db::NearestLiveEdge>, item: &NewsItem) {
@@ -314,6 +327,9 @@ mod tests {
             created_at: "2026-07-14T00:00:00Z".to_string(),
             strength: 1.0,
         };
+        // Promotion mechanics are exercised directly: the pipeline gate is off by
+        // default (see auto_promotion_enabled) and is pinned by its own test.
+        promote_news_match(&conn, Some(&known_edge_match()), &news_item("near update"));
         let results = vec![news_item("near update"), news_item("distant update")];
         let count = process_interest_results(&conn, &TestEmbed, &interest, &results);
         assert_eq!(count, 1);
@@ -395,13 +411,7 @@ mod tests {
             let conn = db::block_on(test_connection());
             seed_test_graph(&conn);
             set_known_edge(&conn, tier, confidence, 0.7);
-            let count = process_interest_results(
-                &conn,
-                &TestEmbed,
-                &test_interest(),
-                &[news_item("near update")],
-            );
-            assert_eq!(count, 0);
+            promote_news_match(&conn, Some(&known_edge_match()), &news_item("near update"));
             let Ok(Some(edge)) = db::load_edge(&conn, "known", "fact") else {
                 unreachable!("known edge exists")
             };
@@ -409,6 +419,37 @@ mod tests {
             assert_eq!(edge.confidence, confidence);
             assert_eq!(edge.stability, 0.8);
         }
+    }
+
+    fn known_edge_match() -> db::NearestLiveEdge {
+        db::NearestLiveEdge {
+            source: "known".to_string(),
+            target: "fact".to_string(),
+            provenance: String::new(),
+            confidence: 0.0,
+            similarity: 0.9,
+        }
+    }
+
+    #[test]
+    fn automatic_promotion_is_off_so_a_near_result_changes_nothing() {
+        let conn = db::block_on(test_connection());
+        seed_test_graph(&conn);
+        set_known_edge(&conn, "legacy", 0.4, 0.4);
+        let count = process_interest_results(
+            &conn,
+            &TestEmbed,
+            &test_interest(),
+            &[news_item("near update")],
+        );
+        assert_eq!(count, 0, "a near result is discarded, not recorded");
+        let Ok(Some(edge)) = db::load_edge(&conn, "known", "fact") else {
+            unreachable!("known edge exists")
+        };
+        assert_eq!(edge.provenance, "legacy", "tier untouched while promotion is off");
+        assert_eq!(edge.confidence, 0.4);
+        assert_eq!(edge.stability, 0.4, "no stability bump — the freezing path is closed");
+        assert_eq!(promotion_event_count(&conn), 0);
     }
 
     #[test]

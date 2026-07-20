@@ -365,14 +365,15 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn suggestion_gate_writes_event_and_regionless_turn_suppresses_it() {
         let conn = db::block_on(harness());
-        let timestamps = [
-            "2026-07-13T00:00:01",
-            "2026-07-13T00:00:02",
-            "2026-07-13T00:00:03",
-            "2026-07-13T00:00:04",
-            "2026-07-13T00:00:05",
-            "2026-07-13T00:00:06",
-        ];
+        // Relative to today: signal strength decays with real age
+        // (SEQUENCE_HALF_LIFE_DAYS against now()), so hardcoded dates make the
+        // test pass when written and fail weeks later. It did — this assertion
+        // started failing between 2026-07-17 and 2026-07-20 with no code change.
+        let today = crate::timeutil::today_iso();
+        let mut timestamps = Vec::new();
+        for second in 1..=6 {
+            timestamps.push(format!("{today}T00:00:0{second}"));
+        }
         let regions = [Some("a"), Some("b"), Some("a"), Some("b"), Some("a"), None];
         for index in 0..regions.len() {
             db::block_on(add_turn(
@@ -380,7 +381,7 @@ mod tests {
                 (
                     "chat",
                     &format!("turn-{index}"),
-                    timestamps[index],
+                    timestamps[index].as_str(),
                     regions[index],
                     0.8,
                 ),
