@@ -10,7 +10,8 @@ use turso::{Builder, Connection, Database, Value, params};
 
 use super::graph::{
     Edge, Graph, Node, PROVENANCE_DREAMED, PROVENANCE_LEGACY, PROVENANCE_USER_CONFIRMED,
-    PROVENANCE_WEB_SURFACED, edge_ceiling, load_from_toon, normalize_id, stability_seed_max,
+    PROVENANCE_WEB_SURFACED, clamp_stability_to_seed, edge_ceiling, load_from_toon, normalize_id,
+    stability_seed_max,
 };
 use super::loops::OpenLoop;
 
@@ -37,6 +38,7 @@ pub type OpenCuriosityNoteRow = (String, String, String, String);
 
 pub(crate) const INTEREST_NEIGHBOUR_DISTANCE: f64 = 0.25; // replay-tunable.
 pub(crate) const DEFAULT_PING_MUTED_UNTIL: &str = "9999-12-31T23:59:59";
+const STABILITY_CLAMP_MARKER: &str = "stability_clamp";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PassRun {
@@ -755,6 +757,32 @@ struct EpistemicsBackfill {
     clamped: usize,
 }
 
+#[derive(Debug, PartialEq)]
+struct StabilityClampProvenance {
+    provenance: String,
+    clamped: usize,
+    median_before: f64,
+    median_after: f64,
+}
+
+#[derive(Debug, PartialEq)]
+struct StabilityClampReport {
+    marker: String,
+    total: usize,
+    clamped: usize,
+    above_seed: usize,
+    provenances: Vec<StabilityClampProvenance>,
+}
+
+struct StabilityClampRow {
+    source: String,
+    target: String,
+    provenance: String,
+    before: f64,
+    after: f64,
+    changed: bool,
+}
+
 async fn backfill_edge_epistemics(
     conn: &Connection,
 ) -> Result<EpistemicsBackfill, Box<dyn Error + Send + Sync>> {
@@ -765,6 +793,210 @@ async fn backfill_edge_epistemics(
     }
     log_epistemics_backfill(&summary);
     Ok(summary)
+}
+
+async fn clamp_stability_once(
+    conn: &Connection,
+    marker: &str,
+) -> Result<Option<StabilityClampReport>, Box<dyn Error + Send + Sync>> {
+    conn.execute("BEGIN", ()).await?;
+    let outcome = clamp_stability_transaction(conn, marker).await;
+    finish_stability_transaction(conn, outcome).await
+}
+
+async fn finish_stability_transaction(
+    conn: &Connection,
+    outcome: Result<Option<StabilityClampReport>, Box<dyn Error + Send + Sync>>,
+) -> Result<Option<StabilityClampReport>, Box<dyn Error + Send + Sync>> {
+    match outcome {
+        Ok(report) => {
+            if let Err(err) = conn.execute("COMMIT", ()).await {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                return Err(err.into());
+            }
+            if let Some(summary) = &report {
+                log_stability_clamp(summary);
+            }
+            Ok(report)
+        }
+        Err(err) => {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(err)
+        }
+    }
+}
+
+async fn clamp_stability_transaction(
+    conn: &Connection,
+    marker: &str,
+) -> Result<Option<StabilityClampReport>, Box<dyn Error + Send + Sync>> {
+    if meta_value(conn, STABILITY_CLAMP_MARKER).await?.is_some() {
+        return Ok(None);
+    }
+    let mut rows = load_stability_clamp_rows(conn).await?;
+    apply_stability_clamp(conn, &mut rows).await?;
+    let above_seed = count_edges_above_seed(conn).await?;
+    if above_seed > 0 {
+        return Err(format!("stability clamp left {above_seed} edges above seed").into());
+    }
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+        params![STABILITY_CLAMP_MARKER, marker],
+    )
+    .await?;
+    Ok(Some(stability_clamp_report(marker, &rows, above_seed)))
+}
+
+async fn meta_value(
+    conn: &Connection,
+    key: &str,
+) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+    let mut rows = conn
+        .query("SELECT value FROM meta WHERE key = ?1", params![key])
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(None);
+    };
+    Ok(Some(text(row.get_value(0)?)))
+}
+
+async fn load_stability_clamp_rows(
+    conn: &Connection,
+) -> Result<Vec<StabilityClampRow>, Box<dyn Error + Send + Sync>> {
+    let mut query = conn
+        .query(
+            "SELECT source, target, provenance, stability FROM edges ORDER BY source, target",
+            (),
+        )
+        .await?;
+    let mut rows = Vec::new();
+    while let Some(row) = query.next().await? {
+        let before = real(row.get_value(3)?);
+        let provenance = text(row.get_value(2)?);
+        rows.push(StabilityClampRow {
+            source: text(row.get_value(0)?),
+            target: text(row.get_value(1)?),
+            after: clamp_stability_to_seed(before, &provenance),
+            provenance,
+            before,
+            changed: false,
+        });
+    }
+    Ok(rows)
+}
+
+async fn apply_stability_clamp(
+    conn: &Connection,
+    rows: &mut [StabilityClampRow],
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    for row in rows {
+        if row.after >= row.before {
+            continue;
+        }
+        let changed = conn
+            .execute(
+                "UPDATE edges SET stability = ?1 WHERE source = ?2 AND target = ?3",
+                params![row.after, row.source.as_str(), row.target.as_str()],
+            )
+            .await?;
+        row.changed = changed > 0;
+    }
+    Ok(())
+}
+
+async fn count_edges_above_seed(conn: &Connection) -> Result<usize, Box<dyn Error + Send + Sync>> {
+    let rows = load_stability_clamp_rows(conn).await?;
+    let mut count = 0usize;
+    for row in rows {
+        if row.before > row.after {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn stability_clamp_report(
+    marker: &str,
+    rows: &[StabilityClampRow],
+    above_seed: usize,
+) -> StabilityClampReport {
+    let mut groups: HashMap<String, (usize, Vec<f64>, Vec<f64>)> = HashMap::new();
+    let mut clamped = 0usize;
+    for row in rows {
+        let group = groups
+            .entry(row.provenance.clone())
+            .or_insert_with(|| (0, Vec::new(), Vec::new()));
+        group.1.push(row.before);
+        group.2.push(row.after);
+        if row.changed {
+            group.0 += 1;
+            clamped += 1;
+        }
+    }
+    StabilityClampReport {
+        marker: marker.to_string(),
+        total: rows.len(),
+        clamped,
+        above_seed,
+        provenances: stability_provenance_summaries(groups),
+    }
+}
+
+fn stability_provenance_summaries(
+    groups: HashMap<String, (usize, Vec<f64>, Vec<f64>)>,
+) -> Vec<StabilityClampProvenance> {
+    let mut summaries = Vec::new();
+    for (provenance, (clamped, mut before, mut after)) in groups {
+        summaries.push(StabilityClampProvenance {
+            provenance,
+            clamped,
+            median_before: median(&mut before),
+            median_after: median(&mut after),
+        });
+    }
+    summaries.sort_by(|left, right| left.provenance.cmp(&right.provenance));
+    summaries
+}
+
+fn median(values: &mut [f64]) -> f64 {
+    values.sort_by(f64::total_cmp);
+    let middle = values.len() / 2;
+    if values.len().is_multiple_of(2) {
+        return (values[middle - 1] + values[middle]) / 2.0;
+    }
+    values[middle]
+}
+
+fn stability_clamp_log_lines(report: &StabilityClampReport) -> Vec<String> {
+    let mut lines = vec![format!(
+        "[stability] clamped {} of {} edges (marker {})",
+        report.clamped, report.total, report.marker
+    )];
+    for summary in &report.provenances {
+        lines.push(format!(
+            "[stability] {}: {} clamped, median {:.2} -> {:.2}",
+            summary.provenance, summary.clamped, summary.median_before, summary.median_after
+        ));
+    }
+    lines.push(format!(
+        "[stability] edges above seed after clamp: {}",
+        report.above_seed
+    ));
+    lines
+}
+
+fn log_stability_clamp(report: &StabilityClampReport) {
+    for line in stability_clamp_log_lines(report) {
+        crate::runlog::log("stability", &line);
+    }
+    // Baseline from simulation-2026-07-20: this clamp plus the shipped curves
+    // predicts rust/immune median 0.128 and user-confirmed median 0.749 at 90
+    // nights, with junk prune-eligible by 30 nights.
+    crate::runlog::log(
+        "stability",
+        "[stability] prediction: at 90 nights rust/immune median 0.128, \
+         user-confirmed median 0.749; junk prune-eligible by 30 nights",
+    );
 }
 
 async fn migrate_entity_bodies_matching_ids(
@@ -1613,14 +1845,15 @@ async fn seed_empty_graph(
 pub fn db_init() -> Result<(), Box<dyn Error + Send + Sync>> {
     let conn = open_connection()?;
     let count = runtime().block_on(node_count(&conn))?;
-    if count > 0 {
-        return Ok(());
+    if count == 0 {
+        let graph = load_from_toon();
+        if !graph.nodes.is_empty() || !graph.edges.is_empty() {
+            runtime().block_on(seed_empty_graph(&conn, &graph))?;
+        }
     }
-    let graph = load_from_toon();
-    if graph.nodes.is_empty() && graph.edges.is_empty() {
-        return Ok(());
-    }
-    runtime().block_on(seed_empty_graph(&conn, &graph))?;
+    let _ = runtime().block_on(backfill_edge_epistemics(&conn))?;
+    let today = crate::timeutil::today_iso();
+    let _ = runtime().block_on(clamp_stability_once(&conn, &today))?;
     let _ = runtime().block_on(migrate_entity_bodies_matching_ids(&conn))?;
     Ok(())
 }
@@ -3990,15 +4223,15 @@ pub(crate) fn int(val: Value) -> i64 {
 mod tests {
     use super::{
         DEFAULT_PING_MUTED_UNTIL, DecayChange, add_edge_ceiling_column, backfill_edge_epistemics,
-        block_on, count_findings_in_window, count_new_embedding_neighbours_async, divert_ping_topic,
-        int, persist_decay_with, real, text,
-        finish_pass_run_async, insert_finding, insert_interest, interest_density_with,
-        last_successful_pass_async, load_all_edges_semantic_async, load_due_loops, load_game_edges,
-        load_loops_for_anchors, load_ping_policy, load_recent_attention_counts_async,
-        load_session_game, load_task_chain, load_unembedded_edges_async, mark_finding_surfaced,
-        migrate_entity_bodies_matching_ids, recover_replica_once, resume_pings, set_ping_mute,
-        start_pass_run_async, top_interests_with, unsurfaced_findings, update_edge_confidence,
-        with_write_lock, write_edge,
+        block_on, clamp_stability_once, count_findings_in_window,
+        count_new_embedding_neighbours_async, divert_ping_topic, finish_pass_run_async,
+        insert_finding, insert_interest, int, interest_density_with, last_successful_pass_async,
+        load_all_edges_semantic_async, load_due_loops, load_game_edges, load_loops_for_anchors,
+        load_ping_policy, load_recent_attention_counts_async, load_session_game, load_task_chain,
+        load_unembedded_edges_async, mark_finding_surfaced, migrate_entity_bodies_matching_ids,
+        persist_decay_with, real, recover_replica_once, resume_pings, set_ping_mute,
+        stability_clamp_log_lines, start_pass_run_async, text, top_interests_with,
+        unsurfaced_findings, update_edge_confidence, with_write_lock, write_edge,
     };
     use crate::memory::graph::Edge;
     use crate::web::NewsItem;
@@ -4615,6 +4848,109 @@ mod tests {
     }
 
     #[test]
+    fn stability_clamp_changes_only_stability_and_reports_actual_rows() {
+        let conn = block_on(stability_clamp_harness());
+        let before = stability_non_target_values(&conn);
+        let marker = crate::timeutil::today_iso();
+        let Ok(Some(report)) = block_on(clamp_stability_once(&conn, &marker)) else {
+            unreachable!("first clamp succeeds")
+        };
+
+        assert_eq!(
+            stability_values(&conn),
+            vec![
+                ("below".to_string(), 0.2),
+                ("dream".to_string(), 0.15),
+                ("legacy".to_string(), 0.3),
+                ("user".to_string(), 0.5),
+            ]
+        );
+        assert_eq!(before, stability_non_target_values(&conn));
+        assert_eq!(report.total, 4);
+        assert_eq!(report.clamped, 3);
+        assert_eq!(report.above_seed, 0);
+        assert_eq!(
+            stability_clamp_log_lines(&report),
+            vec![
+                format!("[stability] clamped 3 of 4 edges (marker {marker})"),
+                "[stability] dreamed: 1 clamped, median 0.90 -> 0.15".to_string(),
+                "[stability] legacy: 1 clamped, median 0.60 -> 0.25".to_string(),
+                "[stability] user-confirmed: 1 clamped, median 1.00 -> 0.50".to_string(),
+                "[stability] edges above seed after clamp: 0".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn stability_clamp_marker_preserves_later_growth() {
+        let conn = block_on(stability_clamp_harness());
+        let marker = crate::timeutil::today_iso();
+        assert!(matches!(
+            block_on(clamp_stability_once(&conn, &marker)),
+            Ok(Some(_))
+        ));
+        block_on(async {
+            let _ = conn
+                .execute(
+                    "UPDATE edges SET stability = 0.8 WHERE source = 'legacy'",
+                    (),
+                )
+                .await;
+        });
+
+        assert!(matches!(
+            block_on(clamp_stability_once(&conn, &marker)),
+            Ok(None)
+        ));
+        assert_eq!(edge_stability(&conn, "legacy"), 0.8);
+        assert_eq!(
+            block_on(super::meta_value(&conn, super::STABILITY_CLAMP_MARKER)).unwrap_or_default(),
+            Some(marker)
+        );
+    }
+
+    #[test]
+    fn failed_stability_clamp_rolls_back_values_and_marker() {
+        let conn = block_on(stability_clamp_harness());
+        block_on(async {
+            let _ = conn.execute("DROP TABLE meta", ()).await;
+            let _ = conn
+                .execute(
+                    "CREATE TABLE meta (
+                        key TEXT PRIMARY KEY CHECK (key != 'stability_clamp'),
+                        value TEXT NOT NULL DEFAULT ''
+                    )",
+                    (),
+                )
+                .await;
+        });
+        let marker = crate::timeutil::today_iso();
+        assert!(block_on(clamp_stability_once(&conn, &marker)).is_err());
+        assert_eq!(edge_stability(&conn, "legacy"), 1.0);
+        assert_eq!(
+            block_on(super::meta_value(&conn, super::STABILITY_CLAMP_MARKER)).unwrap_or_default(),
+            None
+        );
+
+        block_on(async {
+            let _ = conn.execute("DROP TABLE meta", ()).await;
+            let _ = conn
+                .execute(
+                    "CREATE TABLE meta (
+                        key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT ''
+                    )",
+                    (),
+                )
+                .await;
+        });
+        assert!(matches!(
+            block_on(clamp_stability_once(&conn, &marker)),
+            Ok(Some(_))
+        ));
+        assert_eq!(edge_stability(&conn, "legacy"), 0.3);
+    }
+
+    #[test]
     fn entity_body_id_migration_is_strict_and_idempotent() {
         let conn = block_on(harness());
         block_on(async {
@@ -4683,6 +5019,108 @@ mod tests {
             )
             .await;
         conn
+    }
+
+    async fn stability_clamp_harness() -> Connection {
+        let conn = harness().await;
+        let _ = conn
+            .execute(
+                "CREATE TABLE meta (
+                    key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT ''
+                )",
+                (),
+            )
+            .await;
+        let fixture_date = crate::timeutil::today_iso();
+        let _ = conn
+            .execute(
+                "INSERT INTO edges (
+                    source, target, content, stability, confidence, importance,
+                    subject, date, occurred_at, expired_at, source_message_id,
+                    memory_type, origin_session, provenance, ceiling, embedding,
+                    last_decayed_at
+                ) VALUES
+                ('legacy', 'x', 'legacy belief', 1.0, 0.61, 0.7, 1, ?1, ?1, NULL,
+                 'msg-legacy', 'semantic', 'session-a', 'legacy', 0.45,
+                 vector32('[1.0, 0.0]'), ?1),
+                ('user', 'x', 'user belief', 1.0, 0.91, 0.8, 0, ?1, NULL, NULL,
+                 'msg-user', 'semantic', 'session-b', 'user-confirmed', NULL,
+                 vector32('[0.0, 1.0]'), ?1),
+                ('dream', 'x', 'dream belief', 0.9, 0.21, 0.2, 0, ?1, NULL, ?1,
+                 'msg-dream', 'semantic', 'dream:1', 'dreamed', 0.25,
+                 vector32('[0.5, 0.5]'), ?1),
+                ('below', 'x', 'small belief', 0.2, 0.41, 0.3, 0, ?1, NULL, NULL,
+                 'msg-below', 'semantic', '', 'legacy', NULL,
+                 vector32('[0.25, 0.75]'), ?1)",
+                params![fixture_date],
+            )
+            .await;
+        conn
+    }
+
+    fn stability_values(conn: &Connection) -> Vec<(String, f64)> {
+        block_on(async {
+            let Ok(mut rows) = conn
+                .query("SELECT source, stability FROM edges ORDER BY source", ())
+                .await
+            else {
+                unreachable!("stability query succeeds")
+            };
+            let mut values = Vec::new();
+            while let Ok(Some(row)) = rows.next().await {
+                let (Ok(source), Ok(stability)) = (row.get_value(0), row.get_value(1)) else {
+                    unreachable!("stability values read")
+                };
+                values.push((super::text(source), super::real(stability)));
+            }
+            values
+        })
+    }
+
+    fn edge_stability(conn: &Connection, source: &str) -> f64 {
+        let values = stability_values(conn);
+        for (edge_source, stability) in values {
+            if edge_source == source {
+                return stability;
+            }
+        }
+        -1.0
+    }
+
+    fn stability_non_target_values(conn: &Connection) -> Vec<Vec<String>> {
+        block_on(async {
+            let Ok(mut rows) = conn
+                .query(
+                    "SELECT source, target, content, printf('%.17g', confidence),
+                     printf('%.17g', importance), subject, date,
+                     coalesce(occurred_at, '<null>'), coalesce(expired_at, '<null>'),
+                     source_message_id, memory_type, origin_session, provenance,
+                     coalesce(printf('%.17g', ceiling), '<null>'), hex(embedding),
+                     last_decayed_at
+                     FROM edges ORDER BY source, target",
+                    (),
+                )
+                .await
+            else {
+                unreachable!("non-target query succeeds")
+            };
+            let mut snapshots = Vec::new();
+            while let Ok(Some(row)) = rows.next().await {
+                let mut values = Vec::new();
+                for index in 0..16 {
+                    let Ok(value) = row.get_value(index) else {
+                        unreachable!("non-target value reads")
+                    };
+                    values.push(match value {
+                        turso::Value::Text(text) => text,
+                        turso::Value::Integer(number) => number.to_string(),
+                        _ => format!("{value:?}"),
+                    });
+                }
+                snapshots.push(values);
+            }
+            snapshots
+        })
     }
 
     async fn backfilled_values(conn: &Connection) -> Vec<(String, String, f64)> {
