@@ -540,6 +540,7 @@ fn execute_note_curiosity<'scope>(
         origin_session: String::new(),
         provenance: PROVENANCE_WEB_SURFACED.to_string(),
         ceiling: None,
+        last_decayed_at: String::new(),
     };
     let existing = db::load_edge(study.conn, &edge.source, &edge.target)?;
     edge.stability = match &existing {
@@ -600,6 +601,7 @@ fn record_skipped_chunk(
             origin_session: String::new(),
             provenance: PROVENANCE_WEB_SURFACED.to_string(),
             ceiling: None,
+            last_decayed_at: String::new(),
         };
         let existing = db::load_edge(conn, &edge.source, &edge.target)?;
         edge.stability = match &existing {

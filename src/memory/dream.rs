@@ -973,6 +973,7 @@ fn gist_edge(source: &str, target: &str, call: &DreamGistCall, supports: &[Edge]
         origin_session: String::new(),
         provenance: provenance.to_string(),
         ceiling,
+        last_decayed_at: String::new(),
     }
 }
 
@@ -1076,6 +1077,33 @@ impl DreamExpireEdgeCall {
     }
 }
 
+// Weights and provenance are decided by the caller; this only assembles.
+fn dream_edge(
+    source: &str,
+    target: &str,
+    edge_call: DreamEdgeCall,
+    weights: (f64, f64),
+    epistemics: (String, Option<f64>),
+) -> Edge {
+    Edge {
+        source: source.to_string(),
+        target: target.to_string(),
+        content: edge_call.content,
+        stability: weights.0,
+        confidence: weights.1,
+        importance: edge_call.importance,
+        subject: edge_call.subject,
+        date: edge_call.date,
+        occurred_at: None,
+        expired_at: None,
+        memory_type: "semantic".to_string(),
+        origin_session: String::new(),
+        provenance: epistemics.0,
+        ceiling: epistemics.1,
+        last_decayed_at: String::new(),
+    }
+}
+
 fn apply_dream_upsert_edge<'scope, 'policy>(
     ctx: &mut DreamCallContext<'scope, 'policy>,
     edge_call: DreamEdgeCall,
@@ -1093,22 +1121,14 @@ fn apply_dream_upsert_edge<'scope, 'policy>(
         &requested,
         inherited,
     );
-    let edge = Edge {
-        source: source.clone(),
-        target: target.clone(),
-        content: edge_call.content,
-        stability,
-        confidence,
-        importance: edge_call.importance,
-        subject: edge_call.subject,
-        date: edge_call.date,
-        occurred_at: None,
-        expired_at: None,
-        memory_type: "semantic".to_string(),
-        origin_session: String::new(),
-        provenance,
-        ceiling,
-    };
+    let call_names = (edge_call.source.clone(), edge_call.target.clone());
+    let edge = dream_edge(
+        &source,
+        &target,
+        edge_call,
+        (stability, confidence),
+        (provenance, ceiling),
+    );
     db::write_edge(ctx.conn, &edge, ctx.source_id)?;
     ctx.events.push(Event::upsert(
         Actor::new("system", "consolidation"),
@@ -1117,7 +1137,7 @@ fn apply_dream_upsert_edge<'scope, 'policy>(
         existing.is_some(),
     ));
     Ok((
-        format!("upsert_edge: {} → {}", edge_call.source, edge_call.target),
+        format!("upsert_edge: {} → {}", call_names.0, call_names.1),
         true,
     ))
 }
@@ -1423,6 +1443,7 @@ mod tests {
                 origin_session: String::new(),
                 provenance: "legacy".to_string(),
                 ceiling: None,
+                last_decayed_at: String::new(),
             });
         }
         graph.edges = edges;
@@ -1448,7 +1469,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use turso::{Builder, Connection};
 
-    const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', ceiling REAL, PRIMARY KEY (source, target))";
+    const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', ceiling REAL, last_decayed_at TEXT NOT NULL DEFAULT '', PRIMARY KEY (source, target))";
     const EVENTS_DDL: &str = "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')";
     const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
 
@@ -1483,6 +1504,7 @@ mod tests {
             origin_session: "session-1".to_string(),
             provenance: "legacy".to_string(),
             ceiling: None,
+            last_decayed_at: String::new(),
         }
     }
 
@@ -1791,7 +1813,7 @@ mod strategy_tests {
     use turso::{Builder, Connection};
 
     const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
-    const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', ceiling REAL, PRIMARY KEY (source, target))";
+    const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', ceiling REAL, last_decayed_at TEXT NOT NULL DEFAULT '', PRIMARY KEY (source, target))";
     const EVENTS_DDL: &str = "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL DEFAULT '', actor_id TEXT NOT NULL DEFAULT '', event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')";
 
     // Replays one canned response per stream() call and counts the calls so a
@@ -1925,6 +1947,7 @@ mod strategy_tests {
             origin_session: String::new(),
             provenance: "legacy".to_string(),
             ceiling: None,
+            last_decayed_at: String::new(),
         }
     }
 

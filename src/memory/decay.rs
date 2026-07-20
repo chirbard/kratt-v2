@@ -48,10 +48,22 @@ fn decay_edge(edge: &mut Edge, today: &str) {
     if edge.stability >= 1.0 || edge.date.is_empty() {
         return;
     }
-    let days = days_between(&edge.date, today);
+    // Charge elapsed time since the last charge, not the edge's whole age.
+    // Without this the same history was re-charged every night and the
+    // exponent compounded as n(n+1)/14 instead of n/7 — an untouched 30-day
+    // edge reached the confidence floor in about ten nights. Edges that have
+    // never been charged under this scheme start their clock today: current
+    // damage is frozen where it is, not repaired here (repair is part of the
+    // reviewed decay redesign, kratt-roadmap/epistemics/frozen-graph.md).
+    if edge.last_decayed_at.is_empty() {
+        edge.last_decayed_at = today.to_string();
+        return;
+    }
+    let days = days_between(&edge.last_decayed_at, today);
     if days <= 0 {
         return;
     }
+    edge.last_decayed_at = today.to_string();
     let factor = if edge.memory_type == "episodic" {
         EPISODIC_DECAY_BASE.powf(days as f64)
     } else {
@@ -89,6 +101,46 @@ fn date_to_days(date: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+
+    // Regression: decay used to charge each edge's full age on every run,
+    // compounding as n(n+1)/14. One night must cost exactly one night.
+    #[test]
+    fn repeated_runs_charge_one_night_each_not_the_whole_history() {
+        let mut edge = test_edge("semantic", "2026-06-01");
+        edge.confidence = 0.9;
+        edge.last_decayed_at = String::new();
+        // First run only starts the clock: existing damage is frozen, not repaired.
+        decay_edge(&mut edge, "2026-07-01");
+        assert_eq!(edge.confidence, 0.9, "clock start does not decay");
+        assert_eq!(edge.last_decayed_at, "2026-07-01");
+
+        decay_edge(&mut edge, "2026-07-02");
+        let after_one_night = edge.confidence;
+        let expected = 0.9 * 0.95_f64.powf(1.0 / 7.0);
+        assert!(
+            (after_one_night - expected).abs() < 1e-9,
+            "one night charges one night: {after_one_night} vs {expected}"
+        );
+
+        decay_edge(&mut edge, "2026-07-03");
+        let expected_two = 0.9 * 0.95_f64.powf(2.0 / 7.0);
+        assert!(
+            (edge.confidence - expected_two).abs() < 1e-9,
+            "two nights charge two nights, not 1+2"
+        );
+        // The compounded-history value would be far lower.
+        assert!(edge.confidence > 0.9 * 0.95_f64.powf(31.0 / 7.0));
+    }
+
+    #[test]
+    fn same_day_second_run_charges_nothing() {
+        let mut edge = test_edge("semantic", "2026-06-01");
+        edge.confidence = 0.9;
+        edge.last_decayed_at = "2026-07-02".to_string();
+        decay_edge(&mut edge, "2026-07-02");
+        assert_eq!(edge.confidence, 0.9);
+    }
+
     use super::super::graph::{Edge, Graph, Node};
     use super::{decay_edge, decay_graph};
 
@@ -108,6 +160,9 @@ mod tests {
             origin_session: String::new(),
             provenance: "legacy".to_string(),
             ceiling: None,
+            // Already on the incremental scheme, charged up to its own date —
+            // the common case once the clock has been running.
+            last_decayed_at: date.to_string(),
         }
     }
 

@@ -1775,6 +1775,7 @@ fn apply_record_move_call<'scope>(
         origin_session: session_id,
         provenance: options.provenance.to_string(),
         ceiling: None,
+        last_decayed_at: String::new(),
     };
     apply_upsert_edge(conn, edge, options, events)?;
     Ok(format!(
@@ -1847,6 +1848,7 @@ fn apply_define_task_call<'scope>(
         origin_session: session_id,
         provenance: options.provenance.to_string(),
         ceiling: None,
+        last_decayed_at: String::new(),
     };
     apply_upsert_edge(conn, edge, options, events)?;
     Ok(format!("define_task: {name}"))
@@ -1901,6 +1903,7 @@ fn apply_record_rule_call<'scope>(
         origin_session: String::new(),
         provenance: options.provenance.to_string(),
         ceiling: None,
+        last_decayed_at: String::new(),
     };
     apply_upsert_edge(conn, edge, options, events)?;
     Ok(format!("record_rule: {rule}"))
@@ -2170,6 +2173,7 @@ fn open_loop_edge(loop_id: &str, anchor_id: &str, intention: &str) -> Edge {
         origin_session: String::new(),
         provenance: PROVENANCE_USER_CONFIRMED.to_string(),
         ceiling: None,
+        last_decayed_at: String::new(),
     }
 }
 
@@ -2348,26 +2352,13 @@ struct UpsertEdgeCall {
     inferred_from: Option<Vec<(String, String)>>,
 }
 
-fn apply_upsert_edge_call<'scope>(
-    conn: &Connection,
-    options: &ApplyToolOptions<'scope>,
-    events: &mut Vec<Event>,
-    mut call: UpsertEdgeCall,
-) -> Result<String, Box<dyn Error + Send + Sync>> {
-    if let Some(confidence_cap) = options.confidence_cap {
-        call.confidence = call.confidence.min(confidence_cap);
-    }
-    let inferred_from = call.inferred_from.take();
-    let memory_type = match call.memory_type {
-        Some(requested) => super::graph::normalize_memory_type(&requested),
-        None => options.default_memory_type.to_string(),
-    };
-    let origin_session = if memory_type == "episodic" {
-        options.context.session_id.clone()
-    } else {
-        String::new()
-    };
-    let mut edge = Edge {
+fn upsert_edge_to_edge(
+    call: UpsertEdgeCall,
+    memory_type: String,
+    origin_session: String,
+    provenance: &str,
+) -> Edge {
+    Edge {
         source: normalize_id(&call.source),
         target: normalize_id(&call.target),
         content: call.content,
@@ -2380,9 +2371,32 @@ fn apply_upsert_edge_call<'scope>(
         expired_at: None,
         memory_type,
         origin_session,
-        provenance: options.provenance.to_string(),
+        provenance: provenance.to_string(),
         ceiling: None,
+        last_decayed_at: String::new(),
+    }
+}
+
+fn apply_upsert_edge_call<'scope>(
+    conn: &Connection,
+    options: &ApplyToolOptions<'scope>,
+    events: &mut Vec<Event>,
+    mut call: UpsertEdgeCall,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    if let Some(confidence_cap) = options.confidence_cap {
+        call.confidence = call.confidence.min(confidence_cap);
+    }
+    let inferred_from = call.inferred_from.take();
+    let memory_type = match call.memory_type.take() {
+        Some(requested) => super::graph::normalize_memory_type(&requested),
+        None => options.default_memory_type.to_string(),
     };
+    let origin_session = if memory_type == "episodic" {
+        options.context.session_id.clone()
+    } else {
+        String::new()
+    };
+    let mut edge = upsert_edge_to_edge(call, memory_type, origin_session, options.provenance);
     apply_inferred_declaration(conn, options, &inferred_from, &mut edge)?;
     if edge.memory_type == "episodic" {
         runlog::log(
@@ -2938,7 +2952,7 @@ mod tests {
                 unreachable!("in-memory database connects")
             };
             let _ = conn.execute("CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')", ()).await;
-            let _ = conn.execute("CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', ceiling REAL, PRIMARY KEY (source, target))", ()).await;
+            let _ = conn.execute("CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', ceiling REAL, last_decayed_at TEXT NOT NULL DEFAULT '', PRIMARY KEY (source, target))", ()).await;
             conn
         });
         let legacy = Edge {
@@ -2956,6 +2970,7 @@ mod tests {
             origin_session: String::new(),
             provenance: "legacy".to_string(),
             ceiling: None,
+            last_decayed_at: String::new(),
         };
         assert!(db::write_edge(&conn, &legacy, "old").is_ok());
         let call = ToolCall::UpsertEdge {
@@ -3006,7 +3021,7 @@ mod tests {
                 unreachable!("in-memory database connects")
             };
             let _ = conn.execute("CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')", ()).await;
-            let _ = conn.execute("CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', ceiling REAL, PRIMARY KEY (source, target))", ()).await;
+            let _ = conn.execute("CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', ceiling REAL, last_decayed_at TEXT NOT NULL DEFAULT '', PRIMARY KEY (source, target))", ()).await;
             conn
         });
         for (source, confidence) in [("premise-a", 1.0), ("premise-b", 0.9)] {
@@ -3025,6 +3040,7 @@ mod tests {
                 origin_session: String::new(),
                 provenance: "user-confirmed".to_string(),
                 ceiling: None,
+                last_decayed_at: String::new(),
             };
             assert!(db::write_edge(&conn, &premise, "").is_ok());
         }
@@ -3090,7 +3106,7 @@ mod tests {
         use turso::Builder;
 
         const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
-        const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', ceiling REAL, PRIMARY KEY (source, target))";
+        const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', ceiling REAL, last_decayed_at TEXT NOT NULL DEFAULT '', PRIMARY KEY (source, target))";
 
         async fn harness() -> turso::Connection {
             let Ok(database) = Builder::new_local(":memory:").build().await else {
@@ -3231,7 +3247,7 @@ mod tests {
         use turso::Builder;
 
         const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
-        const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', embedding BLOB, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', ceiling REAL, PRIMARY KEY (source, target))";
+        const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', embedding BLOB, memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', ceiling REAL, last_decayed_at TEXT NOT NULL DEFAULT '', PRIMARY KEY (source, target))";
         const EVENTS_DDL: &str = "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, session_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', actor_type TEXT NOT NULL, actor_id TEXT NOT NULL, event_type TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', weight REAL NOT NULL DEFAULT 1.0, payload TEXT NOT NULL DEFAULT '')";
         const VIEWS_DDL: &str = "CREATE TABLE edge_actor_views (actor_type TEXT NOT NULL, actor_id TEXT NOT NULL, source TEXT NOT NULL, target TEXT NOT NULL, views REAL NOT NULL DEFAULT 0, last_visited_at TEXT NOT NULL, PRIMARY KEY (actor_type, actor_id, source, target))";
         const POSITIONS_DDL: &str = "CREATE TABLE actor_positions (actor_type TEXT NOT NULL, actor_id TEXT NOT NULL, sum_vector BLOB, total_weight REAL NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY (actor_type, actor_id))";
@@ -3916,7 +3932,7 @@ mod tests {
         use turso::{Builder, Connection};
 
         const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
-        const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', ceiling REAL, PRIMARY KEY (source, target))";
+        const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', ceiling REAL, last_decayed_at TEXT NOT NULL DEFAULT '', PRIMARY KEY (source, target))";
 
         fn harness() -> Connection {
             db::block_on(async {
@@ -4108,7 +4124,7 @@ mod tests {
         use turso::Builder;
 
         const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
-        const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', ceiling REAL, PRIMARY KEY (source, target))";
+        const EDGES_DDL: &str = "CREATE TABLE edges (source TEXT NOT NULL, target TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', stability REAL NOT NULL DEFAULT 0.0, confidence REAL NOT NULL DEFAULT 0.0, importance REAL NOT NULL DEFAULT 0.0, subject INTEGER NOT NULL DEFAULT 0, date TEXT NOT NULL DEFAULT '', occurred_at TEXT, expired_at TEXT, source_message_id TEXT NOT NULL DEFAULT '', memory_type TEXT NOT NULL DEFAULT 'semantic', origin_session TEXT NOT NULL DEFAULT '', provenance TEXT NOT NULL DEFAULT 'legacy', ceiling REAL, last_decayed_at TEXT NOT NULL DEFAULT '', PRIMARY KEY (source, target))";
 
         async fn harness() -> turso::Connection {
             let Ok(database) = Builder::new_local(":memory:").build().await else {
@@ -4192,6 +4208,7 @@ mod tests {
                 origin_session: String::new(),
                 provenance: "legacy".to_string(),
                 ceiling: None,
+                last_decayed_at: String::new(),
             };
             let Ok(()) = db::write_edge(conn, &raw_edge, "test") else {
                 unreachable!("raw edge writes")

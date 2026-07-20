@@ -32,6 +32,9 @@ pub struct Edge {
     // snapshot a premise-inherited cap here at creation time.
     #[serde(default)]
     pub ceiling: Option<f64>,
+    // Decay clock: the day decay was last charged for this edge. Empty means
+    // never charged under the incremental scheme.
+    pub last_decayed_at: String,
 }
 
 pub const PROVENANCE_USER_CONFIRMED: &str = "user-confirmed";
@@ -192,6 +195,7 @@ fn parse_toon_edge(fields: &[String]) -> Option<Edge> {
         origin_session: String::new(),
         provenance: PROVENANCE_LEGACY.to_string(),
         ceiling: None,
+        last_decayed_at: String::new(),
     })
 }
 
@@ -464,6 +468,7 @@ mod tests {
             origin_session: String::new(),
             provenance: PROVENANCE_LEGACY.to_string(),
             ceiling: None,
+            last_decayed_at: String::new(),
         });
         let first = graph_to_json(&graph);
         let second = graph_to_json(&graph);
