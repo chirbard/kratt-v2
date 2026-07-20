@@ -7,19 +7,37 @@ pub fn apply_decay_if_needed(graph: &mut Graph) -> bool {
     if db::load_last_decay() == today {
         return false;
     }
-    decay_graph(graph, &today);
-    db::save_last_decay(&today);
+    let changes = decay_graph(graph, &today);
+    // The checkpoint lives inside the same transaction as the values, so a
+    // failed persist retries on the next pass instead of being skipped until
+    // tomorrow — the previous order wrote the checkpoint first and swallowed
+    // the error, which silently disabled decay entirely.
+    if let Err(err) = db::persist_decay(&changes, &today) {
+        crate::runlog::log("decay", &format!("persist failed, retrying later: {err}"));
+        return false;
+    }
     true
 }
 
-fn decay_graph(graph: &mut Graph, today: &str) {
+fn decay_graph(graph: &mut Graph, today: &str) -> Vec<db::DecayChange> {
     let nodes = &graph.nodes;
+    let mut changes = Vec::new();
     for edge in &mut graph.edges {
         if edge.expired_at.is_none() && edge_touches_standing_node(nodes, edge) {
             continue;
         }
+        let before = (edge.confidence, edge.last_decayed_at.clone());
         decay_edge(edge, today);
+        if before.0 != edge.confidence || before.1 != edge.last_decayed_at {
+            changes.push(db::DecayChange {
+                source: edge.source.clone(),
+                target: edge.target.clone(),
+                confidence: edge.confidence,
+                last_decayed_at: edge.last_decayed_at.clone(),
+            });
+        }
     }
+    changes
 }
 
 fn edge_touches_standing_node(
