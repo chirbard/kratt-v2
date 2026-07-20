@@ -3818,27 +3818,45 @@ pub(crate) fn persist_decay_with(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     runtime().block_on(async {
         conn.execute("BEGIN", ()).await?;
-        for change in changes {
-            conn.execute(
-                "UPDATE edges SET confidence = ?1, last_decayed_at = ?2
-                 WHERE source = ?3 AND target = ?4",
-                params![
-                    round2(change.confidence),
-                    change.last_decayed_at.as_str(),
-                    change.source.as_str(),
-                    change.target.as_str()
-                ],
-            )
-            .await?;
+        // Atomicity is the whole promise here, so a failure must roll back
+        // rather than return through `?` and leave the transaction open.
+        match write_decay_rows(conn, changes, date).await {
+            Ok(()) => {
+                conn.execute("COMMIT", ()).await?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(err)
+            }
         }
+    })
+}
+
+async fn write_decay_rows(
+    conn: &Connection,
+    changes: &[DecayChange],
+    date: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    for change in changes {
         conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES ('last_decay', ?1)",
-            params![date],
+            "UPDATE edges SET confidence = ?1, last_decayed_at = ?2
+             WHERE source = ?3 AND target = ?4",
+            params![
+                round2(change.confidence),
+                change.last_decayed_at.as_str(),
+                change.source.as_str(),
+                change.target.as_str()
+            ],
         )
         .await?;
-        conn.execute("COMMIT", ()).await?;
-        Ok(())
-    })
+    }
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('last_decay', ?1)",
+        params![date],
+    )
+    .await?;
+    Ok(())
 }
 
 pub fn graph_diff_toon(pre: &Graph, post: &Graph) -> String {
@@ -4337,6 +4355,69 @@ mod tests {
             "decay persistence succeeds"
         );
 
+        let (confidence, clock, has_embedding) = decayed_edge_state(&conn);
+        assert!((confidence - 0.42).abs() < 1e-9);
+        assert_eq!(clock, "2026-07-20");
+        assert_eq!(
+            has_embedding, 1,
+            "embedding survives decay — the rewrite path used to drop it"
+        );
+        assert_eq!(
+            decay_checkpoint(&conn),
+            "2026-07-20",
+            "the checkpoint commits with the values"
+        );
+        assert_eq!(
+            edge_message_id(&conn),
+            "msg-7",
+            "message attribution survives decay"
+        );
+    }
+
+    // Atomicity is the promise of the repair: if any statement fails, neither
+    // the edge values nor the checkpoint may survive. Dropping the meta table
+    // makes the checkpoint write fail after the edge update has been issued.
+    #[test]
+    fn a_failed_decay_write_commits_nothing() {
+        let conn = block_on(harness());
+        block_on(seed_embedded_edge(&conn));
+        block_on(async {
+            let _ = conn.execute("DROP TABLE meta", ()).await;
+        });
+
+        let changes = vec![DecayChange {
+            source: "a".to_string(),
+            target: "b".to_string(),
+            confidence: 0.42,
+            last_decayed_at: "2026-07-20".to_string(),
+        }];
+        assert!(
+            persist_decay_with(&conn, &changes, "2026-07-20").is_err(),
+            "a broken checkpoint write fails the whole persist"
+        );
+
+        block_on(async {
+            let Ok(mut rows) = conn
+                .query("SELECT confidence, last_decayed_at FROM edges WHERE source = 'a'", ())
+                .await
+            else {
+                unreachable!("edge query succeeds")
+            };
+            let Ok(Some(row)) = rows.next().await else {
+                unreachable!("edge still exists")
+            };
+            let (Ok(conf), Ok(clock)) = (row.get_value(0), row.get_value(1)) else {
+                unreachable!("row columns read")
+            };
+            assert!(
+                (real(conf) - 0.9).abs() < 1e-9,
+                "confidence rolled back to its original value"
+            );
+            assert_eq!(text(clock), "", "the clock rolled back too");
+        });
+    }
+
+    fn decayed_edge_state(conn: &Connection) -> (f64, String, i64) {
         block_on(async {
             let Ok(mut rows) = conn
                 .query(
@@ -4350,19 +4431,49 @@ mod tests {
             let Ok(Some(row)) = rows.next().await else {
                 unreachable!("edge still exists")
             };
-            let (Ok(conf), Ok(clock), Ok(has_embedding)) =
+            let (Ok(conf), Ok(clock), Ok(embedded)) =
                 (row.get_value(0), row.get_value(1), row.get_value(2))
             else {
                 unreachable!("row columns read")
             };
-            assert!((real(conf) - 0.42).abs() < 1e-9);
-            assert_eq!(text(clock), "2026-07-20");
-            assert_eq!(
-                int(has_embedding),
-                1,
-                "embedding survives decay — the rewrite path used to drop it"
-            );
-        });
+            (real(conf), text(clock), int(embedded))
+        })
+    }
+
+    fn decay_checkpoint(conn: &Connection) -> String {
+        block_on(async {
+            let Ok(mut rows) = conn
+                .query("SELECT value FROM meta WHERE key = 'last_decay'", ())
+                .await
+            else {
+                return String::new();
+            };
+            match rows.next().await {
+                Ok(Some(row)) => match row.get_value(0) {
+                    Ok(value) => text(value),
+                    Err(_) => String::new(),
+                },
+                _ => String::new(),
+            }
+        })
+    }
+
+    fn edge_message_id(conn: &Connection) -> String {
+        block_on(async {
+            let Ok(mut rows) = conn
+                .query("SELECT source_message_id FROM edges WHERE source = 'a'", ())
+                .await
+            else {
+                return String::new();
+            };
+            match rows.next().await {
+                Ok(Some(row)) => match row.get_value(0) {
+                    Ok(value) => text(value),
+                    Err(_) => String::new(),
+                },
+                _ => String::new(),
+            }
+        })
     }
 
     async fn seed_embedded_edge(conn: &Connection) {
@@ -4374,8 +4485,8 @@ mod tests {
             .await;
         let _ = conn
             .execute(
-                "INSERT INTO edges (source, target, content, stability, confidence, importance, subject, date, memory_type, origin_session, provenance, embedding)
-                 VALUES ('a', 'b', 'belief', 0.5, 0.9, 0.5, 0, '2026-07-01', 'semantic', '', 'legacy', vector32('[1.0, 0.0]'))",
+                "INSERT INTO edges (source, target, content, stability, confidence, importance, subject, date, memory_type, origin_session, provenance, source_message_id, embedding)
+                 VALUES ('a', 'b', 'belief', 0.5, 0.9, 0.5, 0, '2026-07-01', 'semantic', '', 'legacy', 'msg-7', vector32('[1.0, 0.0]'))",
                 (),
             )
             .await;
