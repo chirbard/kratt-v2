@@ -14,8 +14,8 @@ use turso::Connection;
 use super::db;
 use super::decay;
 use super::graph::{
-    Edge, Node, PROVENANCE_INFERRED, PROVENANCE_USER_CONFIRMED, inferred_ceiling, normalize_id,
-    stability_seed_max,
+    Edge, Node, PROVENANCE_INFERRED, PROVENANCE_USER_CONFIRMED, edge_is_pinned, inferred_ceiling,
+    node_type_is_loop, normalize_id, stability_seed_max,
 };
 use super::ledger::{self, Actor, EdgeRef, Event, EventContext};
 
@@ -2074,7 +2074,7 @@ fn node_is_loop(conn: &Connection, node_id: &str) -> Result<bool, Box<dyn Error 
     let Some(node) = db::load_node(conn, &normalized)? else {
         return Ok(false);
     };
-    Ok(node.node_type == "loop")
+    Ok(node_type_is_loop(&node.node_type))
 }
 
 fn node_or_neighbor_is_loop(
@@ -2535,19 +2535,19 @@ fn apply_stability_policy<'scope>(
     options: &ApplyToolOptions<'scope>,
     edge: &mut Edge,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let loop_anchor = edge_is_loop_anchor(conn, edge)?;
+    let pinned = edge_is_pinned_in_db(conn, edge)?;
     let Some(stored) = existing else {
-        if !loop_anchor {
+        if !pinned {
             edge.stability = edge.stability.min(stability_seed_max(&edge.provenance));
         }
         return Ok(());
     };
-    if loop_anchor || stored.stability >= 1.0 {
+    if pinned {
         edge.stability = stored.stability;
         return Ok(());
     }
     if memory_pass_actor(&options.actor.actor_id) && stored.expired_at.is_none() {
-        edge.stability = (edge.stability + REPEAT_STABILITY_BONUS).min(1.0);
+        edge.stability = (stored.stability + REPEAT_STABILITY_BONUS).min(1.0);
     } else {
         edge.stability = stored.stability;
     }
@@ -2558,14 +2558,16 @@ fn memory_pass_actor(actor_id: &str) -> bool {
     matches!(actor_id, "scribe" | "extract" | "consolidate")
 }
 
-fn edge_is_loop_anchor(
+fn edge_is_pinned_in_db(
     conn: &Connection,
     edge: &Edge,
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
-    let Some(source) = db::load_node(conn, &edge.source)? else {
-        return Ok(false);
+    let source = db::load_node(conn, &edge.source)?;
+    let source_type = match source.as_ref() {
+        Some(node) => node.node_type.as_str(),
+        None => "",
     };
-    Ok(source.node_type == "loop")
+    Ok(edge_is_pinned(edge, source_type))
 }
 
 // Dreaming's promotion path: an episodic edge that kept being reinforced or
@@ -2957,7 +2959,7 @@ mod tests {
             source: "rust".to_string(),
             target: "memory".to_string(),
             content: "old claim".to_string(),
-            stability: 0.4,
+            stability: 0.5,
             confidence: 0.5,
             importance: 0.4,
             subject: false,
@@ -2975,7 +2977,7 @@ mod tests {
             source: "rust".to_string(),
             target: "memory".to_string(),
             content: "user restated claim".to_string(),
-            stability: 0.8,
+            stability: 0.3,
             confidence: 0.9,
             importance: 0.7,
             subject: false,
@@ -2999,7 +3001,7 @@ mod tests {
         };
         assert_eq!(edge.provenance, "user-confirmed");
         assert_eq!(edge.confidence, 0.9);
-        assert_eq!(edge.stability, 0.85);
+        assert_eq!(edge.stability, 0.55);
     }
 
     #[test]

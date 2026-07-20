@@ -1,5 +1,6 @@
 use super::db;
-use super::graph::{Edge, Graph};
+use super::decay_curve;
+use super::graph::{Edge, Graph, edge_is_pinned};
 use crate::prompts::today_iso;
 
 pub fn apply_decay_if_needed(graph: &mut Graph) -> bool {
@@ -7,7 +8,7 @@ pub fn apply_decay_if_needed(graph: &mut Graph) -> bool {
     if db::load_last_decay() == today {
         return false;
     }
-    let changes = decay_graph(graph, &today);
+    let (changes, initialized) = decay_graph(graph, &today);
     // The checkpoint lives inside the same transaction as the values, so a
     // failed persist retries on the next pass instead of being skipped until
     // tomorrow — the previous order wrote the checkpoint first and swallowed
@@ -16,18 +17,26 @@ pub fn apply_decay_if_needed(graph: &mut Graph) -> bool {
         crate::runlog::log("decay", &format!("persist failed, retrying later: {err}"));
         return false;
     }
+    if initialized > 0 {
+        crate::runlog::log("decay", &format!("initialized {initialized} clocks"));
+    }
     true
 }
 
-fn decay_graph(graph: &mut Graph, today: &str) -> Vec<db::DecayChange> {
+fn decay_graph(graph: &mut Graph, today: &str) -> (Vec<db::DecayChange>, usize) {
     let nodes = &graph.nodes;
     let mut changes = Vec::new();
+    let mut initialized = 0usize;
     for edge in &mut graph.edges {
-        if edge.expired_at.is_none() && edge_touches_standing_node(nodes, edge) {
+        let source_type = match nodes.get(&edge.source) {
+            Some(node) => node.node_type.as_str(),
+            None => "",
+        };
+        if edge_is_pinned(edge, source_type) {
             continue;
         }
         let before = (edge.confidence, edge.last_decayed_at.clone());
-        decay_edge(edge, today);
+        initialized += usize::from(decay_edge(edge, today));
         if before.0 != edge.confidence || before.1 != edge.last_decayed_at {
             changes.push(db::DecayChange {
                 source: edge.source.clone(),
@@ -37,35 +46,10 @@ fn decay_graph(graph: &mut Graph, today: &str) -> Vec<db::DecayChange> {
             });
         }
     }
-    changes
+    (changes, initialized)
 }
 
-fn edge_touches_standing_node(
-    nodes: &std::collections::HashMap<String, super::graph::Node>,
-    edge: &Edge,
-) -> bool {
-    for node_id in [&edge.source, &edge.target] {
-        if matches!(nodes.get(node_id), Some(node) if matches!(node.node_type.as_str(), "loop" | "interest"))
-        {
-            return true;
-        }
-    }
-    false
-}
-
-// Episodic edges are memory of lived experience, not durable belief — they
-// must be forgettable within days. This is the long-term forgetting
-// mechanism; it does NOT prevent cross-session contamination by itself (a
-// same-day second game would still see stale episodic edges from the first
-// one if decay were the only guard). That guarantee comes from retrieval
-// scoping in embed.rs, which excludes episodic edges outside their
-// originating session regardless of how much they have decayed.
-const EPISODIC_DECAY_BASE: f64 = 0.5; // replay-tunable.
-
-fn decay_edge(edge: &mut Edge, today: &str) {
-    if edge.stability >= 1.0 || edge.date.is_empty() {
-        return;
-    }
+fn decay_edge(edge: &mut Edge, today: &str) -> bool {
     // Charge elapsed time since the last charge, not the edge's whole age.
     // Without this the same history was re-charged every night and the
     // exponent compounded as n(n+1)/14 instead of n/7 — an untouched 30-day
@@ -73,21 +57,18 @@ fn decay_edge(edge: &mut Edge, today: &str) {
     // never been charged under this scheme start their clock today: current
     // damage is frozen where it is, not repaired here (repair is part of the
     // reviewed decay redesign, kratt-roadmap/epistemics/frozen-graph.md).
-    if edge.last_decayed_at.is_empty() {
+    if date_to_days(&edge.last_decayed_at).is_none() {
         edge.last_decayed_at = today.to_string();
-        return;
+        return true;
     }
     let days = days_between(&edge.last_decayed_at, today);
     if days <= 0 {
-        return;
+        return false;
     }
     edge.last_decayed_at = today.to_string();
-    let factor = if edge.memory_type == "episodic" {
-        EPISODIC_DECAY_BASE.powf(days as f64)
-    } else {
-        0.95_f64.powf(days as f64 / 7.0)
-    };
+    let factor = decay_curve::decay_factor(&edge.memory_type, edge.stability, days as f64);
     edge.confidence = (edge.confidence * factor).clamp(0.05, 1.0);
+    false
 }
 
 fn days_between(from: &str, until: &str) -> i64 {
@@ -134,20 +115,22 @@ mod tests {
 
         decay_edge(&mut edge, "2026-07-02");
         let after_one_night = edge.confidence;
-        let expected = 0.9 * 0.95_f64.powf(1.0 / 7.0);
+        let expected = 0.9 * super::super::decay_curve::decay_factor("semantic", 0.3, 1.0);
         assert!(
             (after_one_night - expected).abs() < 1e-9,
             "one night charges one night: {after_one_night} vs {expected}"
         );
 
         decay_edge(&mut edge, "2026-07-03");
-        let expected_two = 0.9 * 0.95_f64.powf(2.0 / 7.0);
+        let expected_two = 0.9 * super::super::decay_curve::decay_factor("semantic", 0.3, 2.0);
         assert!(
             (edge.confidence - expected_two).abs() < 1e-9,
             "two nights charge two nights, not 1+2"
         );
         // The compounded-history value would be far lower.
-        assert!(edge.confidence > 0.9 * 0.95_f64.powf(31.0 / 7.0));
+        assert!(
+            edge.confidence > 0.9 * super::super::decay_curve::decay_factor("semantic", 0.3, 31.0)
+        );
     }
 
     #[test]
@@ -197,13 +180,39 @@ mod tests {
 
     #[test]
     fn episodic_decay_never_drops_below_floor() {
-        let mut episodic = test_edge("episodic", "2026-01-01");
-        decay_edge(&mut episodic, "2026-07-01");
-        assert!(episodic.confidence >= 0.05);
+        for stability in [0.0, 0.3, 0.5, 1.0] {
+            let mut episodic = test_edge("episodic", "2026-01-01");
+            episodic.stability = stability;
+            decay_edge(&mut episodic, "2026-01-08");
+            assert_eq!(episodic.confidence, 0.05);
+        }
     }
 
     #[test]
-    fn live_loop_anchor_keeps_fixed_confidence() {
+    fn stability_one_semantic_edge_still_decays() {
+        let mut edge = test_edge("semantic", "2026-01-01");
+        edge.stability = 1.0;
+        decay_edge(&mut edge, "2027-01-01");
+        assert!(edge.confidence < 1.0);
+    }
+
+    #[test]
+    fn semantic_curve_half_lives_match_production_decay() {
+        for (stability, until) in [(0.5, "2026-08-13"), (0.15, "2026-01-21")] {
+            let mut edge = test_edge("semantic", "2026-01-01");
+            edge.stability = stability;
+            decay_edge(&mut edge, until);
+            let expected = 0.5;
+            assert!(
+                (edge.confidence - expected).abs() < 0.03,
+                "stability {stability}: {}",
+                edge.confidence
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_loop_skips_decay_but_interest_edge_decays() {
         let mut graph = Graph::new();
         graph.nodes.insert(
             "loop-reminder".to_string(),
@@ -213,17 +222,50 @@ mod tests {
                 date: String::new(),
             },
         );
+        graph.nodes.insert(
+            "interest-rust".to_string(),
+            Node {
+                node_type: "interest".to_string(),
+                body: "rust".to_string(),
+                date: String::new(),
+            },
+        );
         let mut loop_edge = test_edge("semantic", "2026-01-01");
         loop_edge.source = "loop-reminder".to_string();
         loop_edge.confidence = 0.9;
         loop_edge.stability = 0.9;
         graph.edges.push(loop_edge.clone());
-        graph.edges.push(test_edge("semantic", "2026-01-01"));
+        let mut interest_edge = test_edge("semantic", "2026-01-01");
+        interest_edge.source = "interest-rust".to_string();
+        graph.edges.push(interest_edge);
         loop_edge.expired_at = Some("2026-01-02".to_string());
         graph.edges.push(loop_edge);
-        decay_graph(&mut graph, "2026-07-12");
+        let _ = decay_graph(&mut graph, "2026-07-12");
         assert!((graph.edges[0].confidence - 0.9).abs() < 1e-9);
         assert!(graph.edges[1].confidence < 1.0);
         assert!(graph.edges[2].confidence < 0.9);
+    }
+
+    #[test]
+    fn empty_and_malformed_clocks_initialize_and_are_counted() {
+        let mut graph = Graph::new();
+        let mut empty = test_edge("semantic", "");
+        empty.last_decayed_at = String::new();
+        let mut malformed = test_edge("semantic", "");
+        malformed.source = "c".to_string();
+        malformed.last_decayed_at = "not-a-date".to_string();
+        graph.edges = vec![empty, malformed];
+        let (changes, initialized) = decay_graph(&mut graph, "2026-07-20");
+        assert_eq!(initialized, 2);
+        assert_eq!(changes.len(), 2);
+        for edge in &graph.edges {
+            assert_eq!(edge.last_decayed_at, "2026-07-20");
+            assert_eq!(edge.confidence, 1.0);
+        }
+        let (_, initialized_next) = decay_graph(&mut graph, "2026-07-21");
+        assert_eq!(initialized_next, 0);
+        for edge in graph.edges {
+            assert!(edge.confidence < 1.0);
+        }
     }
 }

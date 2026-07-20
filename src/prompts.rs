@@ -225,7 +225,7 @@ upsert_node — create or update a fact node. Edge endpoints that don't exist ye
 
 upsert_edge — create or update a directed edge.
 - content: "<subject> verb <target>" or "<subject> verb <fact>"; "implies" for fact→fact; empty when subject=true
-- stability: 1.0 permanent, 0.7 can change, 0.3 temporary
+- stability: 0.3 fades in weeks, 0.5 in months, high values in years
 - confidence: 1.0 stated clearly, 0.7 once, 0.4 inferred, 0.1 uncertain
 - importance: 1.0 must load with source, 0.0 supplementary
 - subject: true only on fact nodes; set importance=1.0
