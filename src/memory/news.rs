@@ -35,28 +35,43 @@ pub(crate) struct NewsScanSummary {
 pub(crate) fn run_news_scan(
     embed_client: &dyn EmbeddingClient,
     search: Option<&dyn SearchClient>,
-) -> NewsScanSummary {
+) -> Result<NewsScanSummary, Box<dyn Error + Send + Sync>> {
     let interests = db::top_interests(NEWS_INTEREST_COUNT);
     register_scan_session();
     let mut summary = NewsScanSummary {
         interests: interests.len(),
         findings: 0,
     };
+    if interests.is_empty() {
+        return Ok(summary);
+    }
     let Some(search_client) = search else {
-        runlog::log("news", "news search unavailable");
-        return summary;
+        return Err("news search unavailable".into());
     };
-    let Ok(conn) = db::open_connection() else {
-        runlog::log("news", "database unavailable");
-        return summary;
-    };
+    let conn = db::open_connection()?;
+    let mut successful_searches = 0usize;
+    let mut last_error = None;
     for interest in interests {
-        summary.findings += scan_interest(&conn, embed_client, search_client, &interest);
+        match scan_interest(&conn, embed_client, search_client, &interest) {
+            Ok(findings) => {
+                successful_searches += 1;
+                summary.findings += findings;
+            }
+            Err(err) => {
+                runlog::log("news", &err.to_string());
+                last_error = Some(err);
+            }
+        }
+    }
+    if successful_searches == 0
+        && let Some(err) = last_error
+    {
+        return Err(err);
     }
     if summary.interests > 0 {
         db::sync_push_best_effort("news");
     }
-    summary
+    Ok(summary)
 }
 
 fn register_scan_session() {
@@ -70,18 +85,19 @@ fn scan_interest(
     embed_client: &dyn EmbeddingClient,
     search_client: &dyn SearchClient,
     interest: &Interest,
-) -> usize {
+) -> Result<usize, Box<dyn Error + Send + Sync>> {
     let results = match search_client.search_news(&interest.topic, NEWS_RECENCY_DAYS) {
-        Ok(items) => items,
+        Ok(results) => results,
         Err(reason) => {
-            runlog::log(
-                "news",
-                &format!("search failed for {}: {reason}", interest.topic),
-            );
-            return 0;
+            return Err(format!("search failed for {}: {reason}", interest.topic).into());
         }
     };
-    process_interest_results(conn, embed_client, interest, &results)
+    Ok(process_interest_results(
+        conn,
+        embed_client,
+        interest,
+        &results,
+    ))
 }
 
 pub(crate) fn process_interest_results(

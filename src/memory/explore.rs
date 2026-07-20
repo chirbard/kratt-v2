@@ -61,13 +61,13 @@ pub fn run_exploration_pass(
     embed: Arc<dyn EmbeddingClient>,
     search: Option<Arc<dyn SearchClient>>,
     sender: Sender<ExploreEvent>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+) -> Result<usize, Box<dyn Error + Send + Sync>> {
     let _timer = runlog::time_step("explore", "pass");
     match execute_exploration_pass(Arc::clone(&llm), Arc::clone(&embed), search, &sender) {
         Ok(events_recorded) => {
             db::sync_push_best_effort("explore");
             let _ = sender.send(ExploreEvent::Done { events_recorded });
-            Ok(())
+            Ok(events_recorded)
         }
         Err(err) => {
             send_log(

@@ -53,7 +53,7 @@ pub fn run_dream_pass(
     llm: Arc<dyn LlmClient>,
     embed: Arc<dyn EmbeddingClient>,
     sender: std::sync::mpsc::Sender<DreamEvent>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+) -> Result<usize, Box<dyn Error + Send + Sync>> {
     let _timer = runlog::time_step("dream", "pass");
     let result = {
         let _write_guard = db::acquire_write_lock();
@@ -63,7 +63,7 @@ pub fn run_dream_pass(
         Ok(edges_added) => {
             db::sync_push_best_effort("dream");
             let _ = sender.send(DreamEvent::Done { edges_added });
-            Ok(())
+            Ok(edges_added)
         }
         Err(err) => {
             send_log(

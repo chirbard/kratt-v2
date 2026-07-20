@@ -994,6 +994,7 @@ mod tests {
             "CREATE TABLE findings (id INTEGER PRIMARY KEY AUTOINCREMENT, interest_topic TEXT NOT NULL, title TEXT NOT NULL, url TEXT NOT NULL, snippet TEXT NOT NULL DEFAULT '', novelty REAL NOT NULL, found_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'candidate', surfaced_at TEXT NOT NULL DEFAULT '')",
             "CREATE TABLE ping_policy (topic TEXT PRIMARY KEY, muted_until TEXT NOT NULL DEFAULT '', divert_until TEXT NOT NULL DEFAULT '')",
             "CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL)",
+            "CREATE TABLE pass_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, pass_type TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT NOT NULL DEFAULT '', outcome TEXT NOT NULL DEFAULT 'failed', reason_class TEXT NOT NULL DEFAULT 'interrupted', items_added INTEGER NOT NULL DEFAULT 0)",
         ];
         for statement in statements {
             let _ = conn.execute(statement, ()).await;

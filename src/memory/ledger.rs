@@ -4,7 +4,7 @@ use std::error::Error;
 use serde_json::Value as JsonValue;
 use turso::{Connection, Value, params};
 
-use crate::memory::db;
+use crate::memory::db::{self, PassRun};
 use crate::memory::graph::Edge;
 
 const HALF_LIFE_CYCLES: f64 = 20.0; // replay-tunable.
@@ -369,10 +369,14 @@ pub fn load_actor_direction(actor_type: &str, actor_id: &str) -> Option<Vec<f64>
 pub struct DayDigest {
     pub day: String,
     pub turns: usize,
+    pub conversation_user_messages: usize,
     pub created: usize,
     pub updated: usize,
     pub pruned: usize,
     pub dream_events: usize,
+    pub dream_runs: Vec<PassRun>,
+    pub dream_consecutive_failures: usize,
+    pub dream_last_successful_at: Option<String>,
     pub autonomy: AutonomySummary,
     // Live intentions whose due date has arrived; rendered for the report.
     pub due_loops: Vec<String>,
@@ -444,10 +448,12 @@ impl DayDigest {
     // A quiet day left no trace in the ledger — nothing to report on.
     pub fn is_quiet(&self) -> bool {
         self.turns == 0
+            && self.conversation_user_messages == 0
             && self.created == 0
             && self.updated == 0
             && self.pruned == 0
             && self.dream_events == 0
+            && self.dream_runs.is_empty()
             && self.autonomy.actions == 0
             && self.due_loops.is_empty()
             && self.inbox_outcomes.is_empty()
@@ -509,7 +515,7 @@ async fn window_digest_async(
     label: &str,
 ) -> Result<DayDigest, Box<dyn Error + Send + Sync>> {
     let mut digest = window_slice_digest(conn, activity, label).await?;
-    digest.dream_events = count_night_dream_events(conn, night).await?;
+    populate_dream_facts(conn, night, &mut digest).await?;
     digest.gists = load_night_gists(conn, night).await?;
     digest.inbox_outcomes = db::load_inbox_outcomes(conn, &night.from, &night.until).await?;
     digest.held_findings = load_held_findings(conn, activity, night).await?;
@@ -519,6 +525,22 @@ async fn window_digest_async(
         digest.due_loops.push(loop_item.display());
     }
     Ok(digest)
+}
+
+async fn populate_dream_facts(
+    conn: &Connection,
+    night: &NightWindow,
+    digest: &mut DayDigest,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    digest.dream_events = count_night_dream_events(conn, night).await?;
+    digest.dream_runs =
+        db::pass_runs_in_window_async(conn, "dream", &night.from, &night.until).await?;
+    digest.dream_consecutive_failures = db::consecutive_failures_async(conn, "dream").await?;
+    digest.dream_last_successful_at = match db::last_successful_pass_async(conn, "dream").await? {
+        Some(run) => Some(run.finished_at),
+        None => None,
+    };
+    Ok(())
 }
 
 async fn load_held_findings(
@@ -676,6 +698,7 @@ async fn window_slice_digest(
     Ok(DayDigest {
         day: label.to_string(),
         turns: count_window_turns(conn, window).await?,
+        conversation_user_messages: count_window_user_messages(conn, window).await?,
         created: count_window_event_type(conn, window, "created").await?,
         updated: count_window_event_type(conn, window, "updated").await?,
         pruned: count_window_event_type(conn, window, "pruned").await?,
@@ -684,6 +707,25 @@ async fn window_slice_digest(
         turn_groups: load_window_turn_groups(conn, window).await?,
         ..DayDigest::default()
     })
+}
+
+async fn count_window_user_messages(
+    conn: &Connection,
+    window: &NightWindow,
+) -> Result<usize, Box<dyn Error + Send + Sync>> {
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*)
+             FROM messages
+             JOIN sessions ON sessions.id = messages.session_id
+             WHERE messages.role = 'user'
+               AND sessions.session_type = 'conversation'
+               AND messages.created_at >= ?1
+               AND messages.created_at < ?2",
+            params![window.from.as_str(), window.until.as_str()],
+        )
+        .await?;
+    count_from(&mut rows).await
 }
 
 async fn count_window_turns(
@@ -1631,6 +1673,8 @@ mod tests {
     }
 
     const SESSIONS_DDL: &str = "CREATE TABLE sessions (id TEXT PRIMARY KEY, session_type TEXT NOT NULL DEFAULT 'conversation', created_at TEXT NOT NULL DEFAULT '')";
+    const MESSAGES_DDL: &str = "CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT '')";
+    const PASS_RUNS_DDL: &str = "CREATE TABLE pass_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, pass_type TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT NOT NULL DEFAULT '', outcome TEXT NOT NULL DEFAULT 'failed', reason_class TEXT NOT NULL DEFAULT 'interrupted', items_added INTEGER NOT NULL DEFAULT 0)";
     const FINDINGS_DDL: &str = "CREATE TABLE findings (id INTEGER PRIMARY KEY, interest_topic TEXT, title TEXT, url TEXT, snippet TEXT, novelty REAL, found_at TEXT, status TEXT, surfaced_at TEXT)";
 
     const YESTERDAY: &str = "2026-07-10";
@@ -1646,6 +1690,8 @@ mod tests {
         };
         let _ = conn.execute(EVENTS_DDL, ()).await;
         let _ = conn.execute(SESSIONS_DDL, ()).await;
+        let _ = conn.execute(MESSAGES_DDL, ()).await;
+        let _ = conn.execute(PASS_RUNS_DDL, ()).await;
         let _ = conn.execute(EDGES_DDL, ()).await;
         let _ = conn.execute(NODES_DDL, ()).await;
         let _ = conn.execute(FINDINGS_DDL, ()).await;
@@ -1704,6 +1750,26 @@ mod tests {
             .execute(
                 "INSERT INTO sessions (id, session_type, created_at) VALUES (?1, 'dream', ?2)",
                 params![session_id, created_at],
+            )
+            .await;
+    }
+
+    async fn insert_digest_message(
+        conn: &Connection,
+        details: (&str, &str, &str, &str),
+        created_at: &str,
+    ) {
+        let (message_id, session_id, session_type, role) = details;
+        let _ = conn
+            .execute(
+                "INSERT OR IGNORE INTO sessions (id, session_type, created_at) VALUES (?1, ?2, ?3)",
+                params![session_id, session_type, created_at],
+            )
+            .await;
+        let _ = conn
+            .execute(
+                "INSERT INTO messages (id, session_id, role, content, created_at) VALUES (?1, ?2, ?3, 'x', ?4)",
+                params![message_id, session_id, role, created_at],
             )
             .await;
     }
@@ -1769,6 +1835,61 @@ mod tests {
         assert_eq!(digest.created, 1);
         assert_eq!(digest.updated, 1);
         assert_eq!(digest.new_edges, vec!["a → b".to_string()]);
+    }
+
+    #[test]
+    fn digest_counts_only_user_messages_from_conversation_sessions() {
+        let conn = db::block_on(digest_harness());
+        let day = crate::timeutil::today_iso();
+        let timestamp = format!("{day}T04:00:00");
+        db::block_on(insert_digest_message(
+            &conn,
+            ("user-message", "chat-session", "conversation", "user"),
+            &timestamp,
+        ));
+        db::block_on(insert_digest_message(
+            &conn,
+            (
+                "assistant-message",
+                "chat-session",
+                "conversation",
+                "assistant",
+            ),
+            &timestamp,
+        ));
+        db::block_on(insert_digest_message(
+            &conn,
+            ("dream-user-message", "dream-session", "dream", "user"),
+            &timestamp,
+        ));
+        let digest = digest(&conn, &day);
+        assert_eq!(digest.conversation_user_messages, 1);
+        assert!(digest.turn_groups.is_empty());
+    }
+
+    #[test]
+    fn conversation_messages_and_thread_material_remain_separate_facts() {
+        let conn = db::block_on(digest_harness());
+        let day = crate::timeutil::today_iso();
+        let timestamp = format!("{day}T04:00:00");
+        db::block_on(insert_digest_message(
+            &conn,
+            ("user-message", "chat-session", "conversation", "user"),
+            &timestamp,
+        ));
+        db::block_on(insert_event(
+            &conn,
+            &day,
+            "chat-session",
+            "turn-a",
+            "created",
+            "a",
+            "b",
+            "",
+        ));
+        let digest = digest(&conn, &day);
+        assert_eq!(digest.conversation_user_messages, 1);
+        assert_eq!(digest.turn_groups, vec!["a → b".to_string()]);
     }
 
     #[test]

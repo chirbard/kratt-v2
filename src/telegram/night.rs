@@ -20,7 +20,48 @@ use crate::web::SearchClient;
 const NIGHT_ACTION_COOLDOWN: Duration = Duration::from_secs(20 * 60);
 // replay-tunable.
 const MAX_NIGHT_ACTIONS: usize = 3;
+const MAX_DREAM_ATTEMPTS: usize = 2; // replay-tunable.
 const DEFAULT_DREAM_HOURS: &str = "3-6";
+
+struct PassExecution {
+    outcome: &'static str,
+    reason_class: &'static str,
+    items_added: usize,
+}
+
+impl PassExecution {
+    fn ok(items_added: usize) -> Self {
+        Self {
+            outcome: "ok",
+            reason_class: "none",
+            items_added,
+        }
+    }
+
+    fn failed(reason_class: &'static str) -> Self {
+        Self {
+            outcome: "failed",
+            reason_class,
+            items_added: 0,
+        }
+    }
+
+    fn skipped(reason_class: &'static str) -> Self {
+        Self {
+            outcome: "skipped",
+            reason_class,
+            items_added: 0,
+        }
+    }
+
+    fn succeeded(&self) -> bool {
+        self.outcome == "ok"
+    }
+
+    fn completed(&self) -> bool {
+        self.outcome != "failed"
+    }
+}
 
 // Hour range [start, end) in UTC (timeutil::current_hour is epoch-derived,
 // like every date in the app), end exclusive. A wrapping range like `23-5`
@@ -88,6 +129,8 @@ struct NightGate {
     // revert to periodic checks) — correctness depends on single-writer.
     dirty: bool,
     dreamed_tonight: bool,
+    dream_attempts: usize,
+    dream_skip_recorded: bool,
     studied_inbox_tonight: bool,
     scanned_news_today: bool,
     last_curiosity_had_yield: Option<bool>,
@@ -104,6 +147,8 @@ impl NightGate {
             night_day: None,
             dirty: true,
             dreamed_tonight: false,
+            dream_attempts: 0,
+            dream_skip_recorded: false,
             studied_inbox_tonight: false,
             scanned_news_today: false,
             last_curiosity_had_yield: None,
@@ -119,6 +164,8 @@ impl NightGate {
             self.night_day = Some(today.to_string());
             self.count = 0;
             self.dreamed_tonight = false;
+            self.dream_attempts = 0;
+            self.dream_skip_recorded = false;
             self.studied_inbox_tonight = false;
             self.scanned_news_today = false;
             self.last_curiosity_had_yield = None;
@@ -139,6 +186,16 @@ impl NightGate {
         self.count += 1;
         self.last_action = Some(now);
         self.last_curiosity_had_yield = None;
+    }
+
+    fn can_attempt_dream(&self) -> bool {
+        !self.dreamed_tonight && self.dream_attempts < MAX_DREAM_ATTEMPTS
+    }
+
+    fn record_dream(&mut self, now: Instant, succeeded: bool) {
+        self.dream_attempts += 1;
+        self.dreamed_tonight = succeeded || self.dream_attempts >= MAX_DREAM_ATTEMPTS;
+        self.record_action(now);
     }
 
     fn record_curiosity(&mut self, now: Instant, had_yield: bool) {
@@ -217,10 +274,14 @@ impl NightCycle {
     // happened, regardless of debt thresholds. Once per night, if any
     // experience postdates the last dream, dream — bypassing decide().
     fn try_guaranteed_dream(&mut self, now: Instant) -> bool {
-        if self.gate.dreamed_tonight {
+        if !self.gate.can_attempt_dream() {
             return false;
         }
         if !scheduler::has_unconsolidated_experience() {
+            if !self.gate.dream_skip_recorded {
+                self.record_skipped_pass("dream", "no_material");
+                self.gate.dream_skip_recorded = true;
+            }
             return false;
         }
         let reason = "nightly guarantee: unconsolidated experience";
@@ -228,9 +289,8 @@ impl NightCycle {
             reason: reason.to_string(),
         });
         runlog::log("tg", &format!("night action: dream ({reason})"));
-        self.run_dream();
-        self.gate.dreamed_tonight = true;
-        self.gate.record_action(now);
+        let result = self.run_dream();
+        self.record_dream_result(now, &result);
         true
     }
 
@@ -254,26 +314,23 @@ impl NightCycle {
     fn dispatch(&mut self, action: SchedulerAction, now: Instant) {
         match action {
             SchedulerAction::Dream { reason } => {
-                runlog::log("tg", &format!("night action: dream ({reason})"));
-                self.run_dream();
-                self.gate.dreamed_tonight = true;
-                self.gate.record_action(now);
+                self.dispatch_dream(&reason, now);
             }
             SchedulerAction::Explore { reason } => {
                 runlog::log("tg", &format!("night action: explore ({reason})"));
-                self.run_explore();
+                let _ = self.run_explore();
                 self.gate.record_action(now);
             }
             SchedulerAction::Curiosity { reason } => {
                 runlog::log("tg", &format!("night action: curiosity ({reason})"));
-                let had_yield = self.run_explore();
+                let had_yield = self.run_explore().items_added > 0;
                 self.gate.record_curiosity(now, had_yield);
             }
             SchedulerAction::NewsScan { reason } => self.dispatch_news_scan(&reason, now),
             SchedulerAction::InboxStudy { reason } => {
                 runlog::log("tg", &format!("night action: inbox study ({reason})"));
-                self.run_inbox_study();
-                self.gate.studied_inbox_tonight = true;
+                let result = self.run_inbox_study();
+                self.gate.studied_inbox_tonight = result.completed();
                 self.gate.record_action(now);
             }
             SchedulerAction::Ingest { path, reason } => {
@@ -284,6 +341,7 @@ impl NightCycle {
                         path.display()
                     ),
                 );
+                self.record_skipped_pass("ingestion", "not_eligible");
                 self.gate.record_skipped(now);
             }
             SchedulerAction::Rest { reason } => {
@@ -293,74 +351,180 @@ impl NightCycle {
         }
     }
 
+    fn dispatch_dream(&mut self, reason: &str, now: Instant) {
+        runlog::log("tg", &format!("night action: dream ({reason})"));
+        if !self.gate.can_attempt_dream() {
+            self.record_skipped_pass("dream", "not_eligible");
+            self.gate.record_skipped(now);
+            return;
+        }
+        let result = self.run_dream();
+        self.record_dream_result(now, &result);
+    }
+
     fn dispatch_news_scan(&mut self, reason: &str, now: Instant) {
         runlog::log("tg", &format!("night action: news scan ({reason})"));
-        self.run_news_scan();
-        self.gate.scanned_news_today = true;
+        let result = self.run_news_scan();
+        self.gate.scanned_news_today = result.completed();
         self.gate.record_action(now);
     }
 
     // Inline drain, same pattern as run_memory_to_completion: the pass drops
     // its sender on return, so draining the receiver runs to completion.
-    fn run_dream(&self) {
+    fn run_dream(&self) -> PassExecution {
+        let run_id = self.start_pass("dream");
         let (sender, receiver) = std::sync::mpsc::channel::<DreamEvent>();
         let llm = Arc::clone(&self.memory_llm);
         let embed = Arc::clone(&self.embed);
-        if let Err(err) = memory::run_dream_pass(llm, embed, sender) {
-            runlog::log("tg", &format!("night dream failed: {err}"));
-        }
+        let result = memory::run_dream_pass(llm, embed, sender);
         for _event in receiver {}
+        let execution = match result {
+            Ok(edges_added) => PassExecution::ok(edges_added),
+            Err(err) => {
+                runlog::log("tg", &format!("night dream failed: {err}"));
+                PassExecution::failed(classify_pass_error(&err.to_string()))
+            }
+        };
+        self.finish_pass(run_id, "dream", &execution);
+        execution
     }
 
-    fn run_explore(&self) -> bool {
+    fn run_explore(&self) -> PassExecution {
+        let run_id = self.start_pass("exploration");
         let (sender, receiver) = std::sync::mpsc::channel::<ExploreEvent>();
         let llm = Arc::clone(&self.memory_llm);
         let embed = Arc::clone(&self.embed);
         let search = self.search.clone();
-        if let Err(err) = memory::run_exploration_pass(llm, embed, search, sender) {
-            runlog::log("tg", &format!("night explore failed: {err}"));
-        }
-        let mut had_yield = false;
-        for event in receiver {
-            if let ExploreEvent::Done { events_recorded } = event {
-                had_yield = events_recorded > 0;
+        let result = memory::run_exploration_pass(llm, embed, search, sender);
+        for _event in receiver {}
+        let execution = match result {
+            Ok(events_recorded) => PassExecution::ok(events_recorded),
+            Err(err) => {
+                runlog::log("tg", &format!("night explore failed: {err}"));
+                PassExecution::failed(classify_pass_error(&err.to_string()))
             }
-        }
-        had_yield
-    }
-
-    fn run_news_scan(&self) {
-        let summary = memory::run_news_scan(&*self.embed, self.search.as_deref());
-        runlog::log(
-            "news",
-            &format!(
-                "[autonomy] news scan — {} interests, {} novel findings",
-                summary.interests, summary.findings
-            ),
-        );
-    }
-
-    fn run_inbox_study(&self) {
-        let Ok(conn) = memory::open_connection() else {
-            return;
         };
-        let Ok(Some(item)) = memory::oldest_queued_inbox(&conn) else {
-            return;
+        self.finish_pass(run_id, "exploration", &execution);
+        execution
+    }
+
+    fn run_news_scan(&self) -> PassExecution {
+        let run_id = self.start_pass("news");
+        let execution = match memory::run_news_scan(&*self.embed, self.search.as_deref()) {
+            Ok(summary) => {
+                runlog::log(
+                    "news",
+                    &format!(
+                        "[autonomy] news scan — {} interests, {} novel findings",
+                        summary.interests, summary.findings
+                    ),
+                );
+                if summary.interests == 0 {
+                    PassExecution::skipped("no_material")
+                } else {
+                    PassExecution::ok(summary.findings)
+                }
+            }
+            Err(err) => {
+                runlog::log("news", &format!("news scan failed: {err}"));
+                PassExecution::failed(classify_pass_error(&err.to_string()))
+            }
+        };
+        self.finish_pass(run_id, "news", &execution);
+        execution
+    }
+
+    fn run_inbox_study(&self) -> PassExecution {
+        let run_id = self.start_pass("ingestion");
+        let Ok(conn) = memory::open_connection() else {
+            let execution = PassExecution::failed("database_error");
+            self.finish_pass(run_id, "ingestion", &execution);
+            return execution;
+        };
+        let item = match memory::oldest_queued_inbox(&conn) {
+            Ok(Some(item)) => item,
+            Ok(None) => {
+                let execution = PassExecution::skipped("no_material");
+                self.finish_pass(run_id, "ingestion", &execution);
+                return execution;
+            }
+            Err(err) => {
+                runlog::log("inbox", &format!("queue read failed: {err}"));
+                let execution = PassExecution::failed("database_error");
+                self.finish_pass(run_id, "ingestion", &execution);
+                return execution;
+            }
         };
         let result = self.study_inbox_item(&item);
-        match result {
+        let execution = match result {
             Ok(session) => {
                 let _ = memory::resolve_inbox_item(&conn, item.item_id, "done", &session);
                 runlog::log(
                     "inbox",
                     &format!("studied: {} (session {session})", item.source),
                 );
+                PassExecution::ok(1)
             }
             Err(reason) => {
                 let _ = memory::resolve_inbox_item(&conn, item.item_id, "failed", &reason);
                 runlog::log("inbox", &format!("failed: {} ({reason})", item.source));
+                PassExecution::failed(classify_pass_error(&reason))
+            }
+        };
+        self.finish_pass(run_id, "ingestion", &execution);
+        execution
+    }
+
+    fn record_dream_result(&mut self, now: Instant, result: &PassExecution) {
+        self.gate.record_dream(now, result.succeeded());
+        if result.succeeded() {
+            return;
+        }
+        if self.gate.can_attempt_dream() {
+            runlog::log(
+                "tg",
+                "night dream retry permitted after the normal action cooldown",
+            );
+        } else {
+            runlog::log("tg", "night dream retry cap reached");
+        }
+    }
+
+    fn start_pass(&self, pass_type: &str) -> Option<i64> {
+        match memory::start_pass_run(pass_type) {
+            Ok(run_id) => Some(run_id),
+            Err(err) => {
+                runlog::log(
+                    "tg",
+                    &format!("{pass_type} pass outcome start failed: {err}"),
+                );
+                None
             }
         }
+    }
+
+    fn finish_pass(&self, run_id: Option<i64>, pass_type: &str, result: &PassExecution) {
+        let Some(run_id) = run_id else {
+            return;
+        };
+        if let Err(err) = memory::finish_pass_run(
+            run_id,
+            result.outcome,
+            result.reason_class,
+            result.items_added,
+        ) {
+            runlog::log(
+                "tg",
+                &format!("{pass_type} pass outcome finish failed: {err}"),
+            );
+            return;
+        }
+        memory::sync_push_best_effort("pass outcome");
+    }
+
+    fn record_skipped_pass(&self, pass_type: &str, reason_class: &'static str) {
+        let run_id = self.start_pass(pass_type);
+        self.finish_pass(run_id, pass_type, &PassExecution::skipped(reason_class));
     }
 
     fn study_inbox_item(&self, item: &memory::InboxItem) -> Result<String, String> {
@@ -396,6 +560,23 @@ impl NightCycle {
         for _event in receiver {}
         result
     }
+}
+
+fn classify_pass_error(error: &str) -> &'static str {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("context length")
+        || lower.contains("maximum context")
+        || lower.contains("too many tokens")
+    {
+        return "context_length";
+    }
+    if lower.contains("database") || lower.contains("sqlite") || lower.contains("turso") {
+        return "database_error";
+    }
+    if lower.contains("unavailable") || lower.contains("not configured") {
+        return "unavailable";
+    }
+    "provider_error"
 }
 
 #[cfg(test)]
@@ -530,6 +711,42 @@ mod tests {
         // Cooldown gates the timing, but the state is still dirty.
         let later = base + Duration::from_secs(1200);
         assert!(gate.should_evaluate(4, "2026-07-10", later));
+    }
+
+    #[test]
+    fn failed_dream_allows_one_cooldown_gated_retry() {
+        let mut gate = gate("3-6");
+        let base = Instant::now();
+        let day = timeutil::today_iso();
+        assert!(gate.should_evaluate(4, &day, base));
+        gate.record_dream(base, false);
+        assert!(!gate.dreamed_tonight);
+        assert!(gate.can_attempt_dream());
+        assert!(!gate.should_evaluate(4, &day, base + Duration::from_secs(60)));
+        let retry = base + Duration::from_secs(1200);
+        assert!(gate.should_evaluate(4, &day, retry));
+        gate.record_dream(retry, false);
+        assert!(gate.dreamed_tonight);
+        assert!(!gate.can_attempt_dream());
+    }
+
+    #[test]
+    fn successful_dream_closes_the_nightly_gate() {
+        let mut gate = gate("3-6");
+        let now = Instant::now();
+        gate.record_dream(now, true);
+        assert!(gate.dreamed_tonight);
+        assert!(!gate.can_attempt_dream());
+        assert_eq!(gate.dream_attempts, 1);
+    }
+
+    #[test]
+    fn pass_errors_use_stable_reason_classes() {
+        assert_eq!(
+            classify_pass_error("Input length exceeds maximum context length"),
+            "context_length"
+        );
+        assert_eq!(classify_pass_error("HTTP 500"), "provider_error");
     }
 
     #[test]
