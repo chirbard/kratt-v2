@@ -18,9 +18,10 @@ mod runlog;
 mod seat_replay;
 mod session;
 mod telegram;
-mod turn;
 mod timeutil;
+mod trace;
 mod tui;
+mod turn;
 mod web;
 
 use std::path::PathBuf;
@@ -51,15 +52,32 @@ fn install_panic_runlog() {
 
 fn main() -> MainResult<()> {
     let decay_simulation = decay_simulation_request()?;
+    let trace_view = trace_view_id()?;
     // All data paths (kratt-data/, logs, .env) are relative — pin the working
     // directory to the crate root so `cargo run` from a subdirectory doesn't
     // scatter kratt-data/ copies around the repo.
     std::env::set_current_dir(env!("CARGO_MANIFEST_DIR"))?;
     install_panic_runlog();
+    if let Some(trace_id) = trace_view {
+        return trace::view(&trace_id);
+    }
     if let Some(request) = decay_simulation {
         return memory::run_decay_simulator(&request.snapshot, request.today.as_deref());
     }
     run_application()
+}
+
+fn trace_view_id() -> MainResult<Option<String>> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--trace-view" {
+            return match args.next() {
+                Some(trace_id) => Ok(Some(trace_id)),
+                None => Err("--trace-view requires a trace id".into()),
+            };
+        }
+    }
+    Ok(None)
 }
 
 fn run_application() -> MainResult<()> {

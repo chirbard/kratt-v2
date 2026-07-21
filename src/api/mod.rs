@@ -49,6 +49,26 @@ pub trait LlmClient: Send + Sync {
         tools: Option<&serde_json::Value>,
         sender: &std::sync::mpsc::Sender<Chunk>,
     ) -> Result<TurnOutcome, Box<dyn Error + Send + Sync>>;
+
+    fn stream_traced(
+        &self,
+        prompt: String,
+        system: Option<String>,
+        sender: Sender<Chunk>,
+        _span: &crate::trace::TraceSpan,
+    ) {
+        self.stream(prompt, system, sender);
+    }
+
+    fn stream_turn_traced(
+        &self,
+        messages: &[serde_json::Value],
+        tools: Option<&serde_json::Value>,
+        sender: &Sender<Chunk>,
+        _span: &crate::trace::TraceSpan,
+    ) -> Result<TurnOutcome, Box<dyn Error + Send + Sync>> {
+        self.stream_turn(messages, tools, sender)
+    }
 }
 
 pub trait EmbeddingClient: Send + Sync {

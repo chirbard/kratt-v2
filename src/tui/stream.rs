@@ -6,7 +6,8 @@ use crate::api::{Chunk, EmbeddingClient, LlmClient, Stats, TurnOutcome};
 use crate::memory;
 use crate::runlog;
 use crate::session;
-use crate::turn::{self, MemoryBuild, TurnContext};
+use crate::trace::{TraceContext, TracingClient};
+use crate::turn::{self, MemoryBuild, ToolExecutionContext, TurnContext};
 use crate::web::SearchClient;
 
 use super::app::{App, Message, Role, State};
@@ -108,12 +109,14 @@ fn stream_turns(
     messages: &mut Vec<Value>,
     memory_build: &MemoryBuild,
 ) {
+    let trace_context = TraceContext::new("chat");
+    let traced_llm = TracingClient::wrap(Arc::clone(&job.llm), trace_context.clone());
     let mut stats_agg = StatsAgg::new();
     let mut first_turn = true;
     loop {
         let outcome = {
             let _stream_timer = runlog::time_step("chat", "LLM stream turn");
-            job.llm.stream_turn(messages, Some(tools), &job.sender)
+            traced_llm.stream_turn(messages, Some(tools), &job.sender)
         };
         match outcome {
             Ok(TurnOutcome::Done(stats)) => {
@@ -121,13 +124,12 @@ fn stream_turns(
                 return;
             }
             Ok(TurnOutcome::ToolCalls(calls)) => {
-                turn::execute_tool_turn(
-                    job.search.as_deref(),
-                    &job.session_path,
-                    &job.sender,
-                    &calls,
-                    messages,
-                );
+                let context = ToolExecutionContext {
+                    search: job.search.as_deref(),
+                    session_path: &job.session_path,
+                    sender: &job.sender,
+                };
+                turn::execute_tool_turn(&context, &calls, messages, &trace_context);
             }
             Err(err) => {
                 let _ = job.sender.send(Chunk::Err(err.to_string()));

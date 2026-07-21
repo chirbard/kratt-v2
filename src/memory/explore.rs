@@ -63,6 +63,8 @@ pub fn run_exploration_pass(
     sender: Sender<ExploreEvent>,
 ) -> Result<usize, Box<dyn Error + Send + Sync>> {
     let _timer = runlog::time_step("explore", "pass");
+    let trace_context = crate::trace::TraceContext::new("explore");
+    let llm = crate::trace::TracingClient::wrap(llm, trace_context);
     match execute_exploration_pass(Arc::clone(&llm), Arc::clone(&embed), search, &sender) {
         Ok(events_recorded) => {
             db::sync_push_best_effort("explore");

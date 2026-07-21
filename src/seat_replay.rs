@@ -36,9 +36,22 @@ pub fn run(seats: &MemorySeats) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     println!("seat-replay: comparing on {} turn pairs\n", pairs.len());
-    let classifier = run_classifier_replay(&seats.heavy, &seats.classifier, &pairs);
+    let trace_context = crate::trace::TraceContext::new("seat_replay");
+    let baseline = crate::trace::TracingClient::wrap(
+        Arc::clone(&seats.heavy),
+        trace_context.with_seat("baseline"),
+    );
+    let classifier_client = crate::trace::TracingClient::wrap(
+        Arc::clone(&seats.classifier),
+        trace_context.with_seat("classifier"),
+    );
+    let scribe_client = crate::trace::TracingClient::wrap(
+        Arc::clone(&seats.scribe),
+        trace_context.with_seat("scribe"),
+    );
+    let classifier = run_classifier_replay(&baseline, &classifier_client, &pairs);
     println!("{}", format_classifier_report(&classifier));
-    let scribe = run_scribe_replay(&seats.heavy, &seats.scribe, &pairs);
+    let scribe = run_scribe_replay(&baseline, &scribe_client, &pairs);
     println!("{}", format_scribe_report(&scribe));
     Ok(())
 }

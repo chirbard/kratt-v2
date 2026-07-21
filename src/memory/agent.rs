@@ -294,12 +294,18 @@ fn parse_turn_mode(reply: &str) -> TurnMode {
 }
 
 pub fn run_memory_agent(
-    seats: MemorySeats,
+    mut seats: MemorySeats,
     user_msg: &str,
     assistant_msg: &str,
     user_message_id: &str,
     sender: std::sync::mpsc::Sender<MemoryEvent>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let trace_context = crate::trace::TraceContext::new("memory");
+    seats.classifier =
+        crate::trace::TracingClient::wrap(seats.classifier, trace_context.with_seat("classifier"));
+    seats.scribe =
+        crate::trace::TracingClient::wrap(seats.scribe, trace_context.with_seat("scribe"));
+    seats.heavy = crate::trace::TracingClient::wrap(seats.heavy, trace_context.with_seat("heavy"));
     super::sequence::record_feedback(user_message_id);
     let agent_run = AgentRun {
         seats,
