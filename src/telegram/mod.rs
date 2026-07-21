@@ -134,13 +134,38 @@ fn spawn_shutdown_announcer(shutdown: Arc<AtomicBool>) {
 }
 
 trait TurnHandler {
-    fn handle(&mut self, text: &str) -> Result<String, Box<dyn Error + Send + Sync>>;
+    fn handle(&mut self, text: &str) -> Result<CompletedTurn, Box<dyn Error + Send + Sync>>;
+}
+
+struct CompletedTurn {
+    answer: String,
+    memory_pass: PendingMemoryPass,
+}
+
+struct PendingMemoryPass {
+    seats: MemorySeats,
+    user_msg: String,
+    answer: String,
+    turn_id: String,
+}
+
+trait MemoryPassRunner {
+    fn run(&self, pass: PendingMemoryPass) -> Result<(), Box<dyn Error + Send + Sync>>;
+}
+
+struct LiveMemoryPassRunner;
+
+impl MemoryPassRunner for LiveMemoryPassRunner {
+    fn run(&self, pass: PendingMemoryPass) -> Result<(), Box<dyn Error + Send + Sync>> {
+        run_memory_to_completion(pass)
+    }
 }
 
 struct Gateway {
     allowed_user_id: i64,
     offset: i64,
     backoff: Duration,
+    memory_runner: Box<dyn MemoryPassRunner>,
 }
 
 // The per-poll references threaded down the dispatch chain, bundled so the
@@ -161,6 +186,7 @@ impl Gateway {
             allowed_user_id,
             offset: 0,
             backoff: POLL_ERROR_BACKOFF,
+            memory_runner: Box::new(LiveMemoryPassRunner),
         }
     }
 
@@ -231,11 +257,18 @@ impl Gateway {
             ctx.handler.handle(&message.text)
         });
         match outcome {
-            Ok(answer) => send_answer(ctx.transport, message.chat_id, &answer),
+            Ok(completed) => self.finish_turn(ctx.transport, message.chat_id, completed),
             Err(err) => {
                 runlog::log("tg", &format!("turn failed: {err}"));
                 let _ = ctx.transport.send_message(message.chat_id, BROKEN_TURN_REPLY);
             }
+        }
+    }
+
+    fn finish_turn(&self, transport: &dyn BotTransport, chat_id: i64, completed: CompletedTurn) {
+        send_answer(transport, chat_id, &completed.answer);
+        if let Err(err) = self.memory_runner.run(completed.memory_pass) {
+            runlog::log("tg", &format!("memory pass failed: {err}"));
         }
     }
 }
@@ -343,9 +376,7 @@ impl LiveTurnHandler {
 }
 
 impl TurnHandler for LiveTurnHandler {
-    // Strictly sequential: answer, then run the memory pass to completion,
-    // before the caller polls again. Serializes all DB writes like the TUI.
-    fn handle(&mut self, text: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+    fn handle(&mut self, text: &str) -> Result<CompletedTurn, Box<dyn Error + Send + Sync>> {
         let session_path = self.session_path();
         let prior_path = prior_session_path();
         let turn_id = session::append_entry(&session_path, "user", text);
@@ -362,26 +393,34 @@ impl TurnHandler for LiveTurnHandler {
             &turn_id,
         )?;
         session::append_entry(&session_path, "assistant", &answer);
-        run_memory_to_completion(self.seats.clone(), text, &answer, &turn_id);
-        Ok(answer)
+        let memory_pass = PendingMemoryPass {
+            seats: self.seats.clone(),
+            user_msg: text.to_string(),
+            answer: answer.clone(),
+            turn_id,
+        };
+        Ok(CompletedTurn {
+            answer,
+            memory_pass,
+        })
     }
 }
 
-// Runs the same memory classifier/pass as the TUI, but inline: the events are
-// drained to completion here rather than into a panel.
-fn run_memory_to_completion(
-    seats: MemorySeats,
-    user_msg: &str,
-    assistant_msg: &str,
-    turn_id: &str,
-) {
+// Runs the same memory classifier/pass as the TUI after delivery. The caller
+// stays blocked until the buffered events are drained, preserving turn order.
+fn run_memory_to_completion(pass: PendingMemoryPass) -> Result<(), Box<dyn Error + Send + Sync>> {
     let (sender, receiver) = std::sync::mpsc::channel::<MemoryEvent>();
-    if let Err(err) = memory::run_memory_agent(seats, user_msg, assistant_msg, turn_id, sender) {
-        runlog::log("tg", &format!("memory pass failed: {err}"));
-    }
+    let result = memory::run_memory_agent(
+        pass.seats,
+        &pass.user_msg,
+        &pass.answer,
+        &pass.turn_id,
+        sender,
+    );
     // The agent already returned and dropped its sender; drain the buffered
     // events so the pass is fully accounted for before the next poll.
     for _event in receiver {}
+    result
 }
 
 // Session = calendar day: episodic origin_session scoping and the future daily
@@ -425,15 +464,19 @@ fn session_path_for_id(session_id: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{DaySession, Gateway, PollCtx, TurnHandler, ping, report};
     use super::bot::BotTransport;
-    use crate::api::{Chunk, LlmClient, TurnOutcome};
+    use super::{
+        CompletedTurn, DaySession, Gateway, MemoryPassRunner, PendingMemoryPass, PollCtx,
+        TurnHandler, ping, report,
+    };
+    use crate::api::{Chunk, EmbeddingClient, LlmClient, TurnOutcome};
+    use crate::memory::MemorySeats;
+    use serde_json::{Value, json};
     use std::error::Error;
-    use std::sync::{Arc, Mutex};
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc::Sender;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
-    use serde_json::{Value, json};
 
     // The gateway poll tests never trigger a report or verdict, so the LLM is
     // never called — this stub only exists to construct a ReportCycle.
@@ -451,6 +494,14 @@ mod tests {
             _sender: &Sender<Chunk>,
         ) -> Result<TurnOutcome, Box<dyn Error + Send + Sync>> {
             unreachable!("poll tests never call the LLM")
+        }
+    }
+
+    struct StubEmbed;
+
+    impl EmbeddingClient for StubEmbed {
+        fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f64>>, Box<dyn Error + Send + Sync>> {
+            unreachable!("gateway tests never embed")
         }
     }
 
@@ -484,6 +535,7 @@ mod tests {
         batches: Mutex<Vec<Result<Value, String>>>,
         sent: Mutex<Vec<(i64, String)>>,
         actions: Mutex<Vec<(i64, String)>>,
+        events: Option<Arc<Mutex<Vec<String>>>>,
     }
 
     impl ScriptedTransport {
@@ -494,13 +546,33 @@ mod tests {
                 batches: Mutex::new(queued),
                 sent: Mutex::new(Vec::new()),
                 actions: Mutex::new(Vec::new()),
+                events: None,
             }
+        }
+
+        fn recording(batches: Vec<Result<Value, String>>, events: Arc<Mutex<Vec<String>>>) -> Self {
+            let mut transport = Self::new(batches);
+            transport.events = Some(events);
+            transport
         }
 
         fn sent_count(&self) -> usize {
             match self.sent.lock() {
                 Ok(sent) => sent.len(),
                 Err(_) => 0,
+            }
+        }
+
+        fn sent_texts(&self) -> Vec<String> {
+            match self.sent.lock() {
+                Ok(sent) => {
+                    let mut texts = Vec::with_capacity(sent.len());
+                    for (_, text) in &*sent {
+                        texts.push(text.clone());
+                    }
+                    texts
+                }
+                Err(_) => Vec::new(),
             }
         }
     }
@@ -517,21 +589,35 @@ mod tests {
             }
         }
 
-        fn send_message(&self, chat_id: i64, text: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+        fn send_message(
+            &self,
+            chat_id: i64,
+            text: &str,
+        ) -> Result<(), Box<dyn Error + Send + Sync>> {
+            self.record_send();
             if let Ok(mut sent) = self.sent.lock() {
                 sent.push((chat_id, text.to_string()));
             }
             Ok(())
         }
 
-        fn send_message_html(&self, chat_id: i64, html: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+        fn send_message_html(
+            &self,
+            chat_id: i64,
+            html: &str,
+        ) -> Result<(), Box<dyn Error + Send + Sync>> {
+            self.record_send();
             if let Ok(mut sent) = self.sent.lock() {
                 sent.push((chat_id, html.to_string()));
             }
             Ok(())
         }
 
-        fn send_chat_action(&self, chat_id: i64, action: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+        fn send_chat_action(
+            &self,
+            chat_id: i64,
+            action: &str,
+        ) -> Result<(), Box<dyn Error + Send + Sync>> {
             if let Ok(mut actions) = self.actions.lock() {
                 actions.push((chat_id, action.to_string()));
             }
@@ -539,16 +625,103 @@ mod tests {
         }
     }
 
+    impl ScriptedTransport {
+        fn record_send(&self) {
+            let Some(events) = &self.events else {
+                return;
+            };
+            if let Ok(mut events) = events.lock() {
+                events.push("send".to_string());
+            }
+        }
+    }
+
     struct FakeHandler {
         seen: Vec<String>,
         reply: String,
+        events: Option<Arc<Mutex<Vec<String>>>>,
     }
 
     impl TurnHandler for FakeHandler {
-        fn handle(&mut self, text: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+        fn handle(&mut self, text: &str) -> Result<CompletedTurn, Box<dyn Error + Send + Sync>> {
             self.seen.push(text.to_string());
-            Ok(self.reply.clone())
+            if let Some(events) = &self.events
+                && let Ok(mut events) = events.lock()
+            {
+                events.push(format!("context:{text}"));
+                events.push(format!("assistant-appended:{text}"));
+            }
+            Ok(fake_completed(&self.reply, text))
         }
+    }
+
+    struct FailingHandler;
+
+    impl TurnHandler for FailingHandler {
+        fn handle(&mut self, _text: &str) -> Result<CompletedTurn, Box<dyn Error + Send + Sync>> {
+            Err("generation failed".into())
+        }
+    }
+
+    struct NoopMemoryRunner;
+
+    impl MemoryPassRunner for NoopMemoryRunner {
+        fn run(&self, _pass: PendingMemoryPass) -> Result<(), Box<dyn Error + Send + Sync>> {
+            Ok(())
+        }
+    }
+
+    struct RecordingMemoryRunner {
+        events: Arc<Mutex<Vec<String>>>,
+        fail: bool,
+    }
+
+    impl MemoryPassRunner for RecordingMemoryRunner {
+        fn run(&self, pass: PendingMemoryPass) -> Result<(), Box<dyn Error + Send + Sync>> {
+            if let Ok(mut events) = self.events.lock() {
+                events.push(format!("memory:{}", pass.user_msg));
+            }
+            if self.fail {
+                return Err("memory failed".into());
+            }
+            Ok(())
+        }
+    }
+
+    fn fake_completed(answer: &str, text: &str) -> CompletedTurn {
+        CompletedTurn {
+            answer: answer.to_string(),
+            memory_pass: PendingMemoryPass {
+                seats: fake_seats(),
+                user_msg: text.to_string(),
+                answer: answer.to_string(),
+                turn_id: "turn-test".to_string(),
+            },
+        }
+    }
+
+    fn fake_seats() -> MemorySeats {
+        MemorySeats {
+            classifier: Arc::new(StubLlm),
+            scribe: Arc::new(StubLlm),
+            heavy: Arc::new(StubLlm),
+            embed: Arc::new(StubEmbed),
+        }
+    }
+
+    fn fake_handler(reply: &str) -> FakeHandler {
+        FakeHandler {
+            seen: Vec::new(),
+            reply: reply.to_string(),
+            events: None,
+        }
+    }
+
+    fn recorded_events(events: &Mutex<Vec<String>>) -> Vec<String> {
+        let Ok(events) = events.lock() else {
+            unreachable!("events lock held")
+        };
+        events.clone()
     }
 
     fn fast_gateway(allowed_user_id: i64) -> Gateway {
@@ -556,6 +729,16 @@ mod tests {
             allowed_user_id,
             offset: 0,
             backoff: Duration::ZERO,
+            memory_runner: Box::new(NoopMemoryRunner),
+        }
+    }
+
+    fn recording_gateway(events: Arc<Mutex<Vec<String>>>, fail: bool) -> Gateway {
+        Gateway {
+            allowed_user_id: 42,
+            offset: 0,
+            backoff: Duration::ZERO,
+            memory_runner: Box::new(RecordingMemoryRunner { events, fail }),
         }
     }
 
@@ -566,13 +749,23 @@ mod tests {
         }]})
     }
 
+    fn two_update_batch() -> Value {
+        json!({"result": [
+            {
+                "update_id": 1,
+                "message": {"from": {"id": 42}, "chat": {"id": 100}, "text": "first"}
+            },
+            {
+                "update_id": 2,
+                "message": {"from": {"id": 42}, "chat": {"id": 100}, "text": "second"}
+            }
+        ]})
+    }
+
     #[test]
     fn an_update_from_the_wrong_user_is_dropped_with_no_reply() {
         let transport = ScriptedTransport::new(vec![Ok(update_batch(1, 999, "hi"))]);
-        let mut handler = FakeHandler {
-            seen: Vec::new(),
-            reply: "answer".to_string(),
-        };
+        let mut handler = fake_handler("answer");
         let stop = AtomicBool::new(false);
         let mut report = fake_report();
         let mut gateway = fast_gateway(42);
@@ -584,10 +777,7 @@ mod tests {
     #[test]
     fn an_update_from_the_allowed_user_is_processed_and_answered() {
         let transport = ScriptedTransport::new(vec![Ok(update_batch(1, 42, "hi"))]);
-        let mut handler = FakeHandler {
-            seen: Vec::new(),
-            reply: "answer".to_string(),
-        };
+        let mut handler = fake_handler("answer");
         let stop = AtomicBool::new(false);
         let mut report = fake_report();
         let mut gateway = fast_gateway(42);
@@ -604,10 +794,7 @@ mod tests {
             "message": {"from": {"id": 42}, "chat": {"id": 100}}
         }]});
         let transport = ScriptedTransport::new(vec![Ok(batch)]);
-        let mut handler = FakeHandler {
-            seen: Vec::new(),
-            reply: "answer".to_string(),
-        };
+        let mut handler = fake_handler("answer");
         let stop = AtomicBool::new(false);
         let mut report = fake_report();
         let mut gateway = fast_gateway(42);
@@ -622,10 +809,7 @@ mod tests {
             Err("network down".to_string()),
             Ok(update_batch(3, 42, "after error")),
         ]);
-        let mut handler = FakeHandler {
-            seen: Vec::new(),
-            reply: "answer".to_string(),
-        };
+        let mut handler = fake_handler("answer");
         let stop = AtomicBool::new(false);
         let mut report = fake_report();
         let mut gateway = fast_gateway(42);
@@ -633,6 +817,68 @@ mod tests {
         poll(&mut gateway, &transport, &mut handler, &mut report, &stop);
         poll(&mut gateway, &transport, &mut handler, &mut report, &stop);
         assert_eq!(handler.seen, vec!["after error".to_string()]);
+    }
+
+    #[test]
+    fn answer_is_sent_before_memory_and_memory_finishes_before_the_next_turn() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport =
+            ScriptedTransport::recording(vec![Ok(two_update_batch())], Arc::clone(&events));
+        let mut handler = FakeHandler {
+            seen: Vec::new(),
+            reply: "answer".to_string(),
+            events: Some(Arc::clone(&events)),
+        };
+        let stop = AtomicBool::new(false);
+        let mut report = fake_report();
+        let mut gateway = recording_gateway(Arc::clone(&events), false);
+
+        poll(&mut gateway, &transport, &mut handler, &mut report, &stop);
+
+        let recorded = recorded_events(&events);
+        assert_eq!(
+            recorded,
+            vec![
+                "context:first",
+                "assistant-appended:first",
+                "send",
+                "memory:first",
+                "context:second",
+                "assistant-appended:second",
+                "send",
+                "memory:second",
+            ]
+        );
+    }
+
+    #[test]
+    fn memory_failure_after_send_does_not_send_a_broken_turn_reply() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let transport =
+            ScriptedTransport::recording(vec![Ok(update_batch(1, 42, "hi"))], Arc::clone(&events));
+        let mut handler = fake_handler("answer");
+        let stop = AtomicBool::new(false);
+        let mut report = fake_report();
+        let mut gateway = recording_gateway(Arc::clone(&events), true);
+
+        poll(&mut gateway, &transport, &mut handler, &mut report, &stop);
+
+        assert_eq!(transport.sent_texts().len(), 1);
+        assert!(transport.sent_texts()[0].contains("answer"));
+        assert_eq!(recorded_events(&events), ["send", "memory:hi"]);
+    }
+
+    #[test]
+    fn generation_failure_still_sends_the_broken_turn_reply() {
+        let transport = ScriptedTransport::new(vec![Ok(update_batch(1, 42, "hi"))]);
+        let mut handler = FailingHandler;
+        let stop = AtomicBool::new(false);
+        let mut report = fake_report();
+        let mut gateway = fast_gateway(42);
+
+        poll(&mut gateway, &transport, &mut handler, &mut report, &stop);
+
+        assert_eq!(transport.sent_texts(), vec![super::BROKEN_TURN_REPLY]);
     }
 
     #[test]
