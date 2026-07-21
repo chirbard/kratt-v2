@@ -15,6 +15,7 @@ use crate::memory::{self, MemoryEvent, MemorySeats};
 use crate::runlog;
 use crate::session;
 use crate::timeutil;
+use crate::trace::{TraceContext, TracingClient};
 use crate::turn;
 use crate::web::SearchClient;
 
@@ -380,11 +381,14 @@ impl TurnHandler for LiveTurnHandler {
         let session_path = self.session_path();
         let prior_path = prior_session_path();
         let turn_id = session::append_entry(&session_path, "user", text);
+        let trace_context = TraceContext::new("chat");
+        let traced_llm = TracingClient::wrap(Arc::clone(&self.chat_llm), trace_context.clone());
         let clients = turn::TurnClients {
-            llm: &*self.chat_llm,
+            llm: &*traced_llm,
             embed: &*self.embed,
             search: self.search.as_deref(),
             style_hint: Some(TELEGRAM_STYLE_HINT),
+            trace: &trace_context,
         };
         let answer = turn::run_turn_collecting(
             &clients,

@@ -7,6 +7,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{Chunk, LlmClient, Stats, ToolCallRequest, TurnOutcome};
+use crate::trace::{self, ResponseRecord, TraceSpan};
 
 #[derive(Deserialize)]
 struct ToolCallFunctionDelta {
@@ -71,6 +72,14 @@ struct StreamState {
     saw_prompt_tokens: bool,
     tool_calls: Vec<ToolCallAcc>,
     finish_reason: Option<String>,
+    content: String,
+    reasoning: String,
+}
+
+struct ApiTrace<'scope> {
+    span: &'scope TraceSpan,
+    provider: &'scope str,
+    model: &'scope str,
 }
 
 pub(super) struct OpenRouterClient {
@@ -137,8 +146,102 @@ impl LlmClient for OpenRouterClient {
         tools: Option<&Value>,
         sender: &Sender<Chunk>,
     ) -> Result<TurnOutcome, Box<dyn std::error::Error + Send + Sync>> {
-        let resp = make_request_messages(&self.api_key, &self.model, &self.url, messages, tools)?;
-        stream_response(resp, sender, request_area(messages))
+        self.run_stream_turn(messages, tools, sender, None)
+    }
+
+    fn stream_traced(
+        &self,
+        prompt: String,
+        system: Option<String>,
+        sender: Sender<Chunk>,
+        span: &TraceSpan,
+    ) {
+        let messages = build_stream_messages(prompt, system);
+        match self.run_stream_turn(&messages, None, &sender, Some(span)) {
+            Ok(TurnOutcome::Done(stats)) => {
+                let _ = sender.send(Chunk::Done(stats));
+            }
+            Ok(TurnOutcome::ToolCalls(_)) => {
+                let _ = sender.send(Chunk::Err("unexpected tool call".to_string()));
+            }
+            Err(err) => {
+                let _ = sender.send(Chunk::Err(err.to_string()));
+            }
+        }
+    }
+
+    fn stream_turn_traced(
+        &self,
+        messages: &[Value],
+        tools: Option<&Value>,
+        sender: &Sender<Chunk>,
+        span: &TraceSpan,
+    ) -> Result<TurnOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        self.run_stream_turn(messages, tools, sender, Some(span))
+    }
+}
+
+impl OpenRouterClient {
+    fn run_stream_turn(
+        &self,
+        messages: &[Value],
+        tools: Option<&Value>,
+        sender: &Sender<Chunk>,
+        span: Option<&TraceSpan>,
+    ) -> Result<TurnOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        let body = request_body(&self.model, messages, tools);
+        let provider = provider_name(&self.url);
+        if let Some(span) = span {
+            trace::request(span, provider, &self.model, body.clone());
+        }
+        let started = Instant::now();
+        let resp = send_traced_request(self, &body, provider, span, started)?;
+        #[allow(clippy::manual_map)]
+        let api_trace = match span {
+            Some(span) => Some(ApiTrace {
+                span,
+                provider,
+                model: &self.model,
+            }),
+            None => None,
+        };
+        let result = stream_response(resp, sender, request_area(messages), api_trace);
+        if let Err(err) = &result
+            && let Some(span) = span
+        {
+            trace::error(
+                span,
+                provider,
+                &self.model,
+                &err.to_string(),
+                started.elapsed().as_millis(),
+            );
+        }
+        result
+    }
+}
+
+fn send_traced_request(
+    client: &OpenRouterClient,
+    body: &Value,
+    provider: &str,
+    span: Option<&TraceSpan>,
+    started: Instant,
+) -> Result<reqwest::blocking::Response, Box<dyn std::error::Error + Send + Sync>> {
+    match send_request(&client.api_key, &client.url, body) {
+        Ok(response) => Ok(response),
+        Err(err) => {
+            if let Some(span) = span {
+                trace::error(
+                    span,
+                    provider,
+                    &client.model,
+                    &err,
+                    started.elapsed().as_millis(),
+                );
+            }
+            Err(err.into())
+        }
     }
 }
 
@@ -173,13 +276,7 @@ fn build_stream_messages(prompt: String, system: Option<String>) -> Vec<Value> {
     messages
 }
 
-fn make_request_messages(
-    api_key: &str,
-    model: &str,
-    url: &str,
-    messages: &[Value],
-    tools: Option<&Value>,
-) -> Result<reqwest::blocking::Response, String> {
+fn request_body(model: &str, messages: &[Value], tools: Option<&Value>) -> Value {
     let mut body = json!({
         "model": model,
         "messages": messages,
@@ -189,10 +286,18 @@ fn make_request_messages(
     if let Some(tool_defs) = tools {
         insert_tools(&mut body, tool_defs);
     }
+    body
+}
+
+fn send_request(
+    api_key: &str,
+    url: &str,
+    body: &Value,
+) -> Result<reqwest::blocking::Response, String> {
     let resp = match Client::new()
         .post(url)
         .bearer_auth(api_key)
-        .json(&body)
+        .json(body)
         .send()
     {
         Ok(resp) => resp,
@@ -206,16 +311,25 @@ fn make_request_messages(
     Ok(resp)
 }
 
+fn provider_name(url: &str) -> &'static str {
+    if url.contains("openrouter.ai") {
+        "openrouter"
+    } else {
+        "openai-compatible"
+    }
+}
+
 fn insert_tools(body: &mut Value, tool_defs: &Value) {
     if let Some(map) = body.as_object_mut() {
         map.insert("tools".to_string(), tool_defs.clone());
     }
 }
 
-fn stream_response(
+fn stream_response<'scope>(
     resp: reqwest::blocking::Response,
     sender: &Sender<Chunk>,
     area: &'static str,
+    trace_info: Option<ApiTrace<'scope>>,
 ) -> Result<TurnOutcome, Box<dyn std::error::Error + Send + Sync>> {
     let mut state = StreamState {
         start: Instant::now(),
@@ -227,6 +341,8 @@ fn stream_response(
         saw_prompt_tokens: false,
         tool_calls: Vec::new(),
         finish_reason: None,
+        content: String::new(),
+        reasoning: String::new(),
     };
     let reader = BufReader::new(resp);
     for line_result in reader.lines() {
@@ -240,7 +356,43 @@ fn stream_response(
         }
     }
     log_cached_usage(area, &state);
+    if let Some(trace_info) = trace_info {
+        trace_response(&state, trace_info);
+    }
     Ok(build_turn_outcome(state))
+}
+
+fn trace_response<'scope>(state: &StreamState, trace_info: ApiTrace<'scope>) {
+    let content = json!({
+        "content": state.content,
+        "reasoning": state.reasoning,
+        "tool_calls": tool_calls_json(&state.tool_calls),
+    });
+    let usage = json!({
+        "prompt_tokens": state.tokens_in,
+        "completion_tokens": state.tokens_out,
+        "cost_usd": state.cost_usd,
+        "cached_tokens": state.cached_tokens,
+    });
+    trace::response(
+        trace_info.span,
+        trace_info.provider,
+        trace_info.model,
+        ResponseRecord {
+            content,
+            finish_reason: state.finish_reason.clone(),
+            usage,
+            duration_ms: state.start.elapsed().as_millis(),
+        },
+    );
+}
+
+fn tool_calls_json(calls: &[ToolCallAcc]) -> Value {
+    let mut values = Vec::new();
+    for call in calls {
+        values.push(json!({"id": call.id, "name": call.name, "args": call.args}));
+    }
+    Value::Array(values)
 }
 
 fn log_cached_usage(area: &str, state: &StreamState) {
@@ -325,6 +477,7 @@ fn send_reasoning_delta(
         && !reasoning.is_empty()
     {
         record_ttft(state);
+        state.reasoning.push_str(&reasoning);
         let _ = sender.send(Chunk::Reasoning(reasoning));
     }
 }
@@ -334,6 +487,7 @@ fn send_content_delta(content: Option<String>, state: &mut StreamState, sender: 
         && !content.is_empty()
     {
         record_ttft(state);
+        state.content.push_str(&content);
         let _ = sender.send(Chunk::Content(content));
     }
 }
@@ -437,7 +591,10 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{StreamState, apply_usage, cached_usage_line, request_area};
+    use super::{
+        StreamState, apply_usage, cached_usage_line, request_area, request_body,
+        send_content_delta, send_reasoning_delta,
+    };
 
     fn stream_state() -> StreamState {
         StreamState {
@@ -450,7 +607,33 @@ mod tests {
             saw_prompt_tokens: false,
             tool_calls: Vec::new(),
             finish_reason: None,
+            content: String::new(),
+            reasoning: String::new(),
         }
+    }
+
+    #[test]
+    fn traced_request_body_is_the_full_wire_payload_with_tools() {
+        let messages = vec![json!({"role": "user", "content": "hello"})];
+        let tools = json!([{"type": "function", "function": {"name": "search"}}]);
+        let body = request_body("model-name", &messages, Some(&tools));
+        assert_eq!(body["model"], "model-name");
+        assert_eq!(body["messages"], serde_json::Value::Array(messages));
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["tools"], tools);
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn response_accumulator_keeps_forwarded_content_and_reasoning() {
+        let (sender, _receiver) = std::sync::mpsc::channel();
+        let mut state = stream_state();
+        send_reasoning_delta(Some("because ".to_string()), &mut state, &sender);
+        send_reasoning_delta(Some("facts".to_string()), &mut state, &sender);
+        send_content_delta(Some("final ".to_string()), &mut state, &sender);
+        send_content_delta(Some("answer".to_string()), &mut state, &sender);
+        assert_eq!(state.reasoning, "because facts");
+        assert_eq!(state.content, "final answer");
     }
 
     #[test]

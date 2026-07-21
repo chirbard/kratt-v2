@@ -11,6 +11,7 @@ use crate::memory;
 use crate::prompts;
 use crate::runlog;
 use crate::session;
+use crate::trace::TraceContext;
 use crate::web::SearchClient;
 
 // How many prior user/assistant turns to replay into the system prompt.
@@ -60,6 +61,7 @@ pub(crate) struct TurnClients<'cl> {
     pub embed: &'cl dyn EmbeddingClient,
     pub search: Option<&'cl dyn SearchClient>,
     pub style_hint: Option<&'cl str>,
+    pub trace: &'cl TraceContext,
 }
 
 pub(crate) fn prepare_stream_context(
@@ -126,7 +128,12 @@ pub(crate) fn run_turn_collecting(
         match outcome {
             TurnOutcome::Done(_) => break,
             TurnOutcome::ToolCalls(calls) => {
-                execute_tool_turn(clients.search, session_path, &sender, &calls, &mut messages);
+                let context = ToolExecutionContext {
+                    search: clients.search,
+                    session_path,
+                    sender: &sender,
+                };
+                execute_tool_turn(&context, &calls, &mut messages, clients.trace);
             }
         }
     }
@@ -385,18 +392,39 @@ fn shorten_belief(text: &str, max_chars: usize) -> String {
     output
 }
 
-pub(crate) fn execute_tool_turn(
-    search: Option<&dyn SearchClient>,
-    session_path: &Path,
-    sender: &Sender<Chunk>,
+pub(crate) struct ToolExecutionContext<'ctx> {
+    pub(crate) search: Option<&'ctx dyn SearchClient>,
+    pub(crate) session_path: &'ctx Path,
+    pub(crate) sender: &'ctx Sender<Chunk>,
+}
+
+pub(crate) fn execute_tool_turn<'context>(
+    context: &ToolExecutionContext<'context>,
     calls: &[ToolCallRequest],
     messages: &mut Vec<Value>,
+    trace_context: &TraceContext,
 ) {
     messages.push(build_tool_call_message(calls));
     for call in calls {
-        let _ = sender.send(Chunk::ToolCall(format!("{}: running…", call.name)));
-        let result = execute_tool(call, search, session_path);
-        let _ = sender.send(Chunk::ToolCall(format!("{}: done", call.name)));
+        crate::trace::tool(
+            trace_context,
+            "tool_call",
+            &call.id,
+            json!({"name": call.name, "arguments": call.args}),
+        );
+        let _ = context
+            .sender
+            .send(Chunk::ToolCall(format!("{}: running…", call.name)));
+        let result = execute_tool(call, context.search, context.session_path);
+        crate::trace::tool(
+            trace_context,
+            "tool_result",
+            &call.id,
+            json!({"name": call.name, "result": &result}),
+        );
+        let _ = context
+            .sender
+            .send(Chunk::ToolCall(format!("{}: done", call.name)));
         messages.push(json!({
             "role": "tool",
             "tool_call_id": call.id,

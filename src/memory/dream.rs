@@ -56,6 +56,8 @@ pub fn run_dream_pass(
     sender: std::sync::mpsc::Sender<DreamEvent>,
 ) -> Result<usize, Box<dyn Error + Send + Sync>> {
     let _timer = runlog::time_step("dream", "pass");
+    let trace_context = crate::trace::TraceContext::new("dream");
+    let llm = crate::trace::TracingClient::wrap(llm, trace_context);
     let result = {
         let _write_guard = db::acquire_write_lock();
         execute_dream_pass(Arc::clone(&llm), Arc::clone(&embed), &sender)

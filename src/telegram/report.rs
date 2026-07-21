@@ -114,10 +114,9 @@ impl ReportCycle {
     // the report never silently vanishes. The verdict ask is appended in code.
     fn compose_message(&self, digest: &DayDigest) -> String {
         let digest_text = render_digest(digest);
-        let body = match self
-            .memory_llm
-            .collect(&prompts::build_daily_report_prompt(&digest_text))
-        {
+        let trace_context = crate::trace::TraceContext::new("report");
+        let llm = crate::trace::TracingClient::wrap(Arc::clone(&self.memory_llm), trace_context);
+        let body = match llm.collect(&prompts::build_daily_report_prompt(&digest_text)) {
             Ok(text) if !text.trim().is_empty() => text.trim().to_string(),
             Ok(_) | Err(_) => {
                 runlog::log("tg", "daily report: LLM phrasing failed, sending digest");

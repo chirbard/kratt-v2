@@ -70,6 +70,8 @@ pub fn run_ingestion_pass(
     path: PathBuf,
     sender: Sender<IngestEvent>,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let trace_context = crate::trace::TraceContext::new("ingest");
+    let llm = crate::trace::TracingClient::wrap(llm, trace_context);
     let result = execute_ingestion_pass(llm, embed, search, (&path, ""), &sender);
     db::sync_push_best_effort("ingest");
     result
@@ -82,6 +84,8 @@ pub fn run_focused_ingestion_pass(
     request: (&Path, &str),
     sender: Sender<IngestEvent>,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let trace_context = crate::trace::TraceContext::new("ingest");
+    let llm = crate::trace::TracingClient::wrap(llm, trace_context);
     let result = execute_ingestion_pass(llm, embed, search, request, &sender);
     db::sync_push_best_effort("ingest");
     result
