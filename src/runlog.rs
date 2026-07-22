@@ -52,9 +52,5 @@ pub fn log(area: &str, text: &str) {
 }
 
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn timing_format_includes_step_and_zero_milliseconds() {
-        assert_eq!(super::format_timing("test step", 0), "test step took 0ms");
-    }
-}
+#[path = "runlog_tests.rs"]
+mod tests;
