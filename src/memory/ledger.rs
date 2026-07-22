@@ -171,16 +171,6 @@ impl Event {
         )
     }
 
-    pub fn promoted(actor: Actor, edge: EdgeRef, context: EventContext, payload: String) -> Self {
-        Self::new(
-            actor,
-            "promoted",
-            edge,
-            context,
-            EventBody::new(1.0, payload),
-        )
-    }
-
     pub fn sequence(
         event_type: &str,
         edge: EdgeRef,
