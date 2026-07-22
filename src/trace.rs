@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs::{self as filesystem, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Sender, channel};
@@ -21,7 +21,7 @@ use crate::api::{Chunk, LlmClient, TurnOutcome};
 use crate::{paths, runlog, timeutil};
 
 const SCHEMA_VERSION: u32 = 1;
-const TRACE_FILE_CAP: usize = 100; // replay-tunable
+const TRACE_DAY_CAP: usize = 100; // replay-tunable
 const TRACE_BYTE_CAP: u64 = 512 * 1024 * 1024; // replay-tunable
 
 #[derive(Clone)]
@@ -285,6 +285,43 @@ struct WriteRequest {
     done: Sender<()>,
 }
 
+#[derive(Default)]
+struct WriterState {
+    sequences: HashMap<String, u64>,
+    flows: HashMap<String, FlowLayout>,
+}
+
+struct FlowLayout {
+    day: String,
+    folder: String,
+    start_time: String,
+    spans: HashMap<String, SpanLayout>,
+    next_span: usize,
+}
+
+#[derive(Clone)]
+struct SpanLayout {
+    index: usize,
+    agent: String,
+    start_time: String,
+    file_stem: String,
+}
+
+struct RecordPaths {
+    day_dir: PathBuf,
+    flow_dir: PathBuf,
+    jsonl: PathBuf,
+    human: PathBuf,
+    flow_start: String,
+    span: SpanLayout,
+}
+
+struct TraceTime {
+    day: String,
+    compact: String,
+    clock: String,
+}
+
 pub(crate) fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("KRATT_TRACE").is_ok_and(|value| value == "1"))
@@ -318,10 +355,10 @@ fn writer_sender() -> Option<&'static Sender<WriteRequest>> {
 }
 
 fn writer_loop(receiver: std::sync::mpsc::Receiver<WriteRequest>) {
-    let mut sequences: HashMap<String, u64> = HashMap::new();
+    let mut state = WriterState::default();
     for mut request in receiver {
-        assign_sequence(&mut request.record, &mut sequences);
-        if let Err(err) = write_record(&request.record) {
+        assign_sequence(&mut request.record, &mut state.sequences);
+        if let Err(err) = write_record(&request.record, &mut state) {
             log_writer_error_once(&err.to_string());
         }
         let _ = request.done.send(());
@@ -334,31 +371,179 @@ fn assign_sequence(record: &mut TraceRecord, sequences: &mut HashMap<String, u64
     record.sequence = *sequence;
 }
 
-fn write_record(record: &TraceRecord) -> Result<(), Box<dyn Error + Send + Sync>> {
+fn write_record(
+    record: &TraceRecord,
+    state: &mut WriterState,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let dir = trace_dir();
-    write_record_to(record, &dir)
+    write_record_to(record, &dir, state)
 }
 
-fn write_record_to(record: &TraceRecord, dir: &Path) -> Result<(), Box<dyn Error + Send + Sync>> {
-    filesystem::create_dir_all(dir)?;
-    set_dir_permissions(dir)?;
-    let path = dir.join(format!("{}.jsonl", safe_id(&record.trace_id)));
-    let is_new = !path.exists();
-    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-    set_file_permissions(&path)?;
+fn write_record_to(
+    record: &TraceRecord,
+    dir: &Path,
+    state: &mut WriterState,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut scrubbed = record.clone();
     redact_record(&mut scrubbed);
-    serde_json::to_writer(&mut file, &scrubbed)?;
+    let paths = record_paths(&scrubbed, dir, state);
+    prepare_trace_dirs(dir, &paths)?;
+    append_jsonl(&paths.jsonl, &scrubbed)?;
+    append_human(&paths, &scrubbed)?;
+    prune_traces(dir)?;
+    Ok(())
+}
+
+fn prepare_trace_dirs(root: &Path, paths: &RecordPaths) -> std::io::Result<()> {
+    filesystem::create_dir_all(&paths.flow_dir)?;
+    set_dir_permissions(root)?;
+    set_dir_permissions(&paths.day_dir)?;
+    set_dir_permissions(&paths.flow_dir)
+}
+
+fn append_jsonl(path: &Path, record: &TraceRecord) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    set_file_permissions(path)?;
+    serde_json::to_writer(&mut file, record)?;
     file.write_all(b"\n")?;
     file.flush()?;
-    if is_new {
-        prune_traces(dir)?;
-    }
     Ok(())
+}
+
+fn append_human(paths: &RecordPaths, record: &TraceRecord) -> std::io::Result<()> {
+    let is_new = !paths.human.exists();
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&paths.human)?;
+    set_file_permissions(&paths.human)?;
+    if is_new {
+        file.write_all(render_file_header(paths, record).as_bytes())?;
+    }
+    file.write_all(render_human_record(record).as_bytes())?;
+    file.flush()
 }
 
 fn trace_dir() -> PathBuf {
     PathBuf::from(paths::data_file("traces"))
+}
+
+fn record_paths(record: &TraceRecord, root: &Path, state: &mut WriterState) -> RecordPaths {
+    let flow = state
+        .flows
+        .entry(record.trace_id.clone())
+        .or_insert_with(|| FlowLayout::new(record));
+    let span_key = routing_span_id(record).to_string();
+    let span = match flow.spans.entry(span_key) {
+        std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            flow.next_span += 1;
+            entry.insert(SpanLayout::new(record, flow.next_span)).clone()
+        }
+    };
+    let day_dir = root.join(&flow.day);
+    let flow_dir = day_dir.join(&flow.folder);
+    RecordPaths {
+        jsonl: flow_dir.join(format!("{}.jsonl", span.file_stem)),
+        human: flow_dir.join(format!("{}.txt", span.file_stem)),
+        day_dir,
+        flow_dir,
+        flow_start: flow.start_time.clone(),
+        span,
+    }
+}
+
+impl FlowLayout {
+    fn new(record: &TraceRecord) -> Self {
+        let time = TraceTime::from_timestamp(&record.timestamp);
+        let activity = safe_component(&record.activity, "trace");
+        let folder = format!(
+            "{}-{}-{}",
+            time.compact,
+            activity,
+            short_id(&record.trace_id)
+        );
+        Self {
+            day: time.day,
+            folder,
+            start_time: time.compact,
+            spans: HashMap::new(),
+            next_span: 0,
+        }
+    }
+}
+
+impl SpanLayout {
+    fn new(record: &TraceRecord, index: usize) -> Self {
+        let time = TraceTime::from_timestamp(&record.timestamp);
+        let agent = trace_agent(record);
+        Self {
+            index,
+            file_stem: format!("{index:02}-{agent}-{}", time.compact),
+            agent,
+            start_time: time.compact,
+        }
+    }
+}
+
+impl TraceTime {
+    fn from_timestamp(timestamp: &str) -> Self {
+        let day = timestamp.get(0..10).unwrap_or("unknown-day").to_string();
+        let hour = timestamp.get(11..13).unwrap_or("00");
+        let minute = timestamp.get(14..16).unwrap_or("00");
+        let second = timestamp.get(17..19).unwrap_or("00");
+        Self {
+            day,
+            compact: format!("{hour}{minute}{second}"),
+            clock: format!("{hour}:{minute}:{second}"),
+        }
+    }
+}
+
+fn routing_span_id(record: &TraceRecord) -> &str {
+    if matches!(record.kind, TraceKind::ToolCall | TraceKind::ToolResult)
+        && !record.parent.is_empty()
+    {
+        &record.parent
+    } else {
+        &record.span_id
+    }
+}
+
+fn trace_agent(record: &TraceRecord) -> String {
+    let agent = match record.seat.as_deref() {
+        Some(seat) => seat,
+        None if record.activity == "chat" => "answering",
+        None => &record.activity,
+    };
+    safe_component(agent, "agent")
+}
+
+fn safe_component(value: &str, fallback: &str) -> String {
+    let mut safe = String::new();
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+            safe.push(character.to_ascii_lowercase());
+        } else if !safe.ends_with('-') {
+            safe.push('-');
+        }
+    }
+    let trimmed = safe.trim_matches('-');
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn short_id(trace_id: &str) -> String {
+    let safe = safe_id(trace_id);
+    let mut reversed: String = safe.chars().rev().take(6).collect();
+    if reversed.is_empty() {
+        return "trace".to_string();
+    }
+    reversed = reversed.chars().rev().collect();
+    reversed.to_ascii_lowercase()
 }
 
 fn safe_id(trace_id: &str) -> String {
@@ -369,6 +554,277 @@ fn safe_id(trace_id: &str) -> String {
         }
     }
     safe
+}
+
+fn render_file_header(paths: &RecordPaths, record: &TraceRecord) -> String {
+    let mut identity = format!("{} · seat={}", record.activity, paths.span.agent);
+    if let Some(model) = &record.model {
+        if model.contains('/') {
+            identity.push_str(&format!(" · {model}"));
+        } else if let Some(provider) = &record.provider {
+            identity.push_str(&format!(" · {provider}/{model}"));
+        } else {
+            identity.push_str(&format!(" · {model}"));
+        }
+    }
+    format!(
+        "════════════════════════════════════════\n{identity}\nflow {}  ·  span {}  ·  round {:02}\n════════════════════════════════════════\n\n",
+        paths.flow_start, paths.span.start_time, paths.span.index
+    )
+}
+
+fn render_human_record(record: &TraceRecord) -> String {
+    match record.kind {
+        TraceKind::Request => render_request(record),
+        TraceKind::Response => render_response(record),
+        TraceKind::ToolCall => render_tool_call(record),
+        TraceKind::ToolResult => render_tool_result(record),
+        TraceKind::Error => render_error(record),
+        TraceKind::Compacted | TraceKind::PartialResponse => render_generic(record),
+    }
+}
+
+fn render_request(record: &TraceRecord) -> String {
+    let mut output = record_header("REQUEST", record, "");
+    let Some(content) = &record.content else {
+        output.push_str("(no request body)\n\n");
+        return output;
+    };
+    if let Some(messages) = array_field(content, "messages") {
+        render_messages(&mut output, messages);
+    } else {
+        output.push_str(&readable_value(content));
+        output.push_str("\n\n");
+    }
+    render_tools_summary(&mut output, content.get("tools"));
+    output
+}
+
+fn render_messages(output: &mut String, messages: &[Value]) {
+    for message in messages {
+        let role = string_field(message, "role").unwrap_or("message");
+        output.push_str(&format!("[{role}]\n"));
+        match message.get("content") {
+            Some(content) => output.push_str(&readable_value(content)),
+            None => output.push_str("(no content)"),
+        }
+        if let Some(calls) = array_field(message, "tool_calls") {
+            output.push_str("\n[tool_calls]\n");
+            render_calls(output, calls);
+        }
+        output.push_str("\n\n");
+    }
+}
+
+fn render_tools_summary(output: &mut String, tools: Option<&Value>) {
+    let Some(Value::Array(tools)) = tools else {
+        return;
+    };
+    if tools.is_empty() {
+        return;
+    }
+    let mut names = Vec::new();
+    for tool in tools.iter().take(6) {
+        names.push(tool_name(tool).unwrap_or("unnamed"));
+    }
+    output.push_str("tools: ");
+    output.push_str(&names.join(", "));
+    output.push_str(&format!("   ({} total)\n\n", tools.len()));
+}
+
+fn render_response(record: &TraceRecord) -> String {
+    let details = response_details(record);
+    let mut output = record_header("RESPONSE", record, &details);
+    let Some(content) = &record.content else {
+        output.push_str("(empty response)\n\n");
+        return output;
+    };
+    render_response_content(&mut output, content);
+    output.push('\n');
+    output
+}
+
+fn render_response_content(output: &mut String, content: &Value) {
+    let Some(object) = content.as_object() else {
+        output.push_str(&readable_value(content));
+        output.push('\n');
+        return;
+    };
+    if let Some(value) = object.get("content")
+        && !value.is_null()
+    {
+        output.push_str(&readable_value(value));
+        output.push('\n');
+    }
+    if let Some(reasoning) = object.get("reasoning")
+        && !reasoning.as_str().unwrap_or("").is_empty()
+    {
+        output.push_str("\n[reasoning]\n");
+        output.push_str(&readable_value(reasoning));
+        output.push('\n');
+    }
+    if let Some(calls) = array_field(content, "tool_calls")
+        && !calls.is_empty()
+    {
+        output.push_str("\n[tool_calls]\n");
+        render_calls(output, calls);
+    }
+}
+
+fn response_details(record: &TraceRecord) -> String {
+    let mut details = Vec::new();
+    if let Some(reason) = &record.finish_reason {
+        details.push(format!("finish={reason}"));
+    }
+    if let Some(tokens) = usage_tokens(record.usage.as_ref()) {
+        details.push(format!("{tokens} tok"));
+    }
+    if let Some(duration) = record.duration_ms {
+        details.push(format_duration(duration));
+    }
+    details.join(", ")
+}
+
+fn usage_tokens(usage: Option<&Value>) -> Option<u64> {
+    let usage = usage?;
+    let prompt = u64_field(usage, "prompt_tokens").unwrap_or(0);
+    let completion = u64_field(usage, "completion_tokens").unwrap_or(0);
+    if prompt == 0 && completion == 0 {
+        None
+    } else {
+        Some(prompt + completion)
+    }
+}
+
+fn format_duration(duration_ms: u128) -> String {
+    if duration_ms < 1_000 {
+        format!("{duration_ms}ms")
+    } else {
+        format!("{:.1}s", duration_ms as f64 / 1_000.0)
+    }
+}
+
+fn render_tool_call(record: &TraceRecord) -> String {
+    let mut output = record_header("TOOL CALL", record, tool_id(record));
+    if let Some(content) = &record.content {
+        output.push_str(&render_call(content));
+    } else {
+        output.push_str("(no tool call body)");
+    }
+    output.push_str("\n\n");
+    output
+}
+
+fn render_tool_result(record: &TraceRecord) -> String {
+    let mut output = record_header("TOOL RESULT", record, tool_id(record));
+    let Some(content) = &record.content else {
+        output.push_str("(no tool result)\n\n");
+        return output;
+    };
+    if let Some(name) = string_field(content, "name") {
+        output.push_str(&format!("{name}\n"));
+    }
+    match content.get("result") {
+        Some(result) => output.push_str(&readable_value(result)),
+        None => output.push_str(&readable_value(content)),
+    }
+    output.push_str("\n\n");
+    output
+}
+
+fn render_error(record: &TraceRecord) -> String {
+    let details = match record.duration_ms {
+        Some(duration) => format_duration(duration),
+        None => String::new(),
+    };
+    let mut output = record_header("ERROR", record, &details);
+    output.push_str(record.error.as_deref().unwrap_or("unknown error"));
+    output.push_str("\n\n");
+    output
+}
+
+fn render_generic(record: &TraceRecord) -> String {
+    let mut output = record_header(record.kind.as_str(), record, "");
+    if let Some(content) = &record.content {
+        output.push_str(&readable_value(content));
+    }
+    output.push_str("\n\n");
+    output
+}
+
+fn record_header(label: &str, record: &TraceRecord, details: &str) -> String {
+    let time = TraceTime::from_timestamp(&record.timestamp).clock;
+    let label = label.to_ascii_uppercase();
+    if details.is_empty() {
+        format!("── {label}  {time} ────────────────────\n")
+    } else {
+        format!("── {label}  {time}  ({details}) ──\n")
+    }
+}
+
+fn render_calls(output: &mut String, calls: &[Value]) {
+    for call in calls {
+        output.push_str(&render_call(call));
+        output.push('\n');
+    }
+}
+
+fn render_call(call: &Value) -> String {
+    let name = tool_name(call).unwrap_or("tool");
+    let arguments = tool_arguments(call);
+    format!("{name}({})", readable_value(arguments.unwrap_or(&Value::Null)))
+}
+
+fn tool_name(value: &Value) -> Option<&str> {
+    if let Some(name) = string_field(value, "name") {
+        return Some(name);
+    }
+    let function = value.get("function")?;
+    string_field(function, "name")
+}
+
+fn tool_arguments(value: &Value) -> Option<&Value> {
+    if let Some(arguments) = value.get("arguments") {
+        return Some(arguments);
+    }
+    if let Some(arguments) = value.get("args") {
+        return Some(arguments);
+    }
+    let function = value.get("function")?;
+    function.get("arguments")
+}
+
+fn tool_id(record: &TraceRecord) -> &str {
+    record.tool_call_id.as_deref().unwrap_or("")
+}
+
+fn string_field<'value>(value: &'value Value, key: &str) -> Option<&'value str> {
+    match value.get(key) {
+        Some(field) => field.as_str(),
+        None => None,
+    }
+}
+
+fn u64_field(value: &Value, key: &str) -> Option<u64> {
+    match value.get(key) {
+        Some(field) => field.as_u64(),
+        None => None,
+    }
+}
+
+fn array_field<'value>(value: &'value Value, key: &str) -> Option<&'value [Value]> {
+    match value.get(key) {
+        Some(Value::Array(items)) => Some(items),
+        _ => None,
+    }
+}
+
+fn readable_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Null => String::new(),
+        _ => serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()),
+    }
 }
 
 fn new_id(prefix: &str) -> String {
@@ -434,25 +890,51 @@ fn redact_text(text: &str, secrets: &[String]) -> String {
 }
 
 fn prune_traces(dir: &Path) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let mut files = Vec::new();
+    let mut days = Vec::new();
     for entry in filesystem::read_dir(dir)? {
         let entry = entry?;
-        if entry.path().extension().is_some_and(|ext| ext == "jsonl") {
-            let metadata = entry.metadata()?;
-            files.push((metadata.modified()?, metadata.len(), entry.path()));
+        if entry.file_type()?.is_dir() && is_day_folder(&entry.file_name()) {
+            let size = directory_size(&entry.path())?;
+            days.push((entry.file_name(), size, entry.path()));
         }
     }
-    files.sort_by_key(|(modified, _, _)| *modified);
+    days.sort_by(|left, right| left.0.cmp(&right.0));
     let mut bytes = 0u64;
-    for (_, size, _) in &files {
+    for (_, size, _) in &days {
         bytes += size;
     }
-    while files.len() > TRACE_FILE_CAP || bytes > TRACE_BYTE_CAP {
-        let (_, size, path) = files.remove(0);
+    while days.len() > TRACE_DAY_CAP || bytes > TRACE_BYTE_CAP {
+        let (_, size, path) = days.remove(0);
         bytes = bytes.saturating_sub(size);
-        filesystem::remove_file(path)?;
+        filesystem::remove_dir_all(path)?;
     }
     Ok(())
+}
+
+fn is_day_folder(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    if name.len() != 10 || name.as_bytes()[4] != b'-' || name.as_bytes()[7] != b'-' {
+        return false;
+    }
+    for (index, character) in name.chars().enumerate() {
+        if index != 4 && index != 7 && !character.is_ascii_digit() {
+            return false;
+        }
+    }
+    true
+}
+
+fn directory_size(dir: &Path) -> std::io::Result<u64> {
+    let mut size = 0u64;
+    for entry in filesystem::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            size += directory_size(&entry.path())?;
+        } else {
+            size += entry.metadata()?.len();
+        }
+    }
+    Ok(size)
 }
 
 #[cfg(unix)]
@@ -484,48 +966,75 @@ fn log_writer_error_once(message: &str) {
     }
 }
 
-pub(crate) fn view(trace_id: &str) -> Result<(), Box<dyn Error>> {
-    let path = trace_dir().join(format!("{}.jsonl", safe_id(trace_id)));
-    let file = OpenOptions::new().read(true).open(path)?;
-    let mut records = Vec::new();
-    for line in BufReader::new(file).lines() {
-        records.push(serde_json::from_str::<TraceRecord>(&line?)?);
+pub(crate) fn view(target: &str) -> Result<(), Box<dyn Error>> {
+    let path = resolve_view_path(target)?;
+    if flow_text_files(&path)?.is_empty() {
+        list_day_flows(&path)?;
+    } else {
+        print_flow(&path)?;
     }
-    records.sort_by_key(|record| record.sequence);
-    print!("{}", render_tree(&records));
     Ok(())
 }
 
-fn render_tree(records: &[TraceRecord]) -> String {
-    let mut output = String::new();
-    let mut depths: HashMap<String, usize> = HashMap::new();
-    if let Some(first) = records.first() {
-        output.push_str(&format!("{} {}\n", first.activity, first.trace_id));
-        depths.insert(first.trace_id.clone(), 0);
+fn resolve_view_path(target: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let direct = PathBuf::from(target);
+    if direct.is_dir() {
+        return Ok(direct);
     }
-    for record in records {
-        let parent_depth = match depths.get(&record.parent) {
-            Some(depth) => *depth,
-            None => 0,
-        };
-        let depth = parent_depth + 1;
-        depths.insert(record.span_id.clone(), depth);
-        output.push_str(&"  ".repeat(depth));
-        output.push_str(&format!(
-            "{:04} {} {}",
-            record.sequence,
-            record.kind.as_str(),
-            record.span_id
-        ));
-        if let Some(call_id) = &record.tool_call_id {
-            output.push_str(&format!(" tool={call_id}"));
-        }
-        if let Some(status) = &record.status {
-            output.push_str(&format!(" [{status}]"));
-        }
-        output.push('\n');
+    let root = trace_dir();
+    let nested = root.join(target);
+    if nested.is_dir() {
+        return Ok(nested);
     }
-    output
+    for entry in filesystem::read_dir(&root)? {
+        let candidate = entry?.path().join(target);
+        if candidate.is_dir() {
+            return Ok(candidate);
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("trace day or flow not found: {target}"),
+    )
+    .into())
+}
+
+fn flow_text_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in filesystem::read_dir(dir)? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|extension| extension == "txt") {
+            files.push(path);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn list_day_flows(day: &Path) -> std::io::Result<()> {
+    let mut flows = Vec::new();
+    for entry in filesystem::read_dir(day)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            flows.push(entry.file_name());
+        }
+    }
+    flows.sort();
+    for flow in flows {
+        println!("{}", flow.to_string_lossy());
+    }
+    Ok(())
+}
+
+fn print_flow(flow: &Path) -> std::io::Result<()> {
+    for path in flow_text_files(flow)? {
+        let content = filesystem::read_to_string(path)?;
+        print!("{content}");
+        if !content.ends_with('\n') {
+            println!();
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
