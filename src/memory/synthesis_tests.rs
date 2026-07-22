@@ -60,5 +60,6 @@
         let first = cluster_toon(&cluster, &edges, &nodes);
         let second = cluster_toon(&cluster, &edges, &nodes);
         assert!(first.contains("An abstraction"));
+        assert!(first.starts_with("edges[1]{source,target,content,"));
         assert_eq!(first, second);
     }

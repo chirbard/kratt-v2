@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::sync::Arc;
 
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::api::EmbeddingClient;
 use crate::runlog;
@@ -13,6 +13,7 @@ use super::db;
 use super::graph::{Edge, Node, closure_nodes, closure_nodes_uncapped};
 use super::ledger;
 use super::routing;
+use super::toon_display::{self, Table};
 
 type ClosureFn = fn(&[(String, String)], &HashMap<String, Node>) -> Vec<(String, Node)>;
 
@@ -253,35 +254,74 @@ fn edges_to_toon_with_closure(
     closure_fn: ClosureFn,
     nodes: &HashMap<String, Node>,
 ) -> String {
-    let mut edges_json = Vec::new();
+    let mut sorted_edges = edges.to_vec();
+    sorted_edges.sort_by(|left, right| {
+        left.source
+            .cmp(&right.source)
+            .then_with(|| left.target.cmp(&right.target))
+    });
+    let mut edge_rows = Vec::new();
     let mut endpoints = Vec::new();
-    for edge in edges {
+    for edge in &sorted_edges {
         endpoints.push((edge.source.clone(), edge.target.clone()));
-        edges_json.push(json!({
-            "source": edge.source,
-            "target": edge.target,
-            "content": edge.content,
-            "confidence": edge.confidence,
-            "stability": edge.stability,
-            "importance": edge.importance,
-            "subject": edge.subject,
-            "date": edge.date,
-            "occurred_at": edge.occurred_at,
-            "expired_at": edge.expired_at,
-            "provenance": edge.provenance,
-        }));
+        edge_rows.push(semantic_edge_row(edge));
     }
     let closure = closure_fn(&endpoints, nodes);
-    let mut nodes_json = Vec::new();
+    let mut node_rows = Vec::new();
     for (node_id, node) in closure {
-        nodes_json.push(json!({
-            "body": node.body,
-            "date": node.date,
-            "id": node_id,
-            "type": node.node_type,
-        }));
+        node_rows.push(vec![
+            json!(node_id),
+            json!(node.node_type),
+            json!(node.body),
+            json!(node.date),
+        ]);
     }
-    toon::encode(&json!({"nodes": nodes_json, "edges": edges_json}), None)
+    encode_memory_tables(edge_rows, node_rows)
+}
+
+fn semantic_edge_row(edge: &SemanticEdge) -> Vec<Value> {
+    vec![
+        json!(edge.source),
+        json!(edge.target),
+        json!(edge.content),
+        json!(edge.occurred_at),
+        json!(edge.provenance),
+        json!(edge.confidence),
+        json!(edge.date),
+        json!(edge.importance),
+        json!(edge.stability),
+        json!(edge.subject),
+        json!(edge.expired_at),
+    ]
+}
+
+fn encode_memory_tables(edge_rows: Vec<Vec<Value>>, node_rows: Vec<Vec<Value>>) -> String {
+    const EDGE_COLUMNS: &[&str] = &[
+        "source",
+        "target",
+        "content",
+        "occurred_at",
+        "provenance",
+        "confidence",
+        "date",
+        "importance",
+        "stability",
+        "subject",
+        "expired_at",
+    ];
+    const NODE_COLUMNS: &[&str] = &["id", "type", "body", "date"];
+    toon_display::encode(&[
+        Table {
+            name: "edges",
+            columns: EDGE_COLUMNS,
+            rows: edge_rows,
+        },
+        Table {
+            name: "nodes",
+            columns: NODE_COLUMNS,
+            rows: node_rows,
+        },
+    ])
 }
 
 pub(crate) fn semantic_edge(edge: &Edge) -> SemanticEdge {

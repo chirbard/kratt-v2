@@ -249,6 +249,8 @@ fn node_id_seen(node_id: &str, node_ids: &[String]) -> bool {
 }
 
 fn edge_value_characters(edge: &Edge) -> usize {
+    // The table header is already charged by empty_toon; this is only the row's
+    // fixed delimiters and primitive fields plus its variable string content.
     edge.source.chars().count()
         + edge.target.chars().count()
         + edge.content.chars().count()
@@ -256,7 +258,7 @@ fn edge_value_characters(edge: &Edge) -> usize {
         + edge.provenance.chars().count()
         + edge.occurred_at.as_deref().unwrap_or("").chars().count()
         + edge.expired_at.as_deref().unwrap_or("").chars().count()
-        + 80
+        + 37
 }
 
 fn node_value_characters(node_id: &str, node: &Node) -> usize {

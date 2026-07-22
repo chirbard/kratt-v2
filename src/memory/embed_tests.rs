@@ -67,6 +67,31 @@
     }
 
     #[test]
+    fn injected_context_is_source_first_and_groups_source_rows() {
+        let mut second_kratt = test_edge("semantic", "");
+        second_kratt.source = "kratt".to_string();
+        second_kratt.target = "zeta".to_string();
+        second_kratt.content = "second".to_string();
+        let mut other = test_edge("semantic", "");
+        other.source = "other".to_string();
+        other.target = "middle".to_string();
+        other.content = "other".to_string();
+        let mut first_kratt = test_edge("semantic", "");
+        first_kratt.source = "kratt".to_string();
+        first_kratt.target = "alpha".to_string();
+        first_kratt.content = "first".to_string();
+
+        let toon = edges_to_toon(&[second_kratt, other, first_kratt]);
+        let lines = toon.lines().collect::<Vec<_>>();
+
+        assert!(lines[0].starts_with("edges[3]{source,target,content,"));
+        assert!(lines[1].starts_with("  kratt,alpha,first,"));
+        assert!(lines[2].starts_with("  kratt,zeta,second,"));
+        assert!(lines[3].starts_with("  other,middle,other,"));
+        assert!(toon.contains("nodes[0]{id,type,body,date}:"));
+    }
+
+    #[test]
     fn bounded_toon_includes_fact_endpoint_body() {
         let edge = test_edge("semantic", "");
         let nodes = HashMap::from([

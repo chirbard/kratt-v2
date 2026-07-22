@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::sync::Arc;
 
-use serde_json::json;
+use serde_json::{Value, json};
 use turso::{Connection, params};
 
 use crate::api::LlmClient;
@@ -11,6 +11,7 @@ use crate::prompts;
 use super::agent::{ToolCall, parse_tool_calls, stream_collect};
 use super::db;
 use super::graph::{Node, closure_nodes, normalize_id, synthesized_ceiling};
+use super::toon_display::{self, Table};
 
 const CLUSTER_MIN_EDGES: usize = 3; // replay-tunable.
 const SYNTHESIS_CLUSTERS_PER_PASS: usize = 2; // replay-tunable.
@@ -580,37 +581,78 @@ fn summarize(text: &str) -> String {
 }
 
 fn cluster_toon(cluster: &Cluster, edges: &[ClusterEdge], nodes: &HashMap<String, Node>) -> String {
-    let mut edges_json = Vec::new();
+    let mut selected_edges = Vec::new();
     let mut endpoints = Vec::new();
     let mut idx = 0usize;
     while idx < cluster.edge_indices.len() {
         let edge = &edges[cluster.edge_indices[idx]];
         endpoints.push((edge.source.clone(), edge.target.clone()));
-        edges_json.push(json!({
-            "source": edge.source,
-            "target": edge.target,
-            "content": edge.content,
-            "confidence": edge.confidence,
-            "stability": edge.stability,
-            "importance": edge.importance,
-            "subject": edge.subject,
-            "date": edge.date,
-            "occurred_at": edge.occurred_at,
-            "expired_at": edge.expired_at,
-        }));
+        selected_edges.push(edge);
         idx += 1;
     }
-    let closure = closure_nodes(&endpoints, nodes);
-    let mut nodes_json = Vec::new();
-    for (node_id, node) in closure {
-        nodes_json.push(json!({
-            "body": node.body,
-            "date": node.date,
-            "id": node_id,
-            "type": node.node_type,
-        }));
+    selected_edges.sort_by(|left, right| {
+        left.source
+            .cmp(&right.source)
+            .then_with(|| left.target.cmp(&right.target))
+    });
+    let mut edge_rows = Vec::new();
+    for edge in selected_edges {
+        edge_rows.push(cluster_edge_row(edge));
     }
-    toon::encode(&json!({"nodes": nodes_json, "edges": edges_json}), None)
+    let closure = closure_nodes(&endpoints, nodes);
+    let mut node_rows = Vec::new();
+    for (node_id, node) in closure {
+        node_rows.push(vec![
+            json!(node_id),
+            json!(node.node_type),
+            json!(node.body),
+            json!(node.date),
+        ]);
+    }
+    encode_cluster_tables(edge_rows, node_rows)
+}
+
+fn cluster_edge_row(edge: &ClusterEdge) -> Vec<Value> {
+    vec![
+        json!(edge.source),
+        json!(edge.target),
+        json!(edge.content),
+        json!(edge.occurred_at),
+        json!(edge.confidence),
+        json!(edge.date),
+        json!(edge.importance),
+        json!(edge.stability),
+        json!(edge.subject),
+        json!(edge.expired_at),
+    ]
+}
+
+fn encode_cluster_tables(edge_rows: Vec<Vec<Value>>, node_rows: Vec<Vec<Value>>) -> String {
+    const EDGE_COLUMNS: &[&str] = &[
+        "source",
+        "target",
+        "content",
+        "occurred_at",
+        "confidence",
+        "date",
+        "importance",
+        "stability",
+        "subject",
+        "expired_at",
+    ];
+    const NODE_COLUMNS: &[&str] = &["id", "type", "body", "date"];
+    toon_display::encode(&[
+        Table {
+            name: "edges",
+            columns: EDGE_COLUMNS,
+            rows: edge_rows,
+        },
+        Table {
+            name: "nodes",
+            columns: NODE_COLUMNS,
+            rows: node_rows,
+        },
+    ])
 }
 
 fn normalize_calls_for_cluster(

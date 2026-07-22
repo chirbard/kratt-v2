@@ -272,7 +272,7 @@ pub fn load_from_toon() -> Graph {
     graph
 }
 
-fn round2(value: f64) -> f64 {
+pub(crate) fn round2(value: f64) -> f64 {
     (value * 100.0).round() / 100.0
 }
 
@@ -345,6 +345,7 @@ fn collect_closure_node(node_id: &str, nodes: &HashMap<String, Node>, state: &mu
     }
 }
 
+#[cfg(test)]
 pub fn graph_to_json(graph: &Graph) -> serde_json::Value {
     let mut node_names: Vec<&String> = graph.nodes.keys().collect();
     node_names.sort();
