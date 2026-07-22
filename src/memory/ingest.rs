@@ -137,6 +137,9 @@ fn execute_ingestion_pass(
         contradiction_used: 0,
         contradiction_cap: chunks.len().max(1),
     };
+    let mut parsed_total = 0usize;
+    let mut applied_total = 0usize;
+    let mut denied_total = 0usize;
     for chunk_index in 0..chunks.len() {
         let chunk_number = chunk_index + 1;
         let _chunk_timer =
@@ -173,7 +176,7 @@ fn execute_ingestion_pass(
         }
         let mut semantic_edges = embed::select_semantic_edges(&*embed, &summaries[chunk_index]);
         semantic_edges.truncate(INGEST_CONTEXT_EDGES);
-        record_chunk_turn(
+        let counts = record_chunk_turn(
             &*llm,
             search.as_deref(),
             sender,
@@ -193,6 +196,9 @@ fn execute_ingestion_pass(
                 search_budget: &mut search_budget,
             },
         )?;
+        parsed_total += counts.0;
+        applied_total += counts.1;
+        denied_total += counts.2;
         send_log(
             sender,
             "ingest",
@@ -200,6 +206,12 @@ fn execute_ingestion_pass(
         );
         previous_summary = summaries[chunk_index].clone();
     }
+    runlog::log(
+        "mem",
+        &format!(
+            "ingest: {parsed_total} parsed, {applied_total} applied, {denied_total} denied"
+        ),
+    );
     send_log(
         sender,
         "ingest",
@@ -233,7 +245,7 @@ fn record_chunk_turn<'scope>(
     search: Option<&dyn SearchClient>,
     sender: &Sender<IngestEvent>,
     input: ChunkTurnInput<'scope>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+) -> Result<(usize, usize, usize), Box<dyn Error + Send + Sync>> {
     db::begin_transaction(input.conn)?;
     let mut events = injected_events(
         input.semantic_edges,
@@ -278,14 +290,15 @@ fn record_chunk_turn<'scope>(
         // The interactive loop handles fact-checking (search, notes, expiry)
         // but the small model extracts poorly one call at a time — a batch
         // text-protocol pass guarantees the chunk's facts land as edges.
-        run_batch_extraction(
+        let counts = run_batch_extraction(
             llm,
             input.semantic_edges,
             input.chunk_text,
             &mut study,
             sender,
         )?;
-        db::block_on(ledger::record_events_in_tx(input.conn, &events))
+        db::block_on(ledger::record_events_in_tx(input.conn, &events))?;
+        Ok(counts)
     })();
     if let Err(err) = result {
         if let Err(rollback_err) = db::block_on(async { input.conn.execute("ROLLBACK", ()).await })
@@ -295,7 +308,7 @@ fn record_chunk_turn<'scope>(
         return Err(err);
     }
     db::commit_transaction(input.conn)?;
-    Ok(())
+    result
 }
 
 fn run_batch_extraction<'scope>(
@@ -304,13 +317,14 @@ fn run_batch_extraction<'scope>(
     chunk_text: &str,
     study: &mut ChunkStudyContext<'scope>,
     sender: &Sender<IngestEvent>,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+) -> Result<(usize, usize, usize), Box<dyn Error + Send + Sync>> {
     let prompt = crate::prompts::build_ingest_extract_prompt(
         &embed::edges_to_toon(semantic_edges),
         chunk_text,
     );
     let response = llm.collect(&prompt)?;
     let calls = agent::parse_tool_calls(&response);
+    let parsed = calls.len();
     if calls.is_empty() {
         let head: String = response.chars().take(200).collect();
         runlog::log(
@@ -320,9 +334,14 @@ fn run_batch_extraction<'scope>(
     }
     study.provenance = MutationProvenance::Document;
     let mut applied = 0usize;
+    let mut denied = 0usize;
     for call in calls {
-        apply_ingest_mutation(call, study)?;
-        applied += 1;
+        let description = apply_ingest_mutation(call, study)?;
+        if description.contains("denied") {
+            denied += 1;
+        } else {
+            applied += 1;
+        }
     }
     send_log(
         sender,
@@ -333,7 +352,7 @@ fn run_batch_extraction<'scope>(
             study.chunk_count
         ),
     );
-    Ok(())
+    Ok((parsed, applied, denied))
 }
 
 fn run_chunk_loop<'scope>(
