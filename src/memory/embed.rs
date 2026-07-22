@@ -18,6 +18,7 @@ type ClosureFn = fn(&[(String, String)], &HashMap<String, Node>) -> Vec<(String,
 
 pub const EMBED_BATCH: usize = 50;
 pub const TOP_K: usize = 60;
+pub const CHAT_INITIAL_K: usize = 15; // replay-tunable
 pub const SMALL_GRAPH_THRESHOLD: usize = 100;
 pub const MAX_POOL: usize = 150;
 pub const EXPLORATION_CANDIDATES: usize = 200;
@@ -162,7 +163,7 @@ pub fn select_semantic_edges_routed(
         Some(vector) => vector,
         None => {
             return RoutedSemanticSelection {
-                edges: fallback_edges(Some(session_id)),
+                edges: chat_fallback_edges(session_id),
                 routing: routing::Routing {
                     routing_vector: Vec::new(),
                     expert: None,
@@ -175,13 +176,13 @@ pub fn select_semantic_edges_routed(
     let routing = routing::route(&query_embedding);
     if db::edge_count() < SMALL_GRAPH_THRESHOLD {
         return RoutedSemanticSelection {
-            edges: fallback_edges(Some(session_id)),
+            edges: chat_fallback_edges(session_id),
             routing,
         };
     }
     let Some(anchors) = anchor_edges_for_vector(&routing.routing_vector, Some(session_id)) else {
         return RoutedSemanticSelection {
-            edges: fallback_edges(Some(session_id)),
+            edges: chat_fallback_edges(session_id),
             routing,
         };
     };
@@ -384,6 +385,14 @@ fn scope_episodic(edges: Vec<SemanticEdge>, session_id: Option<&str>) -> Vec<Sem
 
 fn fallback_edges(session_id: Option<&str>) -> Vec<SemanticEdge> {
     rank_and_cap(all_semantic_edges(session_id))
+}
+
+fn chat_fallback_edges(session_id: &str) -> Vec<SemanticEdge> {
+    let mut edges = fallback_edges(Some(session_id));
+    if edges.len() > CHAT_INITIAL_K {
+        edges.truncate(CHAT_INITIAL_K);
+    }
+    edges
 }
 
 fn choose_exploration_anchors(
@@ -740,10 +749,10 @@ fn rank_pool_for_chat(
         index += 1;
     }
     scored.sort_by(chat_rank_cmp);
-    // TOP_K, not MAX_POOL: MAX_POOL caps the candidate pool, but what gets
-    // injected (and clock-refreshed) must stay workspace-sized.
-    if scored.len() > TOP_K {
-        scored.truncate(TOP_K);
+    // Keep the initial chat blob small enough that the model has to recall
+    // embedding-distant user facts through retrieve_memory when needed.
+    if scored.len() > CHAT_INITIAL_K {
+        scored.truncate(CHAT_INITIAL_K);
     }
     let mut edges = Vec::new();
     for row in scored {
@@ -923,8 +932,8 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        SemanticEdge, edges_to_toon, edges_to_toon_with_nodes, interest_bonus, rank_by_exploration,
-        satiation_factor, scope_episodic,
+        CHAT_INITIAL_K, SemanticEdge, edges_to_toon, edges_to_toon_with_nodes, interest_bonus,
+        rank_by_exploration, rank_pool_for_chat, satiation_factor, scope_episodic,
     };
     use crate::memory::db::InterestTarget;
     use crate::memory::graph::Node;
@@ -946,6 +955,19 @@ mod tests {
             provenance: "legacy".to_string(),
             embedding: None,
         }
+    }
+
+    #[test]
+    fn initial_chat_ranking_is_capped_separately_from_candidate_pool() {
+        let mut edges = Vec::new();
+        for index in 0..(CHAT_INITIAL_K + 5) {
+            let mut edge = test_edge("semantic", "");
+            edge.source = format!("source-{index}");
+            edge.target = format!("target-{index}");
+            edges.push(edge);
+        }
+        let ranked = rank_pool_for_chat(edges, &[], &HashMap::new());
+        assert_eq!(ranked.len(), CHAT_INITIAL_K);
     }
 
     #[test]

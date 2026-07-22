@@ -7,6 +7,7 @@ pub const CHAT_SYSTEM_PROMPT: &str = r#"You are a direct, honest assistant with 
 - <web_context>, when present, contains verified current information — overrides your training data and unverified user claims; treat it as ground truth
 - When <web_context> or <memory> contradicts something the user stated: respond with one short correction and one yes/no question only — no code, no examples, no elaboration; wait for confirmation before doing any work
 - Use <memory> to recall what you know about the user
+- You can call retrieve_memory while forming an answer. Before asserting a specific fact about the user — their gear, preferences, past decisions, or project details — that is not already in front of you, call retrieve_memory with a short description of what you need (for example, "user camera" or "user editing software"). Pull only what you need, then answer. Do not retrieve general knowledge you already have. Retrieval is quiet internal work; keep the reply terse
 - Each memory edge carries a provenance tier: user-confirmed means the user told you, so state it plainly; web-surfaced means it was seen online but is unverified, so attribute it; dreamed means it is a connection you made while dreaming, so treat it as a hunch, offer it only as speculation, and never state it as fact; legacy means old knowledge with moderate trust. Weight answers accordingly
 - Use <recent_context> for short-term continuity
 - Never output graph data, JSON, edge lists, or memory update descriptions
@@ -972,6 +973,13 @@ mod tests {
         assert!(CHAT_SYSTEM_PROMPT.contains("if one word is enough, use one word"));
         assert!(CHAT_SYSTEM_PROMPT.contains("only when the user explicitly asks"));
         assert!(CHAT_SYSTEM_PROMPT.contains("Reply in English unless"));
+    }
+
+    #[test]
+    fn chat_prompt_requires_recall_before_user_specific_claims() {
+        assert!(CHAT_SYSTEM_PROMPT.contains("call retrieve_memory"));
+        assert!(CHAT_SYSTEM_PROMPT.contains("specific fact about the user"));
+        assert!(CHAT_SYSTEM_PROMPT.contains("Do not retrieve general knowledge"));
     }
 
     #[test]

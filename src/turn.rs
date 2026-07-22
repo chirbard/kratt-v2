@@ -16,6 +16,8 @@ use crate::web::SearchClient;
 
 // How many prior user/assistant turns to replay into the system prompt.
 pub(crate) const RECENT_TURNS: usize = 2;
+pub(crate) const MAX_TOOL_ROUNDS: usize = 5;
+const RECALL_K: usize = 7; // replay-tunable
 
 // Front-end-agnostic turn pipeline: memory-block assembly, initial messages,
 // the tool loop, and routing/attribution helpers. Both the TUI streamer and
@@ -120,25 +122,48 @@ pub(crate) fn run_turn_collecting(
     let (mut messages, tools, memory_build) = prepare_stream_context(&ctx)?;
     log_memory_context(&memory_build);
     let (sender, receiver) = channel::<Chunk>();
+    let context = ToolExecutionContext {
+        embed: clients.embed,
+        search: clients.search,
+        session_path,
+        sender: &sender,
+    };
+    run_collecting_tool_loop(clients, &tools, &mut messages, &context)?;
+    drop(sender);
+    Ok(collect_content(&receiver))
+}
+
+fn run_collecting_tool_loop<'context>(
+    clients: &TurnClients,
+    tools: &Value,
+    messages: &mut Vec<Value>,
+    context: &ToolExecutionContext<'context>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut tool_rounds = 0usize;
     loop {
+        let available_tools = tools_for_round(tools, tool_rounds);
         let outcome = {
             let _stream_timer = runlog::time_step("chat", "LLM stream turn");
-            clients.llm.stream_turn(&messages, Some(&tools), &sender)?
+            clients
+                .llm
+                .stream_turn(messages, available_tools, context.sender)?
         };
         match outcome {
             TurnOutcome::Done(_) => break,
             TurnOutcome::ToolCalls(calls) => {
-                let context = ToolExecutionContext {
-                    search: clients.search,
-                    session_path,
-                    sender: &sender,
-                };
-                execute_tool_turn(&context, &calls, &mut messages, clients.trace);
+                if available_tools.is_none() {
+                    runlog::log(
+                        "chat",
+                        "tool round cap: final generation returned tool calls",
+                    );
+                    break;
+                }
+                execute_tool_turn(context, &calls, messages, clients.trace);
+                tool_rounds += 1;
             }
         }
     }
-    drop(sender);
-    Ok(collect_content(&receiver))
+    Ok(())
 }
 
 fn collect_content(receiver: &std::sync::mpsc::Receiver<Chunk>) -> String {
@@ -393,6 +418,7 @@ fn shorten_belief(text: &str, max_chars: usize) -> String {
 }
 
 pub(crate) struct ToolExecutionContext<'ctx> {
+    pub(crate) embed: &'ctx dyn EmbeddingClient,
     pub(crate) search: Option<&'ctx dyn SearchClient>,
     pub(crate) session_path: &'ctx Path,
     pub(crate) sender: &'ctx Sender<Chunk>,
@@ -415,7 +441,7 @@ pub(crate) fn execute_tool_turn<'context>(
         let _ = context
             .sender
             .send(Chunk::ToolCall(format!("{}: running…", call.name)));
-        let result = execute_tool(call, context.search, context.session_path);
+        let result = execute_tool(call, context);
         crate::trace::tool(
             trace_context,
             "tool_result",
@@ -457,6 +483,7 @@ pub(crate) fn build_tools(has_search: bool) -> Value {
     tools.push(search_history_tool());
     tools.push(read_history_tool());
     tools.push(read_source_tool());
+    tools.push(retrieve_memory_tool());
     tools.push(simple_recall_tool(
         "recall_curiosities",
         "Recall up to five real open questions you are curious about, with their age.",
@@ -483,6 +510,17 @@ pub(crate) fn build_tools(has_search: bool) -> Value {
         "Summarize real graph, dream, study, and due-loop activity since the previous conversation.",
     ));
     Value::Array(tools)
+}
+
+pub(crate) fn tools_for_round(tools: &Value, tool_rounds: usize) -> Option<&Value> {
+    if tool_rounds < MAX_TOOL_ROUNDS {
+        return Some(tools);
+    }
+    runlog::log(
+        "chat",
+        &format!("tool round cap hit ({MAX_TOOL_ROUNDS}); forcing final answer"),
+    );
+    None
 }
 
 fn simple_recall_tool(name: &str, description: &str) -> Value {
@@ -591,17 +629,34 @@ fn read_source_tool() -> Value {
     })
 }
 
-fn execute_tool(
+fn retrieve_memory_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "retrieve_memory",
+            "description": "Retrieve memory edges for a focused query about the user, their preferences, decisions, gear, or projects.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"}
+                },
+                "required": ["query"]
+            }
+        }
+    })
+}
+
+fn execute_tool<'context>(
     call: &ToolCallRequest,
-    search: Option<&dyn SearchClient>,
-    session_path: &Path,
+    context: &ToolExecutionContext<'context>,
 ) -> String {
     let _timer = runlog::time_step("tool", call.name.clone());
     match call.name.as_str() {
-        "search_web" => execute_search_web(&call.args, search),
+        "search_web" => execute_search_web(&call.args, context.search),
         "search_history" => execute_search_history(&call.args),
-        "read_history" => execute_read_history(&call.args, session_path),
+        "read_history" => execute_read_history(&call.args, context.session_path),
         "read_source" => execute_read_source(&call.args),
+        "retrieve_memory" => execute_retrieve_memory(&call.args, context.embed),
         "recall_curiosities" => execute_recall_curiosities(),
         "recall_interests" => execute_recall_interests(),
         "recall_ping_policy" => execute_recall_ping_policy(),
@@ -611,6 +666,26 @@ fn execute_tool(
         "catch_up" => execute_catch_up(),
         _ => "unknown tool".to_string(),
     }
+}
+
+fn execute_retrieve_memory(args: &str, embed: &dyn EmbeddingClient) -> String {
+    let Ok(root) = serde_json::from_str::<Value>(args) else {
+        return "no edges found".to_string();
+    };
+    let Some(query) = parse_string_field(&root, "query") else {
+        return "no edges found".to_string();
+    };
+    if query.trim().is_empty() {
+        return "no edges found".to_string();
+    }
+    let mut edges = memory::select_semantic_edges(embed, &query);
+    if edges.len() > RECALL_K {
+        edges.truncate(RECALL_K);
+    }
+    if edges.is_empty() {
+        return "no edges found".to_string();
+    }
+    memory::edges_to_toon(&edges)
 }
 
 fn execute_search_web(args: &str, search: Option<&dyn SearchClient>) -> String {
@@ -996,15 +1071,38 @@ fn parse_string_field(root: &Value, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MemorySections, assemble_memory_block, build_memory_events, build_tools, catch_up_since,
-        collect_anchor_ids, execute_catch_up_with, execute_recall_curiosities_with,
-        execute_recall_intentions_with, execute_recall_interests_with,
-        execute_recall_ping_policy_with, execute_recall_queue_with,
-        execute_recall_recent_learning_with, execute_tool, parse_since_days,
+        MAX_TOOL_ROUNDS, MemorySections, ToolExecutionContext, assemble_memory_block,
+        build_memory_events, build_tools, catch_up_since, collect_anchor_ids,
+        execute_catch_up_with, execute_recall_curiosities_with, execute_recall_intentions_with,
+        execute_recall_interests_with, execute_recall_ping_policy_with, execute_recall_queue_with,
+        execute_recall_recent_learning_with, execute_tool, parse_since_days, tools_for_round,
     };
-    use crate::api::ToolCallRequest;
+    use crate::api::{Chunk, EmbeddingClient, ToolCallRequest};
     use crate::memory::{EdgeRef, GameKnowledge, OpenLoops, Routing, SemanticEdge, TaskChain};
     use turso::{Builder, Connection};
+
+    struct TestEmbed;
+
+    impl EmbeddingClient for TestEmbed {
+        fn embed(
+            &self,
+            texts: &[String],
+        ) -> Result<Vec<Vec<f64>>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(vec![vec![1.0]; texts.len()])
+        }
+    }
+
+    fn test_tool_context<'context>(
+        embed: &'context TestEmbed,
+        sender: &'context std::sync::mpsc::Sender<Chunk>,
+    ) -> ToolExecutionContext<'context> {
+        ToolExecutionContext {
+            embed,
+            search: None,
+            session_path: std::path::Path::new("missing"),
+            sender,
+        }
+    }
 
     async fn introspection_harness() -> Connection {
         let Ok(database) = Builder::new_local(":memory:").build().await else {
@@ -1343,7 +1441,11 @@ mod tests {
                 names.push(name);
             }
         }
+        let (sender, _receiver) = std::sync::mpsc::channel::<Chunk>();
+        let embed = TestEmbed;
+        let context = test_tool_context(&embed, &sender);
         for expected in [
+            "retrieve_memory",
             "recall_curiosities",
             "recall_intentions",
             "recall_recent_learning",
@@ -1356,19 +1458,20 @@ mod tests {
                 name: expected.to_string(),
                 args: "{}".to_string(),
             };
-            assert_ne!(
-                execute_tool(&call, None, std::path::Path::new("missing")),
-                "unknown tool"
-            );
+            assert_ne!(execute_tool(&call, &context), "unknown tool");
         }
         let bogus = ToolCallRequest {
             id: "1".to_string(),
             name: "bogus".to_string(),
             args: "{}".to_string(),
         };
-        assert_eq!(
-            execute_tool(&bogus, None, std::path::Path::new("missing")),
-            "unknown tool"
-        );
+        assert_eq!(execute_tool(&bogus, &context), "unknown tool");
+    }
+
+    #[test]
+    fn tool_round_cap_removes_tools_from_final_generation() {
+        let tools = build_tools(false);
+        assert!(tools_for_round(&tools, MAX_TOOL_ROUNDS - 1).is_some());
+        assert!(tools_for_round(&tools, MAX_TOOL_ROUNDS).is_none());
     }
 }

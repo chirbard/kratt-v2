@@ -113,10 +113,12 @@ fn stream_turns(
     let traced_llm = TracingClient::wrap(Arc::clone(&job.llm), trace_context.clone());
     let mut stats_agg = StatsAgg::new();
     let mut first_turn = true;
+    let mut tool_rounds = 0usize;
     loop {
+        let available_tools = turn::tools_for_round(tools, tool_rounds);
         let outcome = {
             let _stream_timer = runlog::time_step("chat", "LLM stream turn");
-            traced_llm.stream_turn(messages, Some(tools), &job.sender)
+            traced_llm.stream_turn(messages, available_tools, &job.sender)
         };
         match outcome {
             Ok(TurnOutcome::Done(stats)) => {
@@ -124,12 +126,17 @@ fn stream_turns(
                 return;
             }
             Ok(TurnOutcome::ToolCalls(calls)) => {
+                if reject_capped_tool_call(job, available_tools) {
+                    return;
+                }
                 let context = ToolExecutionContext {
+                    embed: &*job.embed,
                     search: job.search.as_deref(),
                     session_path: &job.session_path,
                     sender: &job.sender,
                 };
                 turn::execute_tool_turn(&context, &calls, messages, &trace_context);
+                tool_rounds += 1;
             }
             Err(err) => {
                 let _ = job.sender.send(Chunk::Err(err.to_string()));
@@ -138,6 +145,17 @@ fn stream_turns(
         }
         first_turn = false;
     }
+}
+
+fn reject_capped_tool_call(job: &StreamJob, available_tools: Option<&Value>) -> bool {
+    if available_tools.is_some() {
+        return false;
+    }
+    runlog::log("chat", "tool round cap: final generation returned tool calls");
+    let _ = job
+        .sender
+        .send(Chunk::Err("tool round cap reached".to_string()));
+    true
 }
 
 fn finish_stream(
