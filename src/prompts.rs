@@ -2,6 +2,7 @@ use crate::session::RecentEntry;
 
 pub const CHAT_SYSTEM_PROMPT: &str = r#"You are a direct, honest assistant with your own epistemic standards.
 
+- Answer like an Estonian would: blunt, direct, and without filler. Match the answer to the question: if one word is enough, use one word; a simple question gets a simple answer, never a report. Say each thing once. No preamble, praise, repeated point, or closing summary. Default to a short, human reply. Write a long, structured, thorough answer only when the user explicitly asks for depth, detail, or a report. Reply in English unless the user writes in or asks for another language
 - Push back on wrong assumptions and refuse to build on a bad premise
 - <web_context>, when present, contains verified current information — overrides your training data and unverified user claims; treat it as ground truth
 - When <web_context> or <memory> contradicts something the user stated: respond with one short correction and one yes/no question only — no code, no examples, no elaboration; wait for confirmation before doing any work
@@ -115,62 +116,39 @@ pub const SCRIBE_EXPLANATION: &str = r#"You are the episodic scribe: a fast, nar
 
 pub const SCRIBE_TOOL_DEFINITIONS: &str = r#"TOOLS
 
-record_move — record ONE move or step made this turn (the primary tool). Emit one per move, in order. Structure, ply number, and the move-list are derived for you — you supply only:
-- move: the move text copied verbatim from the exchange, even if it looks illegal or mistaken ("Nc3", "e4")
-- actor: "assistant" for your own move, "user" for the opponent's move
-{"tool":"record_move","args":{"move":"Nc3","actor":"assistant"}}
+`!` means required; `?` means optional. Emit JSON, not this notation.
 
-define_task — define the game/task being set up (once, on the setup turn). Structure is derived for you; you supply only:
-- name: the game/task name ("chess")
-- description: the rules of play AND any presentation instructions ("replies should be the move only")
-{"tool":"define_task","args":{"name":"chess","description":"two-player board game, standard rules; user plays White, assistant Black; replies should be the move only"}}
+record_move(move!, actor!="assistant"|"user")
+  # one call per move, in order; copy move verbatim even if mistaken
+define_task(name!, description?)
+  # setup turn only; include rules and presentation instructions
+record_rule(rule!)
+  # one stated game rule; define_task must have run first
+record_outcome(result!="win"|"loss"|"draw", comment?)
+  # only when the game genuinely ended this turn
+open_loop(intention!, anchor!, due?:YYYY-MM-DD)
+  # anchor is created automatically if missing; one loop per intention; never use for a move or duplicate an open loop
+inbox_add(source!, instruction?)
+  # copy URL/path verbatim; one item per source
+close_loop(loop!, resolution!="done"|"abandoned"|"absence", note?)
+  # only on confirmed resolution, never silence or deadline alone
+upsert_node(name!, type!="fact", body!, date!)
+  # non-move facts only; body is one atomic sentence; endpoints auto-create entities
+upsert_edge(source!, target!, content!, stability!=0.3, confidence!=1.0,
+  importance!=0.5|1.0, subject!=false, date!, memory_type!="episodic")
+  # non-move facts only; importance=1.0 when needed to reconstruct state
 
-record_rule — record ONE stated rule of the current game as durable knowledge (define_task must have run first).
-{"tool":"record_rule","args":{"rule":"the king moves exactly one square in any direction"}}
+Exact upsert_edge JSON:
+{"tool":"upsert_edge","args":{"source":"string","target":"string","content":"<subject> verb <target>","stability":0.3,"confidence":1.0,"importance":0.5,"subject":false,"date":"YYYY-MM-DD","memory_type":"episodic"}}"#;
 
-record_outcome — record the game's end result, from your (the assistant's) perspective. Only when the game genuinely ended this turn.
-- result: "win" | "loss" | "draw"
-- comment: brief reason (optional)
-{"tool":"record_outcome","args":{"result":"loss","comment":"resigned after losing the queen"}}
+pub const REACTION_TOOL_DEFINITION: &str = r#"record_reaction(reaction!="positive"|"negative", comment!)
+  # immediate evaluation of the previous answer only; plain thanks and corrections alone do not count; be conservative"#;
 
-open_loop — remember one concrete intended future action or expected event ("remind me", "I'll send it tomorrow"). NOT a move; never wrap an intention in record_move.
-- intention: one sentence; anchor: topic node, created automatically if missing; due: optional YYYY-MM-DD, empty for contextual-only
-- ONE loop per intention — never open a second loop restating an existing one
-{"tool":"open_loop","args":{"intention":"ask the user whether the systemd unit file arrived","anchor":"systemd-unit-file","due":"2026-07-15"}}
+pub const INTEREST_TOOL_DEFINITION: &str = r#"register_interest(topic!)
+  # standing interest or request to follow/watch/read up; not a one-off question; normalize to a short phrase"#;
 
-inbox_add — queue material the user asks to study later. Copy the URL or file path verbatim; instruction is their stated focus, empty if none. ONE item per source; do not re-queue a source already accepted this exchange.
-{"tool":"inbox_add","args":{"source":"https://example.com/paper.html","instruction":"focus on the eviction policy"}}
-
-close_loop — close a live loop only when this exchange confirms it: done, deliberately abandoned, or the expected event confirmed missing. Never from silence or a passed deadline alone.
-{"tool":"close_loop","args":{"loop":"kebab-loop-id","resolution":"done | abandoned | absence","note":"brief evidence"}}
-
-upsert_node — create or update a fact node (non-move task facts only). Edge endpoints that don't exist yet become entity nodes automatically — never declare them.
-- type is always "fact"; body is one atomic sentence, no period; date YYYY-MM-DD when event occurred, empty if unknown
-{"tool":"upsert_node","args":{"name":"kebab-case-string","type":"fact","body":"one atomic sentence","date":""}}
-
-upsert_edge — create or update a directed edge (non-move task facts only; never for moves).
-- content: "<subject> verb <target>"; describe exactly what happened this turn
-- stability: 0.3 (episodic state is temporary)
-- confidence: 1.0 when stated clearly
-- importance: 1.0 if needed to reconstruct state, else 0.5
-- subject: false
-- date: always today's date
-- memory_type: always "episodic" for scribe writes
-{"tool":"upsert_edge","args":{"source":"string","target":"string","content":"string","stability":0.3,"confidence":1.0,"importance":0.5,"subject":false,"date":"YYYY-MM-DD","memory_type":"episodic"}}"#;
-
-pub const REACTION_TOOL_DEFINITION: &str = r#"record_reaction — emit only when the user's message is an immediate evaluative reaction to your previous answer: praise ("perfect", "wow, exactly right") or rejection ("that was stupid", "no, completely wrong", "useless"). A plain "thanks", politeness, or general mood is NOT a reaction. A correction with content ("no, Fable is from Anthropic") is extraction material, not only a reaction: record the correction as facts; also emit record_reaction only if it clearly evaluates answer quality. Be conservative: false negatives are cheap; false positives poison credit. Never use it for an older answer.
-- reaction: "positive" | "negative"
-- comment: brief quote or paraphrase of the reaction
-{"tool":"record_reaction","args":{"reaction":"negative","comment":"called the answer useless"}}"#;
-
-pub const INTEREST_TOOL_DEFINITION: &str = r#"register_interest — emit when the user expresses a standing interest in a topic or asks you to follow, watch, scan, or read up on it in your free time ("that's interesting", "keep an eye on X", "read up on Y when you can"). The topic is the subject, normalized to a short phrase. A one-off question is NOT a standing interest — only register when they signal ongoing interest.
-{"tool":"register_interest","args":{"topic":"libsql internals"}}"#;
-
-pub const PING_POLICY_TOOL_DEFINITION: &str = r#"set_ping_policy — emit when the user tells you how to handle notifications: mute you for a period, hold a topic for the digest, or resume pinging. Translate their phrasing into an action and an ISO cutoff using today's date; do not leave fuzzy durations in the arguments.
-- action: "mute" | "resume" | "divert"
-- topic: required for divert only
-- until: ISO timestamp required for mute and divert; omit for resume
-{"tool":"set_ping_policy","args":{"action":"divert","topic":"crypto","until":"2026-07-15T00:00:00"}}"#;
+pub const PING_POLICY_TOOL_DEFINITION: &str = r#"set_ping_policy(action!="mute"|"resume"|"divert", topic?, until?:ISO-8601)
+  # divert requires topic+until; mute requires until; resume requires neither; resolve fuzzy durations from today's date"#;
 
 fn append_tool_definitions(prompt: &mut String, definitions: &str) {
     prompt.push_str(definitions);
@@ -219,50 +197,32 @@ pub fn build_scribe_prompt(user_msg: &str, assistant_msg: &str) -> String {
 
 pub const TOOL_DEFINITIONS: &str = r#"TOOLS
 
-upsert_node — create or update a fact node. Edge endpoints that don't exist yet become entity nodes automatically — never declare them.
-- type is always "fact"; body is one atomic sentence, no period; date YYYY-MM-DD when event occurred, empty if unknown
-{"tool":"upsert_node","args":{"name":"kebab-case-string","type":"fact","body":"one atomic sentence","date":""}}
+`!` means required; `?` means optional. Emit JSON, not this notation.
 
-upsert_edge — create or update a directed edge.
-- content: "<subject> verb <target>" or "<subject> verb <fact>"; "implies" for fact→fact; empty when subject=true
-- stability: 0.3 fades in weeks, 0.5 in months, high values in years
-- confidence: 1.0 stated clearly, 0.7 once, 0.4 inferred, 0.1 uncertain
-- importance: 1.0 must load with source, 0.0 supplementary
-- subject: true only on fact nodes; set importance=1.0
-- date: always today's date
-- when you create an edge by combining existing edges from your context rather than from what the user said, pass inferred_from with the supporting edge refs; edges taken from the user's own words never need it
-{"tool":"upsert_edge","args":{"source":"string","target":"string","content":"string","stability":0.0,"confidence":0.0,"importance":0.0,"subject":false,"date":"YYYY-MM-DD","inferred_from":[["support-source","support-target"]]}}
+upsert_node(name!, type!="fact", body!, date!)
+  # body is one atomic sentence; edge endpoints auto-create entities
+upsert_edge(source!, target!, content!, stability!, confidence!, importance!,
+  subject!, date!, inferred_from?:[[source,target],...])
+  # content=<subject> verb <target|fact>; fact→fact uses implies; subject=true -> content empty, importance=1.0
+  # stability: 0.3 weeks, 0.5 months, high years; confidence: 1.0 clear, 0.7 once, 0.4 inferred, 0.1 uncertain
+  # inferred_from is required only when combining context edges, never for the user's own words
+delete_node(name!)
+delete_edge(source!, target!)
+expire_edge(source!, target!, rewritten_content!)
+  # historical/superseded beliefs; delete only absorbed scaffolding
+open_loop(intention!, anchor!, due?:YYYY-MM-DD)
+  # anchor is created automatically if missing; omit due for contextual loops
+inbox_add(source!, instruction?)
+  # copy URL/path verbatim; one item per source
+close_loop(loop!, resolution!="done"|"abandoned"|"absence", note?)
+  # confirmed resolution only; absence requires human confirmation
+record_rule(rule!)
+  # stated rule of a game already known to the graph
+record_outcome(result!="win"|"loss"|"draw", comment?)
+  # only when a game genuinely ended this turn
 
-delete_node — remove a node.
-{"tool":"delete_node","args":{"name":"string"}}
-
-delete_edge — remove a directed edge.
-{"tool":"delete_edge","args":{"source":"string","target":"string"}}
-
-expire_edge — mark an edge historical instead of deleting it.
-- Use expiry for superseded-but-true-then beliefs; use delete only for absorbed scaffolding.
-{"tool":"expire_edge","args":{"source":"string","target":"string","rewritten_content":"string"}}
-
-open_loop — remember one concrete intended future action or expected event until it is honestly resolved.
-- intention: one sentence describing what should happen
-- anchor: topic node whose appearance should surface the loop; the anchor is created automatically if missing
-- due: optional YYYY-MM-DD deadline or expected-by date; empty for contextual-only loops
-{"tool":"open_loop","args":{"intention":"ask Markus whether the systemd unit survived the reboot","anchor":"home-server","due":"2026-07-15"}}
-
-inbox_add — queue material the user asks to study later. Copy the URL or file path verbatim; instruction is their stated focus, empty if none. ONE item per source; do not re-queue a source already accepted this exchange.
-{"tool":"inbox_add","args":{"source":"https://example.com/paper.html","instruction":"focus on the eviction policy"}}
-
-close_loop — close a live loop only when the exchange confirms its resolution.
-- resolution: "done" | "abandoned" | "absence"
-- note: brief evidence or reason; never use absence without human confirmation
-{"tool":"close_loop","args":{"loop":"ask-markus-whether-the-systemd-unit-survived-the-reboot","resolution":"done","note":"confirmed running"}}
-
-record_rule — when the conversation states a rule of a game the graph already knows, use this instead of a loose upsert_edge; it anchors the rule to the game-definition node as durable knowledge.
-{"tool":"record_rule","args":{"rule":"the king moves exactly one square in any direction"}}
-
-record_outcome — when a game genuinely ended this turn (checkmate, resignation, agreed draw), record the result from the assistant's perspective. Never speculatively.
-- result: "win" | "loss" | "draw"
-{"tool":"record_outcome","args":{"result":"win","comment":"opponent resigned"}}"#;
+Exact upsert_edge JSON:
+{"tool":"upsert_edge","args":{"source":"string","target":"string","content":"<subject> verb <target>","stability":0.5,"confidence":1.0,"importance":0.5,"subject":false,"date":"YYYY-MM-DD","inferred_from":[["support-source","support-target"]]}}"#;
 
 pub const MEMORY_RULES: &str = r#"Node types: Rust creates entity nodes automatically from edge endpoints. Use upsert_node only for fact nodes (one atomic claim; body is one sentence, no period; date YYYY-MM-DD when event occurred, empty if unknown; use today for current events; resolve relative dates to YYYY-MM-DD).
 
@@ -507,10 +467,13 @@ pub const DREAM_STRATEGY: &str = r#"You are the strategy consolidator for the ga
 Your job: derive or refine a few portable STRATEGY LESSONS anchored to the game node, learned from how these games actually went.
 
 Rules:
-- Every NEW lesson needs its fact node declared in the same response: {"tool":"upsert_node","args":{"name":"kebab-lesson","type":"fact","body":"the lesson as one sentence","date":""}}. Rust applies valid fact declarations before their edges.
-- gist_edge for a lesson INDUCED FROM PLAYED MOVES — cite the supporting chain edges in supported_by (at least two). Each ref is the chain edge written exactly "hub → move-node", e.g. "task-<session> → task-<session>-ply-003" (the hub is the source, the ply node the target — copy them from the chain sections below). Phrase content as the transferable lesson ("an early queen sortie gets punished by tempo loss"), never as one game's narration. {"tool":"gist_edge","args":{"source":"game-<name>","target":"kebab-lesson","content":"string","confidence":0.6,"supported_by":["task-<session> → task-<session>-ply-003","task-<session> → task-<session>-ply-005"]}}
-- upsert_edge onto the game node ONLY for a lesson implied by the rules alone (before any game teaches otherwise). {"tool":"upsert_edge","args":{"source":"game-<name>","target":"kebab-lesson","content":"string","stability":0.4,"confidence":0.5,"importance":0.5,"subject":false,"date":"YYYY-MM-DD"}}
-- REVISE ON EVIDENCE: an existing strategy contradicted by a lost game gets expire_edge (or a rewritten upsert at lower confidence). The outcomes are given to you precisely so a lesson that keeps losing is corrected, not preserved. {"tool":"expire_edge","args":{"source":"game-<name>","target":"kebab-lesson","rewritten_content":"string"}}
+- `!` means required; `?` means optional. Emit JSON, not this notation.
+- upsert_node(name!, type!="fact", body!, date!): every NEW lesson needs its fact node declared in the same response. Rust applies valid fact declarations before their edges.
+- gist_edge(source!, target!, content!, confidence!, stability?=0.5, supported_by!:[edge-ref,...]): use for a lesson INDUCED FROM PLAYED MOVES. Cite at least two chain edges exactly as "hub → move-node", copied from below. Phrase a transferable lesson, never one game's narration.
+  Exact gist_edge JSON: {"tool":"gist_edge","args":{"source":"game-<name>","target":"kebab-lesson","content":"an early queen sortie gets punished by tempo loss","confidence":0.6,"supported_by":["task-<session> → task-<session>-ply-003","task-<session> → task-<session>-ply-005"]}}
+- upsert_edge(source!, target!, content!, stability!, confidence!, importance!, subject!, date!): use on the game node ONLY for a lesson implied by the rules alone, before any game teaches otherwise.
+  Exact upsert_edge JSON: {"tool":"upsert_edge","args":{"source":"game-<name>","target":"kebab-lesson","content":"string","stability":0.4,"confidence":0.5,"importance":0.5,"subject":false,"date":"YYYY-MM-DD"}}
+- expire_edge(source!, target!, rewritten_content!): REVISE ON EVIDENCE. Expire an existing strategy contradicted by a lost game, or rewrite it at lower confidence. Outcomes exist so a lesson that keeps losing is corrected, not preserved.
 - Never narrate a single game. Never restate a rule as a strategy. Five solid lessons beat twenty.
 - Emit at most 8 tool calls. Anchor every strategy to the game node.
 
@@ -1004,14 +967,22 @@ mod tests {
     }
 
     #[test]
+    fn chat_defaults_to_blunt_length_matched_answers() {
+        assert!(CHAT_SYSTEM_PROMPT.contains("Answer like an Estonian would"));
+        assert!(CHAT_SYSTEM_PROMPT.contains("if one word is enough, use one word"));
+        assert!(CHAT_SYSTEM_PROMPT.contains("only when the user explicitly asks"));
+        assert!(CHAT_SYSTEM_PROMPT.contains("Reply in English unless"));
+    }
+
+    #[test]
     fn heavy_and_scribe_prompts_both_document_loops() {
         let heavy = prompt_with(None);
         assert!(heavy.contains("## Prospective memory — open loops"));
-        assert!(heavy.contains(r#"{"tool":"open_loop""#));
-        assert!(heavy.contains(r#"{"tool":"close_loop""#));
+        assert!(heavy.contains("open_loop(intention!"));
+        assert!(heavy.contains("close_loop(loop!"));
         let scribe = build_scribe_prompt("user", "assistant");
-        assert!(scribe.contains(r#"{"tool":"open_loop""#));
-        assert!(scribe.contains(r#"{"tool":"close_loop""#));
+        assert!(scribe.contains("open_loop(intention!"));
+        assert!(scribe.contains("close_loop(loop!"));
     }
 
     #[test]
@@ -1019,8 +990,8 @@ mod tests {
         for definitions in [SCRIBE_TOOL_DEFINITIONS, TOOL_DEFINITIONS] {
             assert!(!definitions.contains(r#""type":"entity"#));
             assert!(!definitions.contains("entity | fact"));
-            assert!(definitions.contains(r#""type":"fact""#));
-            assert!(definitions.contains("never declare them"));
+            assert!(definitions.contains("type!=\"fact\""));
+            assert!(definitions.contains("auto-create entities"));
         }
     }
 
@@ -1031,7 +1002,7 @@ mod tests {
         for prompt in [heavy, scribe] {
             assert!(!prompt.contains("emit its upsert_node before open_loop"));
             assert!(!prompt.contains("emit its upsert_node first if needed"));
-            assert!(prompt.contains("created automatically if missing"));
+            assert!(prompt.contains("anchor is created automatically if missing"));
         }
     }
 
@@ -1040,9 +1011,9 @@ mod tests {
         let heavy = prompt_with(None);
         let scribe = build_scribe_prompt("user", "assistant");
         for prompt in [heavy, scribe] {
-            assert!(prompt.contains(r#"{"tool":"record_reaction""#));
-            assert!(prompt.contains("A plain \"thanks\""));
-            assert!(prompt.contains("false positives poison credit"));
+            assert!(prompt.contains("record_reaction(reaction!"));
+            assert!(prompt.contains("plain thanks"));
+            assert!(prompt.contains("be conservative"));
         }
     }
 
@@ -1051,8 +1022,8 @@ mod tests {
         let heavy = prompt_with(None);
         let scribe = build_scribe_prompt("user", "assistant");
         for prompt in [heavy, scribe] {
-            assert!(prompt.contains(r#"{"tool":"register_interest""#));
-            assert!(prompt.contains("A one-off question is NOT a standing interest"));
+            assert!(prompt.contains("register_interest(topic!)"));
+            assert!(prompt.contains("not a one-off question"));
         }
         assert!(CHAT_SYSTEM_PROMPT.contains("building your understanding"));
     }
@@ -1062,9 +1033,9 @@ mod tests {
         let heavy = prompt_with(None);
         let scribe = build_scribe_prompt("be quiet this week", "okay");
         for prompt in [heavy, scribe] {
-            assert!(prompt.contains(r#"{"tool":"set_ping_policy""#));
-            assert!(prompt.contains("Translate their phrasing"));
-            assert!(prompt.contains("ISO timestamp"));
+            assert!(prompt.contains("set_ping_policy(action!"));
+            assert!(prompt.contains("resolve fuzzy durations"));
+            assert!(prompt.contains("ISO-8601"));
         }
         assert!(CHAT_SYSTEM_PROMPT.contains("your ping policy"));
     }

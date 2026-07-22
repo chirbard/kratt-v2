@@ -254,9 +254,13 @@ fn run_strategy_game<'run>(
         stage.sender,
     )?;
     let tool_calls = parse_tool_calls(&output);
+    let parsed = tool_calls.len();
     let source_id = format!("dream:{}", stage.session_id);
     let policy = SynthesisPolicy::empty();
-    apply_dream_tool_calls(stage.conn, tool_calls, &source_id, &policy, stage.sender)
+    let (lessons, denied) =
+        apply_dream_tool_calls(stage.conn, tool_calls, &source_id, &policy, stage.sender)?;
+    log_pass_summary("strategy", parsed, denied);
+    Ok(lessons)
 }
 
 // The graph context for the dream's global stages (child lens, abstract
@@ -378,14 +382,13 @@ fn execute_dream_pass(
         let consolidation =
             run_consolidation_agent(llm, &session_id, &global_toon, &all_ctx, sender)?;
         let tool_calls = parse_tool_calls(&consolidation);
-        if tool_calls.is_empty() {
-            // Two consecutive post-reorder dreams wrote zero edges with no
-            // visibility into why — a truncated raw reply is the diagnostic.
-            let preview: String = consolidation.chars().take(600).collect();
-            runlog::log("dream", &format!("consolidation parsed 0 tool calls; reply head: {preview}"));
-        }
+        let parsed = tool_calls.len();
+        log_empty_consolidation(&tool_calls, &consolidation);
         let source_id = format!("dream:{session_id}");
-        apply_dream_tool_calls(&conn, tool_calls, &source_id, &synthesis.policy, sender)?
+        let result =
+            apply_dream_tool_calls(&conn, tool_calls, &source_id, &synthesis.policy, sender)?;
+        log_pass_summary("dream", parsed, result.1);
+        result.0
     };
     send_log(
         sender,
@@ -393,6 +396,18 @@ fn execute_dream_pass(
         format!("done — {edges_added} edges written"),
     );
     Ok(edges_added)
+}
+
+fn log_empty_consolidation(tool_calls: &[ToolCall], response: &str) {
+    if !tool_calls.is_empty() {
+        return;
+    }
+    // A truncated raw reply makes zero-write dreams diagnosable.
+    let preview: String = response.chars().take(600).collect();
+    runlog::log(
+        "dream",
+        &format!("consolidation parsed 0 tool calls; reply head: {preview}"),
+    );
 }
 
 struct DomainOutputs {
@@ -631,9 +646,10 @@ fn apply_dream_tool_calls(
     source_id: &str,
     synthesis_policy: &SynthesisPolicy,
     sender: &std::sync::mpsc::Sender<DreamEvent>,
-) -> Result<usize, Box<dyn Error + Send + Sync>> {
+) -> Result<(usize, usize), Box<dyn Error + Send + Sync>> {
     db::begin_transaction(conn)?;
     let mut edge_count = 0usize;
+    let mut denied_count = 0usize;
     let mut events: Vec<Event> = Vec::new();
     let mut apply_state = DreamApplyState::new(synthesis_policy);
     let result = (|| {
@@ -645,6 +661,9 @@ fn apply_dream_tool_calls(
         };
         let outcomes = apply_preflighted_dream_batch(&mut call_ctx, tool_calls)?;
         for (description, added_edge) in outcomes {
+            if description.contains("denied") {
+                denied_count += 1;
+            }
             if !description.is_empty() {
                 send_log(sender, "dream", description);
             }
@@ -661,7 +680,15 @@ fn apply_dream_tool_calls(
         return Err(err);
     }
     db::commit_transaction(conn)?;
-    Ok(edge_count)
+    Ok((edge_count, denied_count))
+}
+
+fn log_pass_summary(seat: &str, parsed: usize, denied: usize) {
+    let applied = parsed.saturating_sub(denied);
+    runlog::log(
+        "mem",
+        &format!("{seat}: {parsed} parsed, {applied} applied, {denied} denied"),
+    );
 }
 
 fn apply_preflighted_dream_batch<'scope, 'policy>(

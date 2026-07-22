@@ -95,6 +95,7 @@ struct PassSpec {
 
 struct IterationOutcome {
     descriptions: Vec<String>,
+    parsed: usize,
     done: bool,
 }
 
@@ -547,14 +548,25 @@ impl<'run> AgentRun<'run> {
     {
         let mut prompt = first_prompt;
         let mut applied: Vec<String> = Vec::new();
+        let mut parsed_count = 0usize;
+        let mut applied_count = 0usize;
+        let mut denied_count = 0usize;
         for iteration in 1..=pass.max_iterations {
             let outcome = iterate(iteration, prompt)?;
+            parsed_count += outcome.parsed;
+            for description in &outcome.descriptions {
+                if description.contains("denied") {
+                    denied_count += 1;
+                } else {
+                    applied_count += 1;
+                }
+            }
+            applied.extend(outcome.descriptions);
             if outcome.done || iteration == pass.max_iterations {
                 break;
             }
             // Continuations must list everything applied so far, not just the
             // latest iteration, or the model re-emits earlier calls.
-            applied.extend(outcome.descriptions);
             prompt = (pass.continue_prompt)(
                 pass.explanation,
                 self.user_msg,
@@ -562,6 +574,17 @@ impl<'run> AgentRun<'run> {
                 &applied,
             );
         }
+        let seat = if pass.phase == "scribe" {
+            "scribe"
+        } else {
+            "heavy"
+        };
+        self.send_log(
+            "mem",
+            format!(
+                "{seat}: {parsed_count} parsed, {applied_count} applied, {denied_count} denied"
+            ),
+        );
         self.send_log(pass.phase, "done".to_string());
         Ok(())
     }
@@ -588,9 +611,10 @@ impl<'run> AgentRun<'run> {
             }
         };
         let tool_calls = parse_tool_calls(&call_text);
+        let parsed = tool_calls.len();
         self.send_log(
             pass.phase,
-            format!("iteration {iteration}: {} tool calls", tool_calls.len()),
+            format!("iteration {iteration}: {parsed} tool calls"),
         );
         // A response may both apply calls and declare the pass finished.
         let done = tool_calls.is_empty() || says_done(&call_text);
@@ -601,7 +625,11 @@ impl<'run> AgentRun<'run> {
             tool_calls,
             pass.default_memory_type,
         ) {
-            Ok(descriptions) => Ok(IterationOutcome { descriptions, done }),
+            Ok(descriptions) => Ok(IterationOutcome {
+                descriptions,
+                parsed,
+                done,
+            }),
             Err(err) => {
                 self.send_log(pass.phase, format!("error: {err}"));
                 Err(err)
@@ -705,7 +733,13 @@ pub(crate) fn parse_tool_calls(text: &str) -> Vec<ToolCall> {
         // rather than discarding the whole batch.
         Err(_) => match parse_embedded_json(stripped) {
             Some(json_value) => json_value,
-            None => return salvage_tool_calls(stripped),
+            None => {
+                let calls = salvage_tool_calls(stripped);
+                if calls.is_empty() && stripped.contains("\"tool") {
+                    log_dropped_text(stripped, "bad JSON");
+                }
+                return calls;
+            }
         },
     };
     if let Some(tools) = tool_array(&json_value) {
@@ -713,13 +747,18 @@ pub(crate) fn parse_tool_calls(text: &str) -> Vec<ToolCall> {
         for tool in tools {
             if let Some(call) = parse_single_tool(tool) {
                 calls.push(call);
+            } else {
+                log_dropped_tool(tool);
             }
         }
         return calls;
     }
     match parse_single_tool(&json_value) {
         Some(call) => vec![call],
-        None => Vec::new(),
+        None => {
+            log_dropped_tool(&json_value);
+            Vec::new()
+        }
     }
 }
 
@@ -737,13 +776,70 @@ fn salvage_tool_calls(text: &str) -> Vec<ToolCall> {
     let mut calls = Vec::new();
     for span in complete_object_spans(array_body) {
         let Ok(json_value) = serde_json::from_str::<serde_json::Value>(span) else {
+            log_dropped_text(span, "bad JSON");
             continue;
         };
         if let Some(call) = parse_single_tool(&json_value) {
             calls.push(call);
+        } else {
+            log_dropped_tool(&json_value);
         }
     }
     calls
+}
+
+fn log_dropped_tool(tool: &serde_json::Value) {
+    log_dropped_text(&tool.to_string(), dropped_tool_reason(tool));
+}
+
+fn dropped_tool_reason(tool: &serde_json::Value) -> &'static str {
+    let Some(name_value) = tool.get("tool") else {
+        return "bad shape";
+    };
+    let Some(name) = name_value.as_str() else {
+        return "bad shape";
+    };
+    if known_tool_name(name) {
+        "bad shape"
+    } else {
+        "unknown tool"
+    }
+}
+
+fn log_dropped_text(text: &str, reason: &str) {
+    let snippet = truncated_snippet(text);
+    runlog::log("mem", &format!("dropped tool call ({reason}): {snippet}"));
+}
+
+fn truncated_snippet(text: &str) -> String {
+    let mut snippet: String = text.chars().take(120).collect();
+    if text.chars().count() > 120 {
+        snippet.push('…');
+    }
+    snippet
+}
+
+fn known_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "upsert_node"
+            | "upsert_edge"
+            | "delete_node"
+            | "delete_edge"
+            | "expire_edge"
+            | "promote_edge"
+            | "gist_edge"
+            | "record_move"
+            | "define_task"
+            | "record_rule"
+            | "record_outcome"
+            | "record_reaction"
+            | "open_loop"
+            | "close_loop"
+            | "inbox_add"
+            | "register_interest"
+            | "set_ping_policy"
+    )
 }
 
 // Returns the byte spans of balanced top-level {...} objects, string-aware.
@@ -2661,7 +2757,7 @@ fn mutation_context(source_message_id: &str) -> EventContext {
 mod tests {
     use super::{
         AgentRun, IterationOutcome, MAX_PASS_ITERATIONS, MemoryEvent, ToolCall, TurnMode,
-        parse_tool_calls, parse_turn_mode, says_done, stream_collect,
+        dropped_tool_reason, parse_tool_calls, parse_turn_mode, says_done, stream_collect,
     };
     use crate::api::{Chunk, LlmClient, Stats, TurnOutcome};
     use crate::memory::ledger::Event;
@@ -2746,7 +2842,11 @@ mod tests {
             for _call in &tool_calls {
                 descriptions.push("applied".to_string());
             }
-            Ok(IterationOutcome { descriptions, done })
+            Ok(IterationOutcome {
+                parsed: descriptions.len(),
+                descriptions,
+                done,
+            })
         });
         assert!(result.is_ok());
         drop(receiver);
@@ -2778,7 +2878,11 @@ mod tests {
             for _call in &tool_calls {
                 descriptions.push("recorded".to_string());
             }
-            Ok(IterationOutcome { descriptions, done })
+            Ok(IterationOutcome {
+                parsed: descriptions.len(),
+                descriptions,
+                done,
+            })
         });
         assert!(result.is_ok());
         drop(receiver);
@@ -2865,6 +2969,16 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert!(matches!(calls[0], ToolCall::UpsertNode { .. }));
         assert!(matches!(calls[1], ToolCall::UpsertEdge { .. }));
+    }
+
+    #[test]
+    fn dropped_tool_calls_distinguish_unknown_names_from_bad_shapes() {
+        let unknown = serde_json::json!({"tool": "invent_memory", "args": {}});
+        let bad_shape = serde_json::json!({"tool": "upsert_edge", "args": {}});
+        assert_eq!(dropped_tool_reason(&unknown), "unknown tool");
+        assert_eq!(dropped_tool_reason(&bad_shape), "bad shape");
+        assert!(parse_tool_calls(&unknown.to_string()).is_empty());
+        assert!(parse_tool_calls(&bad_shape.to_string()).is_empty());
     }
 
     #[test]
