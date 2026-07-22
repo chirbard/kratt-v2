@@ -1254,22 +1254,6 @@ pub fn finish_pass_run(
     ))
 }
 
-#[allow(dead_code)] // Public compute-by-query API; digest uses the async form.
-pub fn last_successful_pass(
-    pass_type: &str,
-) -> Result<Option<PassRun>, Box<dyn Error + Send + Sync>> {
-    validate_pass_type(pass_type)?;
-    let conn = open_connection()?;
-    block_on(last_successful_pass_async(&conn, pass_type))
-}
-
-#[allow(dead_code)] // Public compute-by-query API; digest uses the async form.
-pub fn consecutive_failures(pass_type: &str) -> Result<usize, Box<dyn Error + Send + Sync>> {
-    validate_pass_type(pass_type)?;
-    let conn = open_connection()?;
-    block_on(consecutive_failures_async(&conn, pass_type))
-}
-
 fn validate_pass_type(pass_type: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
     if matches!(pass_type, "dream" | "exploration" | "news" | "ingestion") {
         return Ok(());
@@ -1435,17 +1419,12 @@ pub struct InboxItem {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-#[allow(dead_code)] // Full queue rows retain metadata beyond the ping renderer's fields.
 pub(crate) struct Finding {
     pub finding_id: i64,
     pub interest_topic: String,
     pub title: String,
     pub url: String,
-    pub snippet: String,
     pub novelty: f64,
-    pub found_at: String,
-    pub status: String,
-    pub surfaced_at: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -1592,7 +1571,7 @@ pub(crate) fn unsurfaced_findings(
     block_on(async {
         let mut rows = conn
             .query(
-                "SELECT id, interest_topic, title, url, snippet, novelty, found_at, status, surfaced_at
+                "SELECT id, interest_topic, title, url, novelty
                  FROM findings WHERE status = 'candidate' ORDER BY novelty DESC, found_at DESC LIMIT ?1",
                 params![limit as i64],
             )
@@ -1613,7 +1592,7 @@ pub(crate) async fn unsurfaced_findings_in_windows(
 ) -> Result<Vec<Finding>, Box<dyn Error + Send + Sync>> {
     let mut rows = conn
         .query(
-            "SELECT id, interest_topic, title, url, snippet, novelty, found_at, status, surfaced_at
+            "SELECT id, interest_topic, title, url, novelty
              FROM findings WHERE status = 'candidate' AND
              ((found_at >= ?1 AND found_at < ?2) OR (found_at >= ?3 AND found_at < ?4))
              ORDER BY novelty DESC, found_at DESC LIMIT ?5",
@@ -1633,11 +1612,7 @@ fn finding_from_row(row: &turso::Row) -> Result<Finding, Box<dyn Error + Send + 
         interest_topic: row.get::<String>(1)?,
         title: row.get::<String>(2)?,
         url: row.get::<String>(3)?,
-        snippet: row.get::<String>(4)?,
-        novelty: row.get::<f64>(5)?,
-        found_at: row.get::<String>(6)?,
-        status: row.get::<String>(7)?,
-        surfaced_at: row.get::<String>(8)?,
+        novelty: row.get::<f64>(4)?,
     })
 }
 
@@ -1740,15 +1715,6 @@ pub(crate) fn mark_finding_surfaced(
         return Err(err);
     }
     commit_transaction(conn)
-}
-
-#[allow(dead_code)] // Single-window API is part of the findings queue contract.
-pub(crate) async fn count_findings_in_window(
-    conn: &Connection,
-    from: &str,
-    until: &str,
-) -> Result<usize, Box<dyn Error + Send + Sync>> {
-    count_findings_in_windows(conn, from, until, from, until).await
 }
 
 pub(crate) async fn count_findings_in_windows(
@@ -2658,18 +2624,6 @@ pub fn load_task_chain(
     })
 }
 
-#[allow(dead_code)]
-pub fn update_edge_confidence(
-    conn: &Connection,
-    source: &str,
-    target: &str,
-    confidence: f64,
-) -> Result<bool, Box<dyn Error + Send + Sync>> {
-    runtime().block_on(update_edge_confidence_async(
-        conn, source, target, confidence,
-    ))
-}
-
 pub fn update_edge_reinforcement(
     conn: &Connection,
     edge: &Edge,
@@ -2826,15 +2780,6 @@ pub(crate) fn save_interest_embedding(
         .await?;
         Ok(())
     })
-}
-
-#[allow(dead_code)]
-pub(crate) fn interest_density(
-    vector: &[f64],
-    max_distance: f64,
-) -> Result<usize, Box<dyn Error + Send + Sync>> {
-    let conn = open_connection()?;
-    runtime().block_on(interest_density_with(&conn, vector, max_distance))
 }
 
 async fn interest_density_with(
@@ -3743,14 +3688,6 @@ fn loop_anchor_query(anchor_ids: &[String], today: &str, cap: usize) -> (String,
     (query, values)
 }
 
-#[allow(dead_code)]
-pub fn load_due_loops(
-    conn: &Connection,
-    today: &str,
-) -> Result<Vec<OpenLoop>, Box<dyn Error + Send + Sync>> {
-    runtime().block_on(load_due_loops_async(conn, today))
-}
-
 pub(super) async fn load_due_loops_async(
     conn: &Connection,
     today: &str,
@@ -4223,15 +4160,16 @@ pub(crate) fn int(val: Value) -> i64 {
 mod tests {
     use super::{
         DEFAULT_PING_MUTED_UNTIL, DecayChange, add_edge_ceiling_column, backfill_edge_epistemics,
-        block_on, clamp_stability_once, count_findings_in_window,
+        block_on, clamp_stability_once, count_findings_in_windows,
         count_new_embedding_neighbours_async, divert_ping_topic, finish_pass_run_async,
         insert_finding, insert_interest, int, interest_density_with, last_successful_pass_async,
-        load_all_edges_semantic_async, load_due_loops, load_game_edges, load_loops_for_anchors,
-        load_ping_policy, load_recent_attention_counts_async, load_session_game, load_task_chain,
-        load_unembedded_edges_async, mark_finding_surfaced, migrate_entity_bodies_matching_ids,
-        persist_decay_with, real, recover_replica_once, resume_pings, set_ping_mute,
-        stability_clamp_log_lines, start_pass_run_async, text, top_interests_with,
-        unsurfaced_findings, update_edge_confidence, with_write_lock, write_edge,
+        load_all_edges_semantic_async, load_due_loops_async, load_game_edges,
+        load_loops_for_anchors, load_ping_policy, load_recent_attention_counts_async,
+        load_session_game, load_task_chain, load_unembedded_edges_async, mark_finding_surfaced,
+        migrate_entity_bodies_matching_ids, persist_decay_with, real, recover_replica_once,
+        resume_pings, set_ping_mute, stability_clamp_log_lines, start_pass_run_async, text,
+        top_interests_with, unsurfaced_findings, update_edge_confidence_async, with_write_lock,
+        write_edge,
     };
     use crate::memory::graph::Edge;
     use crate::web::NewsItem;
@@ -4463,12 +4401,9 @@ mod tests {
                 .unwrap_or_default()
                 .is_empty()
         );
-        let count = block_on(count_findings_in_window(
-            &conn,
-            "2026-07-14T00:00:00Z",
-            "2026-07-15T00:00:00Z",
-        ))
-        .unwrap_or(0);
+        let from = "2026-07-14T00:00:00Z";
+        let until = "2026-07-15T00:00:00Z";
+        let count = block_on(count_findings_in_windows(&conn, from, until, from, until)).unwrap_or(0);
         assert_eq!(count, 1);
         assert_eq!(count_surfaced_events(&conn, "ping-1"), 1);
     }
@@ -4773,7 +4708,9 @@ mod tests {
         assert_eq!(dreamed_stored.confidence, 0.25);
         assert_eq!(confirmed_stored.confidence, 0.9);
 
-        assert!(update_edge_confidence(&conn, "dream", "target", 0.8).unwrap_or(false));
+        assert!(
+            block_on(update_edge_confidence_async(&conn, "dream", "target", 0.8)).unwrap_or(false)
+        );
         let Ok(Some(updated)) = super::load_edge(&conn, "dream", "target") else {
             unreachable!("updated edge loads")
         };
@@ -5429,7 +5366,7 @@ mod tests {
         let conn = block_on(loop_harness());
         block_on(seed_due_loop_cases(&conn));
 
-        let Ok(loops) = load_due_loops(&conn, "2026-07-11") else {
+        let Ok(loops) = block_on(load_due_loops_async(&conn, "2026-07-11")) else {
             unreachable!("due loops load")
         };
         let mut displays = Vec::new();

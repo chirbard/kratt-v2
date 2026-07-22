@@ -52,6 +52,6 @@ pub use ledger::{
 pub(crate) use ledger::catch_up_digest_async;
 pub(crate) use loops::{OpenLoops, load_open_loops};
 #[allow(unused_imports)]
-pub use reinforce::{record_move_outcome, record_outcome};
+pub use reinforce::record_outcome;
 pub use routing::Routing;
 pub use task_chain::{GameKnowledge, TaskChain, load_game_knowledge, load_task_chain};

@@ -169,11 +169,7 @@ mod tests {
             interest_topic: topic.to_string(),
             title: "A finding".to_string(),
             url: "https://example.com".to_string(),
-            snippet: String::new(),
             novelty,
-            found_at: "2026-07-14T10:00:00".to_string(),
-            status: "candidate".to_string(),
-            surfaced_at: String::new(),
         }
     }
 

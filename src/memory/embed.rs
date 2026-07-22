@@ -30,10 +30,6 @@ const INTEREST_TARGETS: usize = 5; // replay-tunable.
 const W_SIM: f64 = 0.65; // replay-tunable.
 const W_CONF: f64 = 0.2; // replay-tunable.
 const W_RECENCY: f64 = 0.15; // replay-tunable.
-// Novelty is an exploration signal, not a recall signal: penalizing
-// often-seen edges suppresses exactly the beliefs a follow-up question
-// needs. Keep at 0 for chat; exploration ranking has its own novelty.
-const W_NOVELTY: f64 = 0.0; // replay-tunable.
 // Any episodic edge reaching rank_score has already survived session
 // scoping (scope_episodic), so it is guaranteed same-session — rank it as
 // maximally relevant recent experience.
@@ -188,8 +184,7 @@ pub fn select_semantic_edges_routed(
     };
     let all_edges = all_semantic_edges(Some(session_id));
     let pool = expand_hops_pool(anchors, all_edges);
-    let user_views = db::load_edge_actor_views("user", "local");
-    let edges = rank_pool_for_chat(pool, &routing.routing_vector, &user_views);
+    let edges = rank_pool_for_chat(pool, &routing.routing_vector);
     RoutedSemanticSelection { edges, routing }
 }
 
@@ -729,17 +724,13 @@ fn rank_and_cap(mut pool: Vec<SemanticEdge>) -> Vec<SemanticEdge> {
     pool
 }
 
-fn rank_pool_for_chat(
-    pool: Vec<SemanticEdge>,
-    routing_vector: &[f64],
-    user_views: &HashMap<(String, String), f64>,
-) -> Vec<SemanticEdge> {
+fn rank_pool_for_chat(pool: Vec<SemanticEdge>, routing_vector: &[f64]) -> Vec<SemanticEdge> {
     let mut scored = Vec::new();
     let mut index = 0usize;
     while index < pool.len() {
         let edge = pool[index].clone();
         let has_embedding = edge.embedding.is_some();
-        let score = rank_score(&edge, routing_vector, user_views);
+        let score = rank_score(&edge, routing_vector);
         scored.push(ChatScoredEdge {
             has_embedding,
             score,
@@ -761,15 +752,10 @@ fn rank_pool_for_chat(
     edges
 }
 
-fn rank_score(
-    edge: &SemanticEdge,
-    routing_vector: &[f64],
-    user_views: &HashMap<(String, String), f64>,
-) -> f64 {
+fn rank_score(edge: &SemanticEdge, routing_vector: &[f64]) -> f64 {
     let sim = similarity_term(routing_vector, edge.embedding.as_deref());
     let recency = recency_term(&edge.date);
-    let novelty = novelty_term(edge, user_views);
-    weighted_rank_score(edge, sim, recency, novelty)
+    weighted_rank_score(edge, sim, recency)
 }
 
 pub(crate) fn replay_rank_score(
@@ -779,11 +765,11 @@ pub(crate) fn replay_rank_score(
 ) -> f64 {
     let sim = similarity_term(routing_vector, edge.embedding.as_deref());
     let recency = recency_term_at(&edge.date, reference_date);
-    weighted_rank_score(edge, sim, recency, 0.0)
+    weighted_rank_score(edge, sim, recency)
 }
 
-fn weighted_rank_score(edge: &SemanticEdge, sim: f64, recency: f64, novelty: f64) -> f64 {
-    let base = W_SIM * sim + W_CONF * edge.confidence + W_RECENCY * recency + W_NOVELTY * novelty;
+fn weighted_rank_score(edge: &SemanticEdge, sim: f64, recency: f64) -> f64 {
+    let base = W_SIM * sim + W_CONF * edge.confidence + W_RECENCY * recency;
     if edge.memory_type == "episodic" {
         base + EPISODIC_RANK_BONUS
     } else {
@@ -799,12 +785,6 @@ fn similarity_term(routing_vector: &[f64], edge_embedding: Option<&[f64]>) -> f6
         return 0.0;
     }
     ledger::cosine_similarity(routing_vector, embedding).unwrap_or(0.0)
-}
-
-fn novelty_term(edge: &SemanticEdge, user_views: &HashMap<(String, String), f64>) -> f64 {
-    let key = (edge.source.clone(), edge.target.clone());
-    let views = *user_views.get(&key).unwrap_or(&0.0);
-    1.0 / (1.0 + views)
 }
 
 fn recency_term(date: &str) -> f64 {
@@ -966,7 +946,7 @@ mod tests {
             edge.target = format!("target-{index}");
             edges.push(edge);
         }
-        let ranked = rank_pool_for_chat(edges, &[], &HashMap::new());
+        let ranked = rank_pool_for_chat(edges, &[]);
         assert_eq!(ranked.len(), CHAT_INITIAL_K);
     }
 
