@@ -1,11 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
-use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use tokio::runtime::Runtime;
 use turso::{Builder, Connection, Database, Value, params};
 
 use super::graph::{
@@ -16,6 +14,24 @@ use super::graph::{
 use super::loops::OpenLoop;
 
 use crate::paths;
+
+mod core;
+mod inbox;
+mod pass_runs;
+mod values;
+
+pub(crate) use core::{acquire_write_lock, block_on};
+use core::{runtime, with_write_lock};
+pub use inbox::{
+    InboxItem, count_queued_inbox, inbox_source_is_queued, insert_inbox_item, load_inbox_outcomes,
+    load_queued_inbox_names, oldest_queued_inbox, resolve_inbox_item,
+};
+pub use pass_runs::{PassRun, finish_pass_run, start_pass_run};
+pub(crate) use pass_runs::{
+    consecutive_failures_async, last_successful_pass_async, pass_runs_in_window_async,
+};
+pub(crate) use values::{int, real, round2, text};
+use values::{optional_real, optional_text, text_or};
 
 pub type SemanticEdgeRow = (
     String,
@@ -39,17 +55,6 @@ pub type OpenCuriosityNoteRow = (String, String, String, String);
 pub(crate) const INTEREST_NEIGHBOUR_DISTANCE: f64 = 0.25; // replay-tunable.
 pub(crate) const DEFAULT_PING_MUTED_UNTIL: &str = "9999-12-31T23:59:59";
 const STABILITY_CLAMP_MARKER: &str = "stability_clamp";
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PassRun {
-    pub run_id: i64,
-    pub pass_type: String,
-    pub started_at: String,
-    pub finished_at: String,
-    pub outcome: String,
-    pub reason_class: String,
-    pub items_added: usize,
-}
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Interest {
@@ -98,20 +103,6 @@ pub(crate) struct SequenceSuggestion {
     pub turn_id: String,
     pub source: String,
     pub target: String,
-}
-
-#[allow(clippy::expect_used)]
-fn runtime() -> &'static Runtime {
-    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
-    // OnceLock::get_or_init requires FnOnce() -> T — no way to propagate errors
-    RUNTIME.get_or_init(|| Runtime::new().expect("tokio runtime"))
-}
-
-pub(crate) fn block_on<F>(future: F) -> F::Output
-where
-    F: Future,
-{
-    runtime().block_on(future)
 }
 
 // Synced mode: when TURSO_DATABASE_URL and TURSO_AUTH_TOKEN are set, the app
@@ -540,23 +531,6 @@ async fn copy_table(
         copied += 1;
     }
     Ok(copied)
-}
-
-// Turso sync and checkpoint operations mutate database-wide state and can
-// dissolve a transaction on another connection. Every write pass and every
-// sync operation must serialize on this lock.
-static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-pub fn acquire_write_lock() -> std::sync::MutexGuard<'static, ()> {
-    match WRITE_LOCK.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
-
-fn with_write_lock<Output>(operation: impl FnOnce() -> Output) -> Output {
-    let _write_guard = acquire_write_lock();
-    operation()
 }
 
 async fn init_schema(
@@ -1228,196 +1202,6 @@ pub fn timestamp_now() -> String {
     crate::timeutil::timestamp_now()
 }
 
-pub fn start_pass_run(pass_type: &str) -> Result<i64, Box<dyn Error + Send + Sync>> {
-    validate_pass_type(pass_type)?;
-    let _write_guard = acquire_write_lock();
-    let conn = open_connection()?;
-    block_on(start_pass_run_async(&conn, pass_type))
-}
-
-pub fn finish_pass_run(
-    run_id: i64,
-    outcome: &str,
-    reason_class: &str,
-    items_added: usize,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    validate_pass_outcome(outcome)?;
-    validate_reason_class(reason_class)?;
-    let _write_guard = acquire_write_lock();
-    let conn = open_connection()?;
-    block_on(finish_pass_run_async(
-        &conn,
-        run_id,
-        outcome,
-        reason_class,
-        items_added,
-    ))
-}
-
-fn validate_pass_type(pass_type: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-    if matches!(pass_type, "dream" | "exploration" | "news" | "ingestion") {
-        return Ok(());
-    }
-    Err(format!("invalid pass type: {pass_type}").into())
-}
-
-fn validate_pass_outcome(outcome: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-    if matches!(outcome, "ok" | "failed" | "skipped") {
-        return Ok(());
-    }
-    Err(format!("invalid pass outcome: {outcome}").into())
-}
-
-fn validate_reason_class(reason_class: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-    if matches!(
-        reason_class,
-        "none"
-            | "context_length"
-            | "provider_error"
-            | "database_error"
-            | "no_material"
-            | "not_eligible"
-            | "unavailable"
-            | "interrupted"
-    ) {
-        return Ok(());
-    }
-    Err(format!("invalid pass reason class: {reason_class}").into())
-}
-
-pub(crate) async fn start_pass_run_async(
-    conn: &Connection,
-    pass_type: &str,
-) -> Result<i64, Box<dyn Error + Send + Sync>> {
-    validate_pass_type(pass_type)?;
-    conn.execute(
-        "INSERT INTO pass_runs (pass_type, started_at) VALUES (?1, ?2)",
-        params![pass_type, timestamp_now()],
-    )
-    .await?;
-    let mut rows = conn.query("SELECT last_insert_rowid()", ()).await?;
-    let Some(row) = rows.next().await? else {
-        return Err("pass run insert did not return an id".into());
-    };
-    Ok(int(row.get_value(0)?))
-}
-
-pub(crate) async fn finish_pass_run_async(
-    conn: &Connection,
-    run_id: i64,
-    outcome: &str,
-    reason_class: &str,
-    items_added: usize,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    validate_pass_outcome(outcome)?;
-    validate_reason_class(reason_class)?;
-    conn.execute(
-        "UPDATE pass_runs SET finished_at = ?1, outcome = ?2, reason_class = ?3, items_added = ?4 WHERE id = ?5",
-        params![
-            timestamp_now(),
-            outcome,
-            reason_class,
-            items_added as i64,
-            run_id
-        ],
-    )
-    .await?;
-    Ok(())
-}
-
-pub(crate) async fn pass_runs_in_window_async(
-    conn: &Connection,
-    pass_type: &str,
-    from: &str,
-    until: &str,
-) -> Result<Vec<PassRun>, Box<dyn Error + Send + Sync>> {
-    validate_pass_type(pass_type)?;
-    let mut rows = conn
-        .query(
-            "SELECT id, pass_type, started_at, finished_at, outcome, reason_class, items_added
-             FROM pass_runs
-             WHERE pass_type = ?1 AND started_at >= ?2 AND started_at < ?3
-             ORDER BY id",
-            params![pass_type, from, until],
-        )
-        .await?;
-    collect_pass_runs(&mut rows).await
-}
-
-pub(crate) async fn last_successful_pass_async(
-    conn: &Connection,
-    pass_type: &str,
-) -> Result<Option<PassRun>, Box<dyn Error + Send + Sync>> {
-    validate_pass_type(pass_type)?;
-    let mut rows = conn
-        .query(
-            "SELECT id, pass_type, started_at, finished_at, outcome, reason_class, items_added
-             FROM pass_runs
-             WHERE pass_type = ?1 AND outcome = 'ok'
-             ORDER BY id DESC LIMIT 1",
-            params![pass_type],
-        )
-        .await?;
-    let mut runs = collect_pass_runs(&mut rows).await?;
-    Ok(runs.pop())
-}
-
-pub(crate) async fn consecutive_failures_async(
-    conn: &Connection,
-    pass_type: &str,
-) -> Result<usize, Box<dyn Error + Send + Sync>> {
-    validate_pass_type(pass_type)?;
-    let mut rows = conn
-        .query(
-            "SELECT
-                 MAX(CASE WHEN outcome = 'ok' THEN 1 ELSE 0 END),
-                 MAX(CASE WHEN outcome = 'failed' THEN 1 ELSE 0 END)
-             FROM pass_runs
-             WHERE pass_type = ?1
-             GROUP BY substr(started_at, 1, 10)
-             ORDER BY substr(started_at, 1, 10) DESC",
-            params![pass_type],
-        )
-        .await?;
-    let mut failures = 0usize;
-    while let Some(row) = rows.next().await? {
-        let had_success = real(row.get_value(0)?) > 0.0;
-        let had_failure = real(row.get_value(1)?) > 0.0;
-        if had_success {
-            break;
-        }
-        if had_failure {
-            failures += 1;
-        }
-    }
-    Ok(failures)
-}
-
-async fn collect_pass_runs(
-    rows: &mut turso::Rows,
-) -> Result<Vec<PassRun>, Box<dyn Error + Send + Sync>> {
-    let mut runs = Vec::new();
-    while let Some(row) = rows.next().await? {
-        runs.push(PassRun {
-            run_id: int(row.get_value(0)?),
-            pass_type: text(row.get_value(1)?),
-            started_at: text(row.get_value(2)?),
-            finished_at: text(row.get_value(3)?),
-            outcome: text(row.get_value(4)?),
-            reason_class: text(row.get_value(5)?),
-            items_added: real(row.get_value(6)?) as usize,
-        });
-    }
-    Ok(runs)
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct InboxItem {
-    pub item_id: i64,
-    pub source: String,
-    pub instruction: String,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Finding {
     pub finding_id: i64,
@@ -1431,112 +1215,6 @@ pub(crate) struct Finding {
 pub(crate) struct PingPolicy {
     pub muted_until: String,
     pub diverts: Vec<(String, String)>,
-}
-
-pub fn insert_inbox_item(
-    conn: &Connection,
-    source: &str,
-    instruction: &str,
-) -> Result<i64, Box<dyn Error + Send + Sync>> {
-    let accepted_at = timestamp_now();
-    block_on(async {
-        conn.execute(
-            "INSERT INTO inbox (accepted_at, source, instruction) VALUES (?1, ?2, ?3)",
-            params![accepted_at, source, instruction],
-        )
-        .await?;
-        Ok(conn.last_insert_rowid())
-    })
-}
-
-pub fn oldest_queued_inbox(
-    conn: &Connection,
-) -> Result<Option<InboxItem>, Box<dyn Error + Send + Sync>> {
-    block_on(async {
-        let mut rows = conn
-            .query(
-                "SELECT id, source, instruction FROM inbox WHERE status = 'queued' ORDER BY id LIMIT 1",
-                (),
-            )
-            .await?;
-        let Some(row) = rows.next().await? else {
-            return Ok(None);
-        };
-        Ok(Some(InboxItem {
-            item_id: row.get::<i64>(0)?,
-            source: row.get::<String>(1)?,
-            instruction: row.get::<String>(2)?,
-        }))
-    })
-}
-
-// Short display names (last path/URL segment) of queued items, oldest first,
-// capped — feeds the chat-visible internal-state line.
-pub async fn load_queued_inbox_names(conn: &Connection) -> Vec<String> {
-    let Ok(mut rows) = conn
-        .query(
-            "SELECT source FROM inbox WHERE status = 'queued' ORDER BY id LIMIT 3",
-            (),
-        )
-        .await
-    else {
-        return Vec::new();
-    };
-    let mut names = Vec::new();
-    while let Ok(Some(row)) = rows.next().await {
-        let source = row.get::<String>(0).unwrap_or_default();
-        let name = match source.trim_end_matches('/').rsplit('/').next() {
-            Some(tail) if !tail.is_empty() => tail.to_string(),
-            _ => source,
-        };
-        names.push(name);
-    }
-    names
-}
-
-pub fn inbox_source_is_queued(
-    conn: &Connection,
-    source: &str,
-) -> Result<bool, Box<dyn Error + Send + Sync>> {
-    block_on(async {
-        let mut rows = conn
-            .query(
-                "SELECT 1 FROM inbox WHERE status = 'queued' AND source = ?1 LIMIT 1",
-                params![source],
-            )
-            .await?;
-        Ok(rows.next().await?.is_some())
-    })
-}
-
-pub fn resolve_inbox_item(
-    conn: &Connection,
-    item_id: i64,
-    status: &str,
-    result: &str,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let resolved_at = timestamp_now();
-    block_on(async {
-        conn.execute(
-            "UPDATE inbox SET status = ?1, resolved_at = ?2, result = ?3 WHERE id = ?4",
-            params![status, resolved_at, result, item_id],
-        )
-        .await?;
-        Ok(())
-    })
-}
-
-pub async fn count_queued_inbox(conn: &Connection) -> usize {
-    let Ok(mut rows) = conn
-        .query("SELECT COUNT(*) FROM inbox WHERE status = 'queued'", ())
-        .await
-    else {
-        return 0;
-    };
-    match rows.next().await {
-        Ok(Some(row)) => row.get::<i64>(0).unwrap_or(0) as usize,
-        _ => 0,
-    }
 }
 
 pub(crate) fn insert_finding(
@@ -1736,29 +1414,6 @@ pub(crate) async fn count_findings_in_windows(
         return Ok(0);
     };
     Ok(row.get::<i64>(0)? as usize)
-}
-
-pub async fn load_inbox_outcomes(
-    conn: &Connection,
-    from: &str,
-    until: &str,
-) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
-    let Ok(mut rows) = conn.query(
-        "SELECT source, status, result FROM inbox WHERE status = 'queued' OR (resolved_at >= ?1 AND resolved_at < ?2) ORDER BY id",
-        params![from, until],
-    ).await else { return Ok(Vec::new()) };
-    let mut outcomes = Vec::new();
-    while let Some(row) = rows.next().await? {
-        let source = row.get::<String>(0)?;
-        let status = row.get::<String>(1)?;
-        let result = row.get::<String>(2)?;
-        if status == "failed" {
-            outcomes.push(format!("{source}: failed ({result})"));
-        } else {
-            outcomes.push(format!("{source}: {status}"));
-        }
-    }
-    Ok(outcomes)
 }
 
 // Bootstrap for an EMPTY database only (db_init returns early when any node
@@ -2139,10 +1794,6 @@ fn dedup_interests(interests: &mut Vec<Interest>) {
 // Weights are stored at two decimals: full float precision survives every
 // multiply-and-write cycle (decay, reinforce) and bloats the prompt/token
 // side; nothing downstream needs more than 0.01 resolution.
-pub(crate) fn round2(value: f64) -> f64 {
-    (value * 100.0).round() / 100.0
-}
-
 fn clamped_confidence(confidence: f64, provenance: &str, ceiling: Option<f64>) -> f64 {
     round2(confidence.min(edge_ceiling(provenance, ceiling)))
 }
@@ -4102,30 +3753,6 @@ pub(super) fn parse_edge_row(row: &turso::Row) -> Option<Edge> {
     })
 }
 
-fn text_or(value: Result<Value, turso::Error>, default: &str) -> String {
-    match value {
-        Ok(Value::Text(text)) => text,
-        _ => default.to_string(),
-    }
-}
-
-fn optional_text(value: Option<Value>) -> Option<String> {
-    match value? {
-        Value::Text(string) => Some(string),
-        Value::Null => None,
-        _ => None,
-    }
-}
-
-fn optional_real(value: Option<Value>) -> Option<f64> {
-    match value? {
-        Value::Real(number) => Some(number),
-        Value::Integer(number) => Some(number as f64),
-        Value::Null => None,
-        _ => None,
-    }
-}
-
 fn parse_optional_vector32(value: Option<Value>) -> Option<Vec<f64>> {
     let json_text = optional_text(value)?;
     if json_text.is_empty() {
@@ -4134,42 +3761,19 @@ fn parse_optional_vector32(value: Option<Value>) -> Option<Vec<f64>> {
     parse_vector32_json(&json_text).ok()
 }
 
-pub(crate) fn text(val: Value) -> String {
-    match val {
-        Value::Text(string) => string,
-        _ => String::new(),
-    }
-}
-
-pub(crate) fn real(val: Value) -> f64 {
-    match val {
-        Value::Real(float) => float,
-        Value::Integer(int) => int as f64,
-        _ => 0.0,
-    }
-}
-
-pub(crate) fn int(val: Value) -> i64 {
-    match val {
-        Value::Integer(int) => int,
-        _ => 0,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         DEFAULT_PING_MUTED_UNTIL, DecayChange, add_edge_ceiling_column, backfill_edge_epistemics,
         block_on, clamp_stability_once, count_findings_in_windows,
-        count_new_embedding_neighbours_async, divert_ping_topic, finish_pass_run_async,
-        insert_finding, insert_interest, int, interest_density_with, last_successful_pass_async,
-        load_all_edges_semantic_async, load_due_loops_async, load_game_edges,
-        load_loops_for_anchors, load_ping_policy, load_recent_attention_counts_async,
-        load_session_game, load_task_chain, load_unembedded_edges_async, mark_finding_surfaced,
-        migrate_entity_bodies_matching_ids, persist_decay_with, real, recover_replica_once,
-        resume_pings, set_ping_mute, stability_clamp_log_lines, start_pass_run_async, text,
-        top_interests_with, unsurfaced_findings, update_edge_confidence_async, with_write_lock,
-        write_edge,
+        count_new_embedding_neighbours_async, divert_ping_topic, insert_finding, insert_interest,
+        int, interest_density_with, load_all_edges_semantic_async, load_due_loops_async,
+        load_game_edges, load_loops_for_anchors, load_ping_policy,
+        load_recent_attention_counts_async, load_session_game, load_task_chain,
+        load_unembedded_edges_async, mark_finding_surfaced, migrate_entity_bodies_matching_ids,
+        persist_decay_with, real, recover_replica_once, resume_pings, set_ping_mute,
+        stability_clamp_log_lines, text, top_interests_with, unsurfaced_findings,
+        update_edge_confidence_async, with_write_lock, write_edge,
     };
     use crate::memory::graph::Edge;
     use crate::web::NewsItem;
@@ -4182,77 +3786,6 @@ mod tests {
     const NODES_DDL: &str = "CREATE TABLE nodes (id TEXT PRIMARY KEY, node_type TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '')";
     const FINDINGS_DDL: &str = "CREATE TABLE findings (id INTEGER PRIMARY KEY AUTOINCREMENT, interest_topic TEXT NOT NULL, title TEXT NOT NULL, url TEXT NOT NULL, snippet TEXT NOT NULL DEFAULT '', novelty REAL NOT NULL, found_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'candidate', surfaced_at TEXT NOT NULL DEFAULT '')";
     const PING_POLICY_DDL: &str = "CREATE TABLE ping_policy (topic TEXT PRIMARY KEY, muted_until TEXT NOT NULL DEFAULT '', divert_until TEXT NOT NULL DEFAULT '')";
-
-    async fn pass_run_harness() -> Connection {
-        let Ok(database) = Builder::new_local(":memory:").build().await else {
-            unreachable!("in-memory database builds")
-        };
-        let Ok(conn) = database.connect() else {
-            unreachable!("in-memory database connects")
-        };
-        let Ok(()) = super::create_pass_run_table(&conn).await else {
-            unreachable!("pass run table creates")
-        };
-        conn
-    }
-
-    #[test]
-    fn pass_run_records_failure_reason_and_items() {
-        let conn = block_on(pass_run_harness());
-        let Ok(run_id) = block_on(start_pass_run_async(&conn, "dream")) else {
-            unreachable!("pass starts")
-        };
-        assert!(
-            block_on(finish_pass_run_async(
-                &conn,
-                run_id,
-                "failed",
-                "context_length",
-                0,
-            ))
-            .is_ok()
-        );
-        let runs =
-            block_on(super::pass_runs_in_window_async(&conn, "dream", "", "z")).unwrap_or_default();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].outcome, "failed");
-        assert_eq!(runs[0].reason_class, "context_length");
-    }
-
-    #[test]
-    fn pass_failure_streak_resets_after_success() {
-        let conn = block_on(pass_run_harness());
-        block_on(async {
-            let _ = conn.execute(
-                "INSERT INTO pass_runs (pass_type, started_at, finished_at, outcome, reason_class) VALUES
-                 ('dream', strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-3 days'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-3 days'), 'ok', 'none'),
-                 ('dream', strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-2 days'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-2 days'), 'failed', 'provider_error'),
-                 ('dream', strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 day'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 day'), 'failed', 'provider_error'),
-                 ('dream', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'failed', 'context_length')",
-                (),
-            ).await;
-        });
-        assert_eq!(
-            block_on(super::consecutive_failures_async(&conn, "dream")).unwrap_or_default(),
-            3
-        );
-        let last = block_on(last_successful_pass_async(&conn, "dream")).unwrap_or_default();
-        assert!(last.is_some());
-        let Ok(run_id) = block_on(start_pass_run_async(&conn, "dream")) else {
-            unreachable!("success starts")
-        };
-        assert!(block_on(finish_pass_run_async(&conn, run_id, "ok", "none", 4)).is_ok());
-        assert_eq!(
-            block_on(super::consecutive_failures_async(&conn, "dream")).unwrap_or_default(),
-            0
-        );
-        let latest = block_on(last_successful_pass_async(&conn, "dream")).unwrap_or_default();
-        let items_added = match latest {
-            Some(run) => Some(run.items_added),
-            None => None,
-        };
-        assert_eq!(items_added, Some(4));
-    }
 
     #[test]
     fn startup_recovery_moves_replica_and_retries_once() {
