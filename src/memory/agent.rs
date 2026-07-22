@@ -122,6 +122,7 @@ pub(crate) enum ToolCall {
         importance: f64,
         subject: bool,
         date: String,
+        occurred_at: Option<String>,
         // None means the caller did not specify memory_type — the writer's
         // default (ApplyToolOptions::default_memory_type) applies.
         memory_type: Option<String>,
@@ -990,10 +991,9 @@ pub(crate) fn memory_mutation_tools() -> serde_json::Value {
                 "properties": {
                     "name": {"type": "string"},
                     "type": {"type": "string", "enum": ["entity", "fact", "note"]},
-                    "body": {"type": "string"},
-                    "date": {"type": "string"}
+                    "body": {"type": "string"}
                 },
-                "required": ["name", "type", "body", "date"]
+                "required": ["name", "type", "body"]
             }),
         ),
         memory_tool(
@@ -1018,10 +1018,10 @@ pub(crate) fn memory_mutation_tools() -> serde_json::Value {
                     "confidence": {"type": "number"},
                     "importance": {"type": "number"},
                     "subject": {"type": "boolean"},
-                    "date": {"type": "string"},
+                    "occurred_at": {"type": "string"},
                     "memory_type": {"type": "string", "enum": ["episodic", "semantic"]}
                 },
-                "required": ["source", "target", "content", "stability", "confidence", "importance", "subject", "date"]
+                "required": ["source", "target", "content", "stability", "confidence", "importance", "subject"]
             }),
         ),
         memory_tool(
@@ -1110,6 +1110,7 @@ fn parse_upsert_edge(args: &serde_json::Value) -> Option<ToolCall> {
             date_val
         }
     };
+    let occurred_at = json_str(args, "occurred_at");
     Some(ToolCall::UpsertEdge {
         source,
         target,
@@ -1119,6 +1120,11 @@ fn parse_upsert_edge(args: &serde_json::Value) -> Option<ToolCall> {
         importance: json_f64(args, "importance"),
         subject: json_bool(args, "subject"),
         date,
+        occurred_at: if occurred_at.trim().is_empty() {
+            None
+        } else {
+            Some(occurred_at)
+        },
         memory_type: json_opt_str(args, "memory_type"),
         inferred_from: parse_optional_edge_refs(args, "inferred_from"),
     })
@@ -1727,10 +1733,10 @@ pub(crate) fn apply_tool_call<'scope>(
         return Ok("mutation denied: loop lifecycle requires open_loop or close_loop".to_string());
     }
     match call {
-        ToolCall::UpsertNode { name, node_type, body, date } =>
-            apply_declared_upsert_node(conn, name, node_type, body, date),
-        ToolCall::UpsertEdge { source, target, content, stability, confidence, importance, subject, date, memory_type, inferred_from } =>
-            apply_upsert_edge_call(conn, options, events, UpsertEdgeCall { source, target, content, stability, confidence, importance, subject, date, memory_type, inferred_from }),
+        ToolCall::UpsertNode { name, node_type, body, date: _ } =>
+            apply_declared_upsert_node(conn, name, node_type, body),
+        ToolCall::UpsertEdge { source, target, content, stability, confidence, importance, subject, date: _, occurred_at, memory_type, inferred_from } =>
+            apply_upsert_edge_call(conn, options, events, UpsertEdgeCall { source, target, content, stability, confidence, importance, subject, occurred_at, memory_type, inferred_from }),
         ToolCall::DeleteNode { name } =>
             apply_delete_node(conn, name, options, events),
         ToolCall::DeleteEdge { source, target } =>
@@ -2447,7 +2453,7 @@ struct UpsertEdgeCall {
     confidence: f64,
     importance: f64,
     subject: bool,
-    date: String,
+    occurred_at: Option<String>,
     memory_type: Option<String>,
     inferred_from: Option<Vec<(String, String)>>,
 }
@@ -2466,8 +2472,8 @@ fn upsert_edge_to_edge(
         confidence: call.confidence,
         importance: call.importance,
         subject: call.subject,
-        date: call.date,
-        occurred_at: None,
+        date: crate::prompts::today_iso(),
+        occurred_at: call.occurred_at,
         expired_at: None,
         memory_type,
         origin_session,
@@ -2491,6 +2497,9 @@ fn apply_upsert_edge_call<'scope>(
         Some(requested) => super::graph::normalize_memory_type(&requested),
         None => options.default_memory_type.to_string(),
     };
+    if memory_type == "episodic" {
+        call.occurred_at = None;
+    }
     let origin_session = if memory_type == "episodic" {
         options.context.session_id.clone()
     } else {
@@ -2577,7 +2586,6 @@ fn apply_declared_upsert_node(
     name: String,
     node_type: String,
     body: String,
-    date: String,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
     let normalized = normalize_id(&name);
     let synthesis_nodes = HashSet::new();
@@ -2585,7 +2593,20 @@ fn apply_declared_upsert_node(
         runlog::log("nodes", &format!("denied: {denial}"));
         return Ok(denial);
     }
+    let date = first_seen_date(conn, &normalized)?;
     apply_upsert_node(conn, name, "fact".to_string(), body, date)
+}
+
+fn first_seen_date(
+    conn: &Connection,
+    node_id: &str,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    if let Some(stored) = db::load_node(conn, node_id)?
+        && !stored.date.is_empty()
+    {
+        return Ok(stored.date);
+    }
+    Ok(crate::prompts::today_iso())
 }
 
 fn apply_upsert_edge<'scope>(

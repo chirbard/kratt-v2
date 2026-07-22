@@ -789,7 +789,8 @@ fn apply_dream_call<'scope, 'policy>(
             confidence,
             importance,
             subject,
-            date,
+            date: _,
+            occurred_at,
             memory_type: _,
             inferred_from,
         } => apply_dream_upsert_edge(
@@ -802,7 +803,7 @@ fn apply_dream_call<'scope, 'policy>(
                 confidence,
                 importance,
                 subject,
-                date,
+                occurred_at,
                 inferred_from,
             },
         ),
@@ -810,8 +811,8 @@ fn apply_dream_call<'scope, 'policy>(
             name,
             node_type,
             body,
-            date,
-        } => apply_dream_upsert_node(ctx, DreamNodeCall::new(name, node_type, body, date)),
+            date: _,
+        } => apply_dream_upsert_node(ctx, DreamNodeCall::new(name, node_type, body)),
         ToolCall::DeleteEdge { source, target } => {
             apply_dream_delete_edge(ctx, DreamDeleteEdgeCall::new(source, target))
         }
@@ -1037,7 +1038,7 @@ struct DreamEdgeCall {
     confidence: f64,
     importance: f64,
     subject: bool,
-    date: String,
+    occurred_at: Option<String>,
     inferred_from: Option<Vec<(String, String)>>,
 }
 
@@ -1059,7 +1060,6 @@ struct DreamNodeCall {
     name: String,
     node_type: String,
     body: String,
-    date: String,
 }
 
 struct DreamDeleteEdgeCall {
@@ -1081,12 +1081,11 @@ struct DreamCallContext<'scope, 'policy> {
 }
 
 impl DreamNodeCall {
-    fn new(name: String, node_type: String, body: String, date: String) -> Self {
+    fn new(name: String, node_type: String, body: String) -> Self {
         Self {
             name,
             node_type,
             body,
-            date,
         }
     }
 }
@@ -1123,8 +1122,8 @@ fn dream_edge(
         confidence: weights.1,
         importance: edge_call.importance,
         subject: edge_call.subject,
-        date: edge_call.date,
-        occurred_at: None,
+        date: crate::prompts::today_iso(),
+        occurred_at: edge_call.occurred_at,
         expired_at: None,
         memory_type: "semantic".to_string(),
         origin_session: String::new(),
@@ -1257,10 +1256,14 @@ fn apply_dream_upsert_node<'scope, 'policy>(
         return Ok((denial, false));
     }
     let node_type = resolved_node_type(&normalized, &node_call.node_type, ctx.apply_state);
+    let date = match db::load_node(ctx.conn, &normalized)? {
+        Some(stored) if !stored.date.is_empty() => stored.date,
+        _ => crate::prompts::today_iso(),
+    };
     let node = Node {
         node_type: node_type.clone(),
         body: node_call.body,
-        date: node_call.date,
+        date,
     };
     db::write_node(ctx.conn, &normalized, &node)?;
     Ok((

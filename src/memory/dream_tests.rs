@@ -361,7 +361,6 @@
             "higher-order".to_string(),
             "synthesis".to_string(),
             "a supported synthesis".to_string(),
-            String::new(),
         );
         let Ok((description, changed_edge)) = apply_dream_upsert_node(&ctx, call) else {
             unreachable!("synthesis applies")

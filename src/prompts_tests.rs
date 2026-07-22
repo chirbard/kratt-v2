@@ -8,9 +8,9 @@
 
     use super::{
         AgentPrompt, CHAT_SYSTEM_PROMPT, CONSOLIDATE_EXPLANATION, CONTINUE_PASS, DAILY_REPORT,
-        DREAM_BIOLOGIST, EXTRACT_EXPLANATION, JSON_OUTPUT_RULES, SCRIBE_EXPLANATION,
-        SCRIBE_TOOL_DEFINITIONS, TOOL_DEFINITIONS, build_agent_prompt, build_chat_system_prompt,
-        build_classify_prompt, build_continue_prompt, build_dream_prompt,
+        DREAM_BIOLOGIST, EXTRACT_EXPLANATION, JSON_OUTPUT_RULES, MEMORY_RULES,
+        SCRIBE_EXPLANATION, SCRIBE_TOOL_DEFINITIONS, TOOL_DEFINITIONS, build_agent_prompt,
+        build_chat_system_prompt, build_classify_prompt, build_continue_prompt, build_dream_prompt,
         build_scribe_continue_prompt, build_scribe_prompt,
     };
 
@@ -239,6 +239,17 @@
             assert!(definitions.contains("type!=\"fact\""));
             assert!(definitions.contains("auto-create entities"));
         }
+    }
+
+    #[test]
+    fn temporal_guidance_separates_learned_and_occurred_dates() {
+        assert!(TOOL_DEFINITIONS.contains("occurred_at?"));
+        assert!(!TOOL_DEFINITIONS.contains("subject!, date!"));
+        assert!(SCRIBE_TOOL_DEFINITIONS.contains("subject!=false, date!"));
+        assert!(!SCRIBE_TOOL_DEFINITIONS.contains("occurred_at"));
+        assert!(MEMORY_RULES.contains("Node date is automatic"));
+        assert!(MEMORY_RULES.contains("Edge date is automatic"));
+        assert!(MEMORY_RULES.contains("never use today's date as occurred_at"));
     }
 
     #[test]
