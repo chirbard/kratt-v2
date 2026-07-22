@@ -133,7 +133,7 @@ inbox_add(source!, instruction?)
   # copy URL/path verbatim; one item per source
 close_loop(loop!, resolution!="done"|"abandoned"|"absence", note?)
   # only on confirmed resolution, never silence or deadline alone
-upsert_node(name!, type!="fact", body!, date!)
+upsert_node(name!, type!="fact", body!)
   # non-move facts only; body is one atomic sentence; endpoints auto-create entities
 upsert_edge(source!, target!, content!, stability!=0.3, confidence!=1.0,
   importance!=0.5|1.0, subject!=false, date!, memory_type!="episodic")
@@ -200,10 +200,10 @@ pub const TOOL_DEFINITIONS: &str = r#"TOOLS
 
 `!` means required; `?` means optional. Emit JSON, not this notation.
 
-upsert_node(name!, type!="fact", body!, date!)
+upsert_node(name!, type!="fact", body!)
   # body is one atomic sentence; edge endpoints auto-create entities
 upsert_edge(source!, target!, content!, stability!, confidence!, importance!,
-  subject!, date!, inferred_from?:[[source,target],...])
+  subject!, occurred_at?, inferred_from?:[[source,target],...])
   # content=<subject> verb <target|fact>; fact→fact uses implies; subject=true -> content empty, importance=1.0
   # stability: 0.3 weeks, 0.5 months, high years; confidence: 1.0 clear, 0.7 once, 0.4 inferred, 0.1 uncertain
   # inferred_from is required only when combining context edges, never for the user's own words
@@ -223,9 +223,11 @@ record_outcome(result!="win"|"loss"|"draw", comment?)
   # only when a game genuinely ended this turn
 
 Exact upsert_edge JSON:
-{"tool":"upsert_edge","args":{"source":"string","target":"string","content":"<subject> verb <target>","stability":0.5,"confidence":1.0,"importance":0.5,"subject":false,"date":"YYYY-MM-DD","inferred_from":[["support-source","support-target"]]}}"#;
+{"tool":"upsert_edge","args":{"source":"string","target":"string","content":"<subject> verb <target>","stability":0.5,"confidence":1.0,"importance":0.5,"subject":false,"occurred_at":"2022","inferred_from":[["support-source","support-target"]]}}"#;
 
-pub const MEMORY_RULES: &str = r#"Node types: Rust creates entity nodes automatically from edge endpoints. Use upsert_node only for fact nodes (one atomic claim; body is one sentence, no period; date YYYY-MM-DD when event occurred, empty if unknown; use today for current events; resolve relative dates to YYYY-MM-DD).
+pub const MEMORY_RULES: &str = r#"Node types: Rust creates entity nodes automatically from edge endpoints. Use upsert_node only for fact nodes; body is one atomic claim in one sentence with no period. Node date is automatic (when first recorded) — do not supply it.
+
+Edge date is automatic (when learned). Set edge occurred_at only when the fact refers to a specific past time different from now, such as a release date, birth year, or historical event. Resolve relative dates to YYYY-MM-DD. Leave occurred_at empty for current or ongoing facts; never use today's date as occurred_at.
 
 Direct edges vs fact nodes: use a direct edge for simple relationships. Create a fact node only when the claim needs a sentence — attribution, uncertainty, temporal context, or multiple entities.
 - Simple: entity-a → entity-b, content "<subject> verb <target>"
@@ -247,8 +249,8 @@ Taxonomy links must chain through every category level so unrelated nodes can co
 
 pub const JSON_OUTPUT_RULES: &str = r#"Respond with raw JSON only. No markdown. No prose. No code fences. Start with `{`.
 
-Single call: {"tool":"upsert_node","args":{"name":"example-fact","type":"fact","body":"one atomic sentence","date":""}}
-Multiple calls: {"tools":[{"tool":"upsert_node","args":{"name":"example-fact","type":"fact","body":"one atomic sentence","date":""}},{"tool":"upsert_edge","args":{"source":"a","target":"example-fact","content":"<subject> verb <fact>","stability":1.0,"confidence":1.0,"importance":0.0,"subject":false,"date":"YYYY-MM-DD"}}]}"#;
+Single call: {"tool":"upsert_node","args":{"name":"example-fact","type":"fact","body":"one atomic sentence"}}
+Multiple calls: {"tools":[{"tool":"upsert_node","args":{"name":"example-fact","type":"fact","body":"one atomic sentence"}},{"tool":"upsert_edge","args":{"source":"a","target":"example-fact","content":"<subject> verb <fact>","stability":1.0,"confidence":1.0,"importance":0.0,"subject":false}}]}"#;
 
 pub struct AgentPrompt<'scope> {
     pub explanation: &'scope str,
@@ -469,11 +471,11 @@ Your job: derive or refine a few portable STRATEGY LESSONS anchored to the game 
 
 Rules:
 - `!` means required; `?` means optional. Emit JSON, not this notation.
-- upsert_node(name!, type!="fact", body!, date!): every NEW lesson needs its fact node declared in the same response. Rust applies valid fact declarations before their edges.
+- upsert_node(name!, type!="fact", body!): every NEW lesson needs its fact node declared in the same response. Rust applies valid fact declarations before their edges.
 - gist_edge(source!, target!, content!, confidence!, stability?=0.5, supported_by!:[edge-ref,...]): use for a lesson INDUCED FROM PLAYED MOVES. Cite at least two chain edges exactly as "hub → move-node", copied from below. Phrase a transferable lesson, never one game's narration.
   Exact gist_edge JSON: {"tool":"gist_edge","args":{"source":"game-<name>","target":"kebab-lesson","content":"an early queen sortie gets punished by tempo loss","confidence":0.6,"supported_by":["task-<session> → task-<session>-ply-003","task-<session> → task-<session>-ply-005"]}}
-- upsert_edge(source!, target!, content!, stability!, confidence!, importance!, subject!, date!): use on the game node ONLY for a lesson implied by the rules alone, before any game teaches otherwise.
-  Exact upsert_edge JSON: {"tool":"upsert_edge","args":{"source":"game-<name>","target":"kebab-lesson","content":"string","stability":0.4,"confidence":0.5,"importance":0.5,"subject":false,"date":"YYYY-MM-DD"}}
+- upsert_edge(source!, target!, content!, stability!, confidence!, importance!, subject!, occurred_at?): use on the game node ONLY for a lesson implied by the rules alone, before any game teaches otherwise.
+  Exact upsert_edge JSON: {"tool":"upsert_edge","args":{"source":"game-<name>","target":"kebab-lesson","content":"string","stability":0.4,"confidence":0.5,"importance":0.5,"subject":false}}
 - expire_edge(source!, target!, rewritten_content!): REVISE ON EVIDENCE. Expire an existing strategy contradicted by a lost game, or rewrite it at lower confidence. Outcomes exist so a lesson that keeps losing is corrected, not preserved.
 - Never narrate a single game. Never restate a rule as a strategy. Five solid lessons beat twenty.
 - Emit at most 8 tool calls. Anchor every strategy to the game node.

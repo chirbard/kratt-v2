@@ -1,6 +1,7 @@
     use super::{
         AgentRun, IterationOutcome, MAX_PASS_ITERATIONS, MemoryEvent, ToolCall, TurnMode,
-        dropped_tool_reason, parse_tool_calls, parse_turn_mode, says_done, stream_collect,
+        dropped_tool_reason, memory_mutation_tools, parse_tool_calls, parse_turn_mode, says_done,
+        stream_collect,
     };
     use crate::api::{Chunk, LlmClient, Stats, TurnOutcome};
     use crate::memory::ledger::Event;
@@ -225,6 +226,18 @@
     }
 
     #[test]
+    fn semantic_tool_schema_exposes_occurred_at_but_not_model_dates() {
+        let tools = memory_mutation_tools();
+        let node_parameters = &tools[0]["function"]["parameters"];
+        let edge_parameters = &tools[2]["function"]["parameters"];
+        assert!(node_parameters["properties"].get("date").is_none());
+        assert!(edge_parameters["properties"].get("date").is_none());
+        assert!(edge_parameters["properties"].get("occurred_at").is_some());
+        let required = edge_parameters["required"].as_array().cloned().unwrap_or_default();
+        assert!(!required.contains(&serde_json::json!("occurred_at")));
+    }
+
+    #[test]
     fn gist_edge_parses_full_args_and_both_ref_spellings() {
         let arrow = r#"{"tools":[{"tool":"gist_edge","args":{"source":"early-queen-sorties","target":"chess-openings","content":"queen sorties get punished","confidence":0.6,"stability":0.4,"supported_by":["game3-hub → move-qh5","game4-hub->move-qf3"]}}]}"#;
         let calls = parse_tool_calls(arrow);
@@ -292,6 +305,25 @@
     }
 
     #[test]
+    fn upsert_edge_parses_optional_occurred_at() {
+        let historical = parse_tool_calls(
+            r#"{"tool":"upsert_edge","args":{"source":"release","target":"product","occurred_at":"2022"}}"#,
+        );
+        let ToolCall::UpsertEdge { occurred_at, .. } = &historical[0] else {
+            unreachable!("parsed historical edge")
+        };
+        assert_eq!(occurred_at.as_deref(), Some("2022"));
+
+        let current = parse_tool_calls(
+            r#"{"tool":"upsert_edge","args":{"source":"current","target":"fact","occurred_at":""}}"#,
+        );
+        let ToolCall::UpsertEdge { occurred_at, .. } = &current[0] else {
+            unreachable!("parsed current edge")
+        };
+        assert_eq!(occurred_at, &None);
+    }
+
+    #[test]
     fn prose_wrapped_json_is_recovered() {
         let wrapped = r#"Here are the extracted facts: {"tools":[{"tool":"delete_edge","args":{"source":"a","target":"b"}}]} done."#;
         let calls = parse_tool_calls(wrapped);
@@ -345,6 +377,7 @@
             importance: 0.7,
             subject: false,
             date: String::new(),
+            occurred_at: None,
             memory_type: Some("semantic".to_string()),
             inferred_from: None,
         };
@@ -426,6 +459,7 @@
             importance: 0.5,
             subject: false,
             date: String::new(),
+            occurred_at: None,
             memory_type: None,
             inferred_from: Some(vec![
                 ("premise-a".to_string(), "fact".to_string()),
@@ -450,6 +484,7 @@
             importance: 0.5,
             subject: false,
             date: String::new(),
+            occurred_at: None,
             memory_type: None,
             inferred_from: Some(vec![("ghost".to_string(), "fact".to_string())]),
         };
@@ -1328,7 +1363,7 @@
                 name: name.to_string(),
                 node_type: node_type.to_string(),
                 body: body.to_string(),
-                date: String::new(),
+                date: "model-controlled-date".to_string(),
             }
         }
 
@@ -1345,7 +1380,8 @@
                 confidence: 1.0,
                 importance: 1.0,
                 subject,
-                date: "2026-07-17".to_string(),
+                date: "model-controlled-date".to_string(),
+                occurred_at: None,
                 memory_type: None,
                 inferred_from: None,
             }
@@ -1384,6 +1420,47 @@
                 (stored.node_type.as_str(), stored.body.as_str()),
                 ("fact", "one claim")
             );
+            assert_eq!(stored.date, crate::prompts::today_iso());
+        }
+
+        #[test]
+        fn semantic_edges_separate_learned_date_from_occurred_time() {
+            let conn = harness();
+            let mut historical = edge("release", "product", false);
+            let ToolCall::UpsertEdge { occurred_at, .. } = &mut historical else {
+                unreachable!("edge helper returns upsert_edge")
+            };
+            *occurred_at = Some("2022".to_string());
+            assert!(apply_one(&conn, historical).contains("upsert_edge:"));
+            let Ok(Some(stored)) = db::load_edge(&conn, "release", "product") else {
+                unreachable!("historical edge exists")
+            };
+            assert_eq!(stored.date, crate::prompts::today_iso());
+            assert_eq!(stored.occurred_at.as_deref(), Some("2022"));
+
+            assert!(apply_one(&conn, edge("current", "fact", false)).contains("upsert_edge:"));
+            let Ok(Some(current)) = db::load_edge(&conn, "current", "fact") else {
+                unreachable!("current edge exists")
+            };
+            assert_eq!(current.date, crate::prompts::today_iso());
+            assert_eq!(current.occurred_at, None);
+
+            let mut episodic = edge("session", "event", false);
+            let ToolCall::UpsertEdge {
+                occurred_at,
+                memory_type,
+                ..
+            } = &mut episodic
+            else {
+                unreachable!("edge helper returns upsert_edge")
+            };
+            *occurred_at = Some("2022".to_string());
+            *memory_type = Some("episodic".to_string());
+            assert!(apply_one(&conn, episodic).contains("upsert_edge:"));
+            let Ok(Some(stored)) = db::load_edge(&conn, "session", "event") else {
+                unreachable!("episodic edge exists")
+            };
+            assert_eq!(stored.occurred_at, None);
         }
 
         #[test]

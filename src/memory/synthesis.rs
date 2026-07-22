@@ -796,6 +796,7 @@ fn normalize_upsert_edge(call: &ToolCall, confidence: f64) -> ToolCall {
         importance,
         subject,
         date,
+        occurred_at,
         memory_type,
         inferred_from,
         ..
@@ -812,6 +813,7 @@ fn normalize_upsert_edge(call: &ToolCall, confidence: f64) -> ToolCall {
         importance: *importance,
         subject: *subject,
         date: date.clone(),
+        occurred_at: occurred_at.clone(),
         memory_type: memory_type.clone(),
         inferred_from: inferred_from.clone(),
     }
@@ -941,9 +943,9 @@ fn tool_call_json(call: &ToolCall) -> serde_json::Value {
             name,
             node_type,
             body,
-            date,
+            date: _,
         } => {
-            json!({"tool":"upsert_node","args":{"name":name,"type":node_type,"body":body,"date":date}})
+            json!({"tool":"upsert_node","args":{"name":name,"type":node_type,"body":body}})
         }
         ToolCall::UpsertEdge { .. } => upsert_edge_json(call),
         ToolCall::DeleteNode { name } => json!({"tool":"delete_node","args":{"name":name}}),
@@ -1045,14 +1047,15 @@ fn upsert_edge_json(call: &ToolCall) -> serde_json::Value {
         confidence,
         importance,
         subject,
-        date,
+        date: _,
+        occurred_at,
         memory_type,
         inferred_from,
     } = call
     else {
         unreachable!("upsert_edge_json called with non-upsert_edge");
     };
-    json!({"tool":"upsert_edge","args":{"source":source,"target":target,"content":content,"stability":stability,"confidence":confidence,"importance":importance,"subject":subject,"date":date,"memory_type":memory_type,"inferred_from":inferred_from}})
+    json!({"tool":"upsert_edge","args":{"source":source,"target":target,"content":content,"stability":stability,"confidence":confidence,"importance":importance,"subject":subject,"occurred_at":occurred_at,"memory_type":memory_type,"inferred_from":inferred_from}})
 }
 
 fn gist_edge_json(call: &ToolCall) -> serde_json::Value {
