@@ -2,7 +2,8 @@ use std::error::Error;
 
 use turso::{Connection, params};
 
-use super::{open_connection, round2, runtime, text};
+use super::{open_connection, round2, text};
+use super::core::runtime;
 
 pub fn load_last_decay() -> String {
     let Ok(conn) = open_connection() else {
