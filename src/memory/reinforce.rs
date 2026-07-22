@@ -32,18 +32,6 @@ pub fn record_outcome(
     apply_outcome(session_id, "", outcome_score, payload)
 }
 
-// Per-move credit assignment for multi-move games (see credit-assignment.md).
-// No caller yet — wired up by the future game harness (Demo 1).
-#[allow(dead_code)]
-pub fn record_move_outcome(
-    session_id: &str,
-    turn_id: &str,
-    outcome_score: f64,
-    payload: &str,
-) -> Result<String, Box<dyn Error + Send + Sync>> {
-    apply_outcome(session_id, turn_id, outcome_score, payload)
-}
-
 // In-transaction outcome: reinforce the session's active edges inside a
 // transaction the caller already opened (the scribe pass at game end). The
 // public record_outcome acquires the write lock and begins its own

@@ -143,8 +143,8 @@ impl Event {
         )
     }
 
-    // turn_id is empty for a session-level outcome and set for per-move credit
-    // (record_move_outcome in reinforce.rs); both scopes share this constructor.
+    // turn_id is empty for a session-level outcome and set for per-turn credit;
+    // both scopes share this constructor.
     pub fn outcome(session_id: &str, turn_id: &str, score: f64, payload: String) -> Self {
         Self::new(
             Actor::new("system", "reinforcement"),
