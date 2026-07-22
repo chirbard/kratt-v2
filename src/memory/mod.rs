@@ -41,7 +41,7 @@ pub(crate) use db::{
 pub(crate) use db::{insert_interest, top_interests_with};
 pub use dream::{DreamEvent, run_dream_pass};
 pub use decay_simulator::run as run_decay_simulator;
-pub use embed::{SemanticEdge, edges_to_toon, run_embed_pass, select_semantic_edges_routed};
+pub use embed::{SemanticEdge, edges_to_toon, run_embed_pass, select_semantic_edges, select_semantic_edges_routed};
 pub use explore::{ExploreEvent, run_exploration_pass};
 pub use ingest::{IngestEvent, run_focused_ingestion_pass, run_ingestion_pass};
 pub(crate) use news::run_news_scan;
