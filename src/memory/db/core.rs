@@ -27,6 +27,10 @@ where
     runtime().block_on(future)
 }
 
+pub fn timestamp_now() -> String {
+    crate::timeutil::timestamp_now()
+}
+
 // Turso sync and checkpoint operations mutate database-wide state and can
 // dissolve a transaction on another connection. Every write pass and every
 // sync operation must serialize on this lock.
@@ -52,6 +56,10 @@ enum DbHandle {
     Local(Database),
     Synced(turso::sync::Database),
 }
+
+#[cfg(test)]
+#[path = "core_lock_tests.rs"]
+mod lock_tests;
 
 static DATABASE: OnceLock<DbHandle> = OnceLock::new();
 
