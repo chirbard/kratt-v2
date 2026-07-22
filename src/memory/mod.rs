@@ -21,6 +21,7 @@ pub use scheduler::pressure_line;
 pub use sequence::sequence_line;
 mod synthesis;
 mod task_chain;
+mod toon_display;
 
 pub use agent::{MemoryEvent, MemorySeats, run_memory_agent};
 pub(crate) use agent::{classify_reply_label, describe_tool_call, parse_tool_calls};

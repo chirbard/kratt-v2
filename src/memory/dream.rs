@@ -2,6 +2,7 @@ use std::error::Error;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde_json::{Value, json};
 use turso::Connection;
 
 use crate::api::{EmbeddingClient, LlmClient};
@@ -19,12 +20,13 @@ use super::db;
 use super::embed::{self, SemanticEdge};
 use super::graph::{
     Edge, Graph, Node, PROVENANCE_DREAMED, PROVENANCE_INFERRED, PROVENANCE_SYNTHESIZED,
-    edge_is_pinned, graph_to_json, inferred_ceiling, node_carries_value, normalize_id,
-    stability_seed_max, synthesized_ceiling,
+    edge_is_pinned, inferred_ceiling, node_carries_value, normalize_id, round2, stability_seed_max,
+    synthesized_ceiling,
 };
 use super::hygiene;
 use super::ledger::{self, Actor, EdgeRef, Event, EventContext};
 use super::synthesis::{self, SynthesisPolicy};
+use super::toon_display::{self, Table};
 
 const GIST_IMPORTANCE: f64 = 0.5; // replay-tunable.
 const MAX_PRUNES_PER_PASS: usize = 3; // replay-tunable.
@@ -282,7 +284,7 @@ fn bounded_global_toon(graph: &Graph) -> String {
     }
     let dropped = ranked.len().saturating_sub(edges.len());
     let bounded = Graph { nodes, edges };
-    let toon_text = toon::encode(&graph_to_json(&bounded), None);
+    let toon_text = dream_graph_toon(&bounded);
     runlog::log(
         "dream",
         &format!(
@@ -293,6 +295,88 @@ fn bounded_global_toon(graph: &Graph) -> String {
         ),
     );
     toon_text
+}
+
+fn dream_graph_toon(graph: &Graph) -> String {
+    let mut edges = graph.edges.iter().collect::<Vec<_>>();
+    edges.sort_by(|left, right| {
+        left.source
+            .cmp(&right.source)
+            .then_with(|| left.target.cmp(&right.target))
+    });
+    let mut edge_rows = Vec::new();
+    for edge in edges {
+        edge_rows.push(dream_edge_row(edge));
+    }
+    let node_rows = dream_node_rows(graph);
+    toon_display::encode(&dream_tables(edge_rows, node_rows))
+}
+
+fn dream_edge_row(edge: &Edge) -> Vec<Value> {
+    vec![
+        json!(edge.source),
+        json!(edge.target),
+        json!(edge.content),
+        json!(edge.occurred_at),
+        json!(edge.provenance),
+        json!(round2(edge.confidence)),
+        json!(edge.ceiling),
+        json!(edge.date),
+        json!(round2(edge.importance)),
+        json!(round2(edge.stability)),
+        json!(edge.subject),
+        json!(edge.expired_at),
+    ]
+}
+
+fn dream_node_rows(graph: &Graph) -> Vec<Vec<Value>> {
+    let mut node_names = graph.nodes.keys().collect::<Vec<_>>();
+    node_names.sort();
+    let mut rows = Vec::new();
+    for node_name in node_names {
+        let Some(node) = graph.nodes.get(node_name) else {
+            continue;
+        };
+        if node_carries_value(node) {
+            rows.push(vec![
+                json!(node_name),
+                json!(node.node_type),
+                json!(node.body),
+                json!(node.date),
+            ]);
+        }
+    }
+    rows
+}
+
+fn dream_tables(edge_rows: Vec<Vec<Value>>, node_rows: Vec<Vec<Value>>) -> [Table<'static>; 2] {
+    const EDGE_COLUMNS: &[&str] = &[
+        "source",
+        "target",
+        "content",
+        "occurred_at",
+        "provenance",
+        "confidence",
+        "ceiling",
+        "date",
+        "importance",
+        "stability",
+        "subject",
+        "expired_at",
+    ];
+    const NODE_COLUMNS: &[&str] = &["id", "type", "body", "date"];
+    [
+        Table {
+            name: "edges",
+            columns: EDGE_COLUMNS,
+            rows: edge_rows,
+        },
+        Table {
+            name: "nodes",
+            columns: NODE_COLUMNS,
+            rows: node_rows,
+        },
+    ]
 }
 
 fn ranked_live_edges(graph: &Graph) -> Vec<Edge> {
