@@ -8,7 +8,6 @@ mod heavy;
 mod ingest;
 mod ledger;
 mod loops;
-mod news;
 mod reinforce;
 mod sequence;
 pub mod scheduler;
@@ -39,7 +38,6 @@ pub use embed::{
     select_semantic_edges_for_chat,
 };
 pub use ingest::{IngestEvent, run_focused_ingestion_pass, run_ingestion_pass};
-pub(crate) use news::run_news_scan;
 pub use ledger::{
     Actor, Attribution, DayDigest, EdgeRef, Event, EventContext, NightWindow, day_digest,
     newest_dream_session_id, recompute_positions, record_events, turn_attribution,

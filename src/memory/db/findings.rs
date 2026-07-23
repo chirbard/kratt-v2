@@ -21,31 +21,6 @@ pub(crate) struct PingPolicy {
     pub diverts: Vec<(String, String)>,
 }
 
-pub(crate) fn insert_finding(
-    conn: &Connection,
-    interest_topic: &str,
-    item: &crate::web::NewsItem,
-    novelty: f64,
-) -> Result<i64, Box<dyn Error + Send + Sync>> {
-    let found_at = timestamp_now();
-    block_on(async {
-        conn.execute(
-            "INSERT INTO findings (interest_topic, title, url, snippet, novelty, found_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                interest_topic,
-                item.title.as_str(),
-                item.url.as_str(),
-                item.snippet.as_str(),
-                novelty,
-                found_at
-            ],
-        )
-        .await?;
-        Ok(conn.last_insert_rowid())
-    })
-}
-
 pub(crate) fn unsurfaced_findings(
     conn: &Connection,
     limit: usize,

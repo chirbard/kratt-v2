@@ -483,9 +483,6 @@ fn dispatch_scheduler_action(app: &mut App, action: crate::memory::scheduler::Sc
         SchedulerAction::InboxStudy { reason } => {
             crate::runlog::log("sched", &format!("inbox study is daemon-only: {reason}"));
         }
-        SchedulerAction::NewsScan { reason } => {
-            crate::runlog::log("sched", &format!("news scan is daemon-only: {reason}"));
-        }
         SchedulerAction::Ingest { path, reason } => {
             crate::runlog::log(
                 "sched",
@@ -504,9 +501,7 @@ fn dispatch_scheduler_action(app: &mut App, action: crate::memory::scheduler::Sc
 }
 
 fn tui_scheduler_inputs() -> crate::memory::scheduler::SchedulerInputs {
-    let mut inputs = crate::memory::scheduler::gather_inputs();
-    inputs.news_scan_due = false;
-    inputs
+    crate::memory::scheduler::gather_inputs()
 }
 
 // Runaway guard: bounds API spend by switching autonomous mode off after too

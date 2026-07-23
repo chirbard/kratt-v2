@@ -140,18 +140,6 @@
     }
 
     #[test]
-    fn news_scan_latch_rearms_on_day_rollover() {
-        let mut gate = gate("3-6");
-        let base = Instant::now();
-        assert!(gate.should_evaluate(4, "2026-07-10", base));
-        gate.scanned_news_today = true;
-        assert!(gate.scanned_news_today);
-        let next = base + Duration::from_secs(1200);
-        assert!(gate.should_evaluate(4, "2026-07-11", next));
-        assert!(!gate.scanned_news_today);
-    }
-
-    #[test]
     fn skipped_action_consumes_cooldown_but_not_cap() {
         let mut gate = gate("3-6");
         let base = Instant::now();

@@ -14,7 +14,6 @@ const DRIFT_WARN_DISTANCE: f64 = 0.10;
 /// Action that the scheduler decides to take
 #[derive(Debug, Clone, PartialEq)]
 pub enum SchedulerAction {
-    NewsScan { reason: String },
     InboxStudy { reason: String },
     Ingest { path: PathBuf, reason: String },
     Rest { reason: String },
@@ -26,7 +25,6 @@ pub struct SchedulerInputs {
     pub queued_inbox: usize,
     pub re_read_candidates: Vec<(String, usize, String)>, // (path, note_count, source_node_id)
     pub actor_positions: Vec<(String, String, Option<Vec<f64>>)>, // (actor_type, actor_id, position)
-    pub news_scan_due: bool,
 }
 
 /// Gather all inputs from the database for scheduler decision
@@ -47,7 +45,6 @@ async fn gather_inputs_async(conn: &Connection) -> SchedulerInputs {
         queued_inbox,
         re_read_candidates,
         actor_positions,
-        news_scan_due: true,
     }
 }
 
@@ -83,11 +80,6 @@ pub fn decide(inputs: &SchedulerInputs) -> SchedulerAction {
     }
     if let Some(action) = check_re_read_candidates(inputs) {
         return action;
-    }
-    if inputs.news_scan_due {
-        return SchedulerAction::NewsScan {
-            reason: "daily interest-driven scan".to_string(),
-        };
     }
     rest_action(inputs)
 }
@@ -200,9 +192,6 @@ fn log_drift_warning(distance: f64, actor_a: &str, actor_b: &str) {
 /// Log the scheduler action decision
 pub fn log_scheduler_decision(action: &SchedulerAction) {
     match action {
-        SchedulerAction::NewsScan { reason } => {
-            crate::runlog::log("sched", &format!("[autonomy] news scan — {reason}"));
-        }
         SchedulerAction::InboxStudy { reason } => {
             crate::runlog::log("sched", &format!("[autonomy] inbox study — {reason}"));
         }

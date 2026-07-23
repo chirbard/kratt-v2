@@ -121,7 +121,6 @@ struct NightGate {
     // revert to periodic checks) — correctness depends on single-writer.
     dirty: bool,
     studied_inbox_tonight: bool,
-    scanned_news_today: bool,
 }
 
 impl NightGate {
@@ -135,7 +134,6 @@ impl NightGate {
             night_day: None,
             dirty: true,
             studied_inbox_tonight: false,
-            scanned_news_today: false,
         }
     }
 
@@ -147,7 +145,6 @@ impl NightGate {
             self.night_day = Some(today.to_string());
             self.count = 0;
             self.studied_inbox_tonight = false;
-            self.scanned_news_today = false;
             self.dirty = true;
         }
         inside && self.dirty && self.cooldown_elapsed(now) && self.count < self.max_actions
@@ -232,9 +229,6 @@ impl NightCycle {
         if self.gate.studied_inbox_tonight {
             inputs.queued_inbox = 0;
         }
-        if self.gate.scanned_news_today {
-            inputs.news_scan_due = false;
-        }
         let action = scheduler::decide(&inputs);
         scheduler::log_scheduler_decision(&action);
         if !matches!(action, SchedulerAction::Rest { .. }) {
@@ -245,7 +239,6 @@ impl NightCycle {
 
     fn dispatch(&mut self, action: SchedulerAction, now: Instant) {
         match action {
-            SchedulerAction::NewsScan { reason } => self.dispatch_news_scan(&reason, now),
             SchedulerAction::InboxStudy { reason } => {
                 runlog::log("tg", &format!("night action: inbox study ({reason})"));
                 let result = self.run_inbox_study();
@@ -268,39 +261,6 @@ impl NightCycle {
                 self.gate.record_rest();
             }
         }
-    }
-
-    fn dispatch_news_scan(&mut self, reason: &str, now: Instant) {
-        runlog::log("tg", &format!("night action: news scan ({reason})"));
-        let result = self.run_news_scan();
-        self.gate.scanned_news_today = result.completed();
-        self.gate.record_action(now);
-    }
-
-    fn run_news_scan(&self) -> PassExecution {
-        let run_id = self.start_pass("news");
-        let execution = match memory::run_news_scan(&*self.embed, self.search.as_deref()) {
-            Ok(summary) => {
-                runlog::log(
-                    "news",
-                    &format!(
-                        "[autonomy] news scan — {} interests, {} novel findings",
-                        summary.interests, summary.findings
-                    ),
-                );
-                if summary.interests == 0 {
-                    PassExecution::skipped("no_material")
-                } else {
-                    PassExecution::ok(summary.findings)
-                }
-            }
-            Err(err) => {
-                runlog::log("news", &format!("news scan failed: {err}"));
-                PassExecution::failed(classify_pass_error(&err.to_string()))
-            }
-        };
-        self.finish_pass(run_id, "news", &execution);
-        execution
     }
 
     fn run_inbox_study(&self) -> PassExecution {

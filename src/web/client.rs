@@ -50,6 +50,7 @@ impl SearchClient for TavilyClient {
     }
 }
 
+#[allow(dead_code)]
 fn tavily_news_post(
     api_key: &str,
     topic: &str,
@@ -136,6 +137,7 @@ fn tavily_request(
     }
 }
 
+#[allow(dead_code)]
 fn parse_news_results(value: &serde_json::Value) -> Vec<NewsItem> {
     let Some(results_value) = value.get("results") else {
         return Vec::new();

@@ -21,8 +21,8 @@ pub use core::{
 };
 pub use decay_store::{DecayChange, load_last_decay, persist_decay};
 pub(crate) use findings::{
-    Finding, PingPolicy, count_findings_in_windows, divert_ping_topic, insert_finding,
-    load_ping_policy, mark_finding_surfaced, resume_pings, set_ping_mute, unsurfaced_findings,
+    Finding, PingPolicy, count_findings_in_windows, divert_ping_topic, load_ping_policy,
+    mark_finding_surfaced, resume_pings, set_ping_mute, unsurfaced_findings,
     unsurfaced_findings_in_windows,
 };
 pub use graph_store::{
@@ -52,8 +52,7 @@ pub(crate) use retrieval::{
     Interest, RecentLearning, RegionTransition, insert_interest, last_suggestion_for_session,
     load_inbox_snapshot_async, load_open_curiosity_notes_async, load_open_intentions_async,
     load_previous_turn_region, load_recent_learning_async, load_region_transitions, load_turn_region,
-    load_unembedded_interests, nearest_live_edges, record_news_graph_material,
-    save_interest_embedding, top_interests,
+    load_unembedded_interests, save_interest_embedding, top_interests,
 };
 #[cfg(test)]
 pub(crate) use retrieval::top_interests_with;
@@ -65,9 +64,7 @@ pub use retrieval::{
 #[cfg(test)]
 use schema::create_pass_run_table;
 use schema::init_schema;
-pub(crate) use sessions::{
-    conversation_boundary_async, latest_assistant_message_timestamp_async, register_news_session,
-};
+pub(crate) use sessions::{conversation_boundary_async, latest_assistant_message_timestamp_async};
 pub use sessions::{
     insert_message, read_message_context, register_ingestion_session, register_session,
     search_messages_fts, source_session_id,

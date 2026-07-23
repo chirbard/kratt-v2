@@ -33,20 +33,6 @@ pub fn register_ingestion_session(session_id: &str, created_at: &str) {
     });
 }
 
-pub(crate) fn register_news_session(session_id: &str, created_at: &str) {
-    let Ok(conn) = open_connection() else {
-        return;
-    };
-    runtime().block_on(async {
-        let _ = conn
-            .execute(
-                "INSERT OR IGNORE INTO sessions (id, session_type, created_at) VALUES (?1, 'news', ?2)",
-                params![session_id, created_at],
-            )
-            .await;
-    });
-}
-
 pub(crate) async fn conversation_boundary_async(
     conn: &Connection,
     gap_seconds: i64,

@@ -14,7 +14,6 @@
                 "node1".to_string(),
             )],
             actor_positions: vec![],
-            news_scan_due: false,
         };
         let action = decide(&inputs);
 
@@ -28,21 +27,6 @@
             }
             _ => panic!("Expected Ingest action, got {:?}", action),
         }
-    }
-
-    #[test]
-    fn news_scan_runs_below_maintenance_and_above_rest() {
-        let due = SchedulerInputs {
-            news_scan_due: true,
-            ..SchedulerInputs::default()
-        };
-        assert!(matches!(decide(&due), SchedulerAction::NewsScan { .. }));
-
-        let scanned = SchedulerInputs {
-            news_scan_due: false,
-            ..SchedulerInputs::default()
-        };
-        assert!(matches!(decide(&scanned), SchedulerAction::Rest { .. }));
     }
 
     #[test]

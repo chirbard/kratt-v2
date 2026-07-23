@@ -5,12 +5,9 @@ use turso::{Connection, Value, params};
 
 use super::core::runtime;
 use super::{
-    add_interest_node_columns, block_on, open_connection, optional_text, parse_edge_row, real,
-    text, text_or, timestamp_now,
+    add_interest_node_columns, open_connection, optional_text, parse_edge_row, real, text,
 };
-use crate::memory::graph::{
-    PROVENANCE_LEGACY, PROVENANCE_WEB_SURFACED, normalize_id, stability_seed_max,
-};
+use crate::memory::graph::normalize_id;
 use crate::memory::loops::OpenLoop;
 
 #[cfg(test)]
@@ -53,15 +50,6 @@ pub(crate) struct RecentLearning {
     pub event_type: String,
     pub timestamp: String,
     pub provenance: String,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct NearestLiveEdge {
-    pub source: String,
-    pub target: String,
-    pub provenance: String,
-    pub confidence: f64,
-    pub similarity: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -296,81 +284,6 @@ fn dedup_interests(interests: &mut Vec<Interest>) {
 // Weights are stored at two decimals: full float precision survives every
 // multiply-and-write cycle (decay, reinforce) and bloats the prompt/token
 // side; nothing downstream needs more than 0.01 resolution.
-
-pub(crate) fn nearest_live_edges(
-    conn: &Connection,
-    vector: &[f64],
-    limit: usize,
-) -> Result<Vec<NearestLiveEdge>, Box<dyn Error + Send + Sync>> {
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
-    let json_str = vector32_json(vector)?;
-    block_on(async {
-        let mut rows = conn
-            .query(
-                "SELECT source, target, provenance, confidence,
-                        vector_distance_cos(embedding, vector32(?1))
-                 FROM edges WHERE embedding IS NOT NULL AND expired_at IS NULL
-                 ORDER BY vector_distance_cos(embedding, vector32(?1)) LIMIT ?2",
-                params![json_str, limit as i64],
-            )
-            .await?;
-        let mut edges = Vec::new();
-        while let Some(row) = rows.next().await? {
-            let distance = row.get::<f64>(4)?;
-            edges.push(NearestLiveEdge {
-                source: text(row.get_value(0)?),
-                target: text(row.get_value(1)?),
-                provenance: text_or(row.get_value(2), PROVENANCE_LEGACY),
-                confidence: real(row.get_value(3)?),
-                similarity: (1.0 - distance).clamp(-1.0, 1.0),
-            });
-        }
-        Ok(edges)
-    })
-}
-
-pub(crate) fn record_news_graph_material(
-    conn: &Connection,
-    finding_id: i64,
-    interest: &Interest,
-    item: &crate::web::NewsItem,
-    embedding: &[f64],
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let timestamp = timestamp_now();
-    let today = crate::timeutil::today_iso();
-    let session_id = format!("news:{today}");
-    let target_id = format!("news-finding-{finding_id}");
-    let content = format!("{} — {}", item.title, item.snippet);
-    let json_str = vector32_json(embedding)?;
-    let stability = stability_seed_max(PROVENANCE_WEB_SURFACED);
-    block_on(async {
-        conn.execute(
-            "INSERT OR REPLACE INTO nodes (id, node_type, body, date)
-             VALUES (?1, 'event', ?2, ?3)",
-            params![target_id.as_str(), item.title.as_str(), timestamp.as_str()],
-        )
-        .await?;
-        conn.execute(
-            "INSERT OR REPLACE INTO edges
-             (source, target, content, stability, confidence, importance, subject, date,
-              occurred_at, memory_type, origin_session, provenance, embedding)
-             VALUES (?1, ?2, ?3, ?4, 0.5, 0.4, 0, ?5, ?5, 'episodic', ?6, 'web-surfaced', vector32(?7))",
-            params![
-                interest.node_id.as_str(),
-                target_id.as_str(),
-                content.as_str(),
-                stability,
-                timestamp.as_str(),
-                session_id.as_str(),
-                json_str.as_str()
-            ],
-        )
-        .await?;
-        Ok(())
-    })
-}
 
 pub fn load_unembedded_edges() -> Vec<(String, String, String)> {
     let Ok(conn) = open_connection() else {

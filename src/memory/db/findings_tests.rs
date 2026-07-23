@@ -1,10 +1,9 @@
     use super::{
-        DEFAULT_PING_MUTED_UNTIL, count_findings_in_windows, divert_ping_topic, insert_finding,
-        load_ping_policy, mark_finding_surfaced, resume_pings, set_ping_mute, unsurfaced_findings,
+        DEFAULT_PING_MUTED_UNTIL, count_findings_in_windows, divert_ping_topic, load_ping_policy,
+        mark_finding_surfaced, resume_pings, set_ping_mute, unsurfaced_findings,
     };
     use crate::memory::db::block_on;
     use crate::memory::db::test_support::{EVENTS_DDL, FINDINGS_DDL, PING_POLICY_DDL, harness};
-    use crate::web::NewsItem;
     use turso::{Connection, params};
 
     #[test]
@@ -42,14 +41,7 @@
             let _ = conn.execute(EVENTS_DDL, ()).await;
             let _ = conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, session_type TEXT NOT NULL DEFAULT 'conversation', created_at TEXT NOT NULL DEFAULT '')", ()).await;
         });
-        let item = NewsItem {
-            title: "A new compiler".to_string(),
-            url: "https://example.com/compiler".to_string(),
-            snippet: "Details".to_string(),
-        };
-        let Ok(finding_id) = insert_finding(&conn, "Rust", &item, 0.8) else {
-            unreachable!("finding inserts")
-        };
+        let finding_id = insert_candidate(&conn);
         let candidates = unsurfaced_findings(&conn, 10).unwrap_or_default();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].finding_id, finding_id);
@@ -73,6 +65,21 @@
             block_on(count_findings_in_windows(&conn, from, until, from, until)).unwrap_or(0);
         assert_eq!(count, 1);
         assert_eq!(count_surfaced_events(&conn, "ping-1"), 1);
+    }
+
+    fn insert_candidate(conn: &Connection) -> i64 {
+        block_on(async {
+            let _ = conn
+                .execute(
+                    "INSERT INTO findings
+                     (interest_topic, title, url, snippet, novelty, found_at)
+                     VALUES ('Rust', 'A new compiler', 'https://example.com/compiler',
+                             'Details', 0.8, strftime('%Y-%m-%dT%H:%M:%S', 'now'))",
+                    (),
+                )
+                .await;
+            conn.last_insert_rowid()
+        })
     }
 
     fn count_surfaced_events(conn: &Connection, turn_id: &str) -> i64 {
