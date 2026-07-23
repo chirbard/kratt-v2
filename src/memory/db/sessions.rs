@@ -33,19 +33,6 @@ pub fn register_dream_session(session_id: &str, created_at: &str) {
     });
 }
 
-pub fn register_exploration_session(session_id: &str, created_at: &str) {
-    let Ok(conn) = open_connection() else {
-        return;
-    };
-    runtime().block_on(async {
-        let _ = conn.execute(
-            "INSERT OR IGNORE INTO sessions (id, session_type, created_at) VALUES (?1, 'exploration', ?2)",
-            params![session_id, created_at],
-        )
-        .await;
-    });
-}
-
 pub fn register_ingestion_session(session_id: &str, created_at: &str) {
     let Ok(conn) = open_connection() else {
         return;
@@ -71,29 +58,6 @@ pub(crate) fn register_news_session(session_id: &str, created_at: &str) {
             )
             .await;
     });
-}
-
-pub fn latest_session_id(session_type: &str) -> Option<String> {
-    let conn = open_connection().ok()?;
-    runtime().block_on(latest_session_id_async(&conn, session_type))
-}
-
-async fn latest_session_id_async(conn: &Connection, session_type: &str) -> Option<String> {
-    let mut rows = conn
-        .query(
-            "SELECT id FROM sessions WHERE session_type = ?1 ORDER BY created_at DESC, rowid DESC LIMIT 1",
-            params![session_type],
-        )
-        .await
-        .ok()?;
-    let row = match rows.next().await {
-        Ok(Some(row)) => row,
-        _ => return None,
-    };
-    match row.get_value(0) {
-        Ok(value) => Some(text(value)),
-        Err(_) => None,
-    }
 }
 
 pub(crate) async fn conversation_boundary_async(

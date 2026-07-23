@@ -992,15 +992,6 @@ pub fn edge_count() -> usize {
     result.unwrap_or_default()
 }
 
-pub fn load_open_curiosity_notes(limit: usize) -> Vec<OpenCuriosityNoteRow> {
-    let Ok(conn) = open_connection() else {
-        return Vec::new();
-    };
-    runtime()
-        .block_on(load_open_curiosity_notes_async(&conn, limit))
-        .unwrap_or_default()
-}
-
 pub(crate) async fn load_open_curiosity_notes_async(
     conn: &Connection,
     limit: usize,
@@ -1115,50 +1106,6 @@ pub(crate) async fn load_inbox_snapshot_async(
 // is the last thing said before the user stepped away, so a catch-up window
 // from it spans whatever the background passes did overnight. None = no gap in
 // the scanned window (continuously active, or first-ever chat).
-
-pub fn count_new_embedding_neighbours(
-    vector: &[f64],
-    created_at: &str,
-    max_distance: f64,
-) -> Result<usize, Box<dyn Error + Send + Sync>> {
-    let conn = open_connection()?;
-    runtime().block_on(count_new_embedding_neighbours_async(
-        &conn,
-        vector,
-        created_at,
-        max_distance,
-    ))
-}
-
-pub(super) async fn count_new_embedding_neighbours_async(
-    conn: &Connection,
-    vector: &[f64],
-    created_at: &str,
-    max_distance: f64,
-) -> Result<usize, Box<dyn Error + Send + Sync>> {
-    let json_str = vector32_json(vector)?;
-    let mut rows = conn
-        .query(
-            "SELECT COUNT(*)
-             FROM edges e
-             JOIN (
-                 SELECT source, target, MIN(ts) AS created_at
-                 FROM events
-                 WHERE event_type = 'created' AND source != '' AND target != ''
-                 GROUP BY source, target
-             ) created ON created.source = e.source AND created.target = e.target
-             WHERE e.expired_at IS NULL
-               AND e.embedding IS NOT NULL
-               AND created.created_at > ?2
-               AND vector_distance_cos(e.embedding, vector32(?1)) <= ?3",
-            params![json_str, created_at, max_distance],
-        )
-        .await?;
-    let Some(row) = rows.next().await? else {
-        return Ok(0);
-    };
-    Ok(int(row.get_value(0)?) as usize)
-}
 
 const OPEN_LOOP_SELECT: &str = "SELECT e.source, e.target, n.body, n.date FROM nodes n JOIN edges e ON e.source = n.id JOIN nodes anchor ON anchor.id = e.target";
 

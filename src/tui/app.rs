@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::api::{Chunk, EmbeddingClient, LlmClient, Stats};
-use crate::memory::{self, DreamEvent, ExploreEvent, IngestEvent, MemoryEvent, MemorySeats};
+use crate::memory::{self, DreamEvent, IngestEvent, MemoryEvent, MemorySeats};
 use crate::session;
 use crate::web::SearchClient;
 
@@ -36,13 +36,6 @@ pub(crate) enum DreamState {
 }
 
 #[derive(PartialEq)]
-pub(crate) enum ExploreState {
-    Idle,
-    Running,
-    Done,
-}
-
-#[derive(PartialEq)]
 pub(crate) enum IngestState {
     Idle,
     Running,
@@ -65,7 +58,7 @@ pub(crate) struct Message {
 pub(crate) struct App {
     pub(crate) chat_llm: Arc<dyn LlmClient>,
     // The memory pass runs on per-seat clients (classifier/scribe/heavy). The
-    // heavy seat is also the model for dream/explore/ingest passes.
+    // heavy seat is also the model for dream/ingest passes.
     pub(crate) seats: MemorySeats,
     pub(crate) embed: Arc<dyn EmbeddingClient>,
     pub(crate) search: Option<Arc<dyn SearchClient>>,
@@ -95,10 +88,6 @@ pub(crate) struct App {
     pub(crate) dream_rx: Option<std::sync::mpsc::Receiver<DreamEvent>>,
     pub(crate) dream_log: Vec<(String, String)>,
     pub(crate) dream_summary: String,
-    pub(crate) explore_state: ExploreState,
-    pub(crate) explore_rx: Option<std::sync::mpsc::Receiver<ExploreEvent>>,
-    pub(crate) explore_log: Vec<(String, String)>,
-    pub(crate) explore_summary: String,
     pub(crate) ingest_state: IngestState,
     pub(crate) ingest_rx: Option<std::sync::mpsc::Receiver<IngestEvent>>,
     pub(crate) ingest_log: Vec<(String, String)>,
@@ -150,10 +139,6 @@ impl App {
             dream_rx: None,
             dream_log: Vec::new(),
             dream_summary: String::new(),
-            explore_state: ExploreState::Idle,
-            explore_rx: None,
-            explore_log: Vec::new(),
-            explore_summary: String::new(),
             ingest_state: IngestState::Idle,
             ingest_rx: None,
             ingest_log: Vec::new(),
@@ -320,33 +305,6 @@ pub(crate) fn drain_dream(app: &mut App) {
     }
 }
 
-pub(crate) fn drain_explore(app: &mut App) {
-    let explore_receiver = match app.explore_rx.take() {
-        Some(explore_receiver) => explore_receiver,
-        None => return,
-    };
-    loop {
-        match explore_receiver.try_recv() {
-            Ok(ExploreEvent::Log { phase, text }) => {
-                app.explore_log.push((phase.to_string(), text));
-            }
-            Ok(ExploreEvent::Done { events_recorded }) => {
-                app.explore_summary = format!("explore done — {events_recorded} events");
-                app.explore_state = ExploreState::Done;
-                return;
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                app.explore_rx = Some(explore_receiver);
-                return;
-            }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                app.explore_state = ExploreState::Idle;
-                return;
-            }
-        }
-    }
-}
-
 pub(crate) fn drain_ingest(app: &mut App) {
     let ingest_receiver = match app.ingest_rx.take() {
         Some(ingest_receiver) => ingest_receiver,
@@ -409,20 +367,6 @@ pub(crate) fn start_dream(app: &mut App) {
     app.dream_state = DreamState::Running;
 }
 
-pub(crate) fn start_exploration(app: &mut App) {
-    app.explore_log.clear();
-    app.explore_summary.clear();
-    let (sender, receiver) = std::sync::mpsc::channel::<ExploreEvent>();
-    let llm = Arc::clone(&app.seats.heavy);
-    let embed = Arc::clone(&app.embed);
-    let search = clone_search_client(app);
-    std::thread::spawn(move || {
-        let _ = memory::run_exploration_pass(llm, embed, search, sender);
-    });
-    app.explore_rx = Some(receiver);
-    app.explore_state = ExploreState::Running;
-}
-
 fn clone_search_client(app: &App) -> Option<Arc<dyn SearchClient>> {
     match &app.search {
         Some(search) => Some(Arc::clone(search)),
@@ -442,22 +386,6 @@ pub(crate) fn start_ingestion(app: &mut App, path: PathBuf) {
     });
     app.ingest_rx = Some(receiver);
     app.ingest_state = IngestState::Running;
-}
-
-pub(crate) fn run_outcome_command(app: &mut App, score: f64) {
-    app.memory_log.clear();
-    let Some(session_id) = memory::latest_session_id("exploration") else {
-        app.memory_log.push((
-            "reinforce".to_string(),
-            "no exploration session found".to_string(),
-        ));
-        return;
-    };
-    let text = match memory::record_outcome(&session_id, score, "{}") {
-        Ok(summary) => summary,
-        Err(err) => format!("error: {err}"),
-    };
-    app.memory_log.push(("reinforce".to_string(), text));
 }
 
 pub(crate) fn start_recompute_positions(app: &mut App) {
@@ -528,7 +456,6 @@ pub(crate) fn scheduler_allowed(app: &App) -> bool {
     app.state == State::Idle
         && app.memory_state == MemoryState::Idle
         && app.dream_state != DreamState::Running
-        && app.explore_state != ExploreState::Running
         && app.ingest_state != IngestState::Running
 }
 
@@ -617,11 +544,6 @@ fn dispatch_scheduler_action(app: &mut App, action: crate::memory::scheduler::Sc
         SchedulerAction::Dream { reason } => {
             crate::runlog::log("sched", &format!("dispatching dream: {}", reason));
             start_dream(app);
-            app.scheduler_consecutive_actions += 1;
-        }
-        SchedulerAction::Explore { reason } | SchedulerAction::Curiosity { reason } => {
-            crate::runlog::log("sched", &format!("dispatching exploration: {reason}"));
-            start_exploration(app);
             app.scheduler_consecutive_actions += 1;
         }
         SchedulerAction::InboxStudy { reason } => {

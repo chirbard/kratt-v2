@@ -3,9 +3,9 @@ use super::super::{
     test_support::{EVENTS_DDL, NODES_DDL, harness},
 };
 use super::{
-    count_new_embedding_neighbours_async, insert_interest, interest_density_with,
-    load_all_edges_semantic_async, load_due_loops_async, load_loops_for_anchors,
-    load_recent_attention_counts_async, load_unembedded_edges_async, top_interests_with,
+    insert_interest, interest_density_with, load_all_edges_semantic_async, load_due_loops_async,
+    load_loops_for_anchors, load_recent_attention_counts_async, load_unembedded_edges_async,
+    top_interests_with,
 };
 use turso::{Connection, params};
 
@@ -70,22 +70,6 @@ async fn policy_harness() -> Connection {
     let conn = harness().await;
     let _ = conn.execute(EVENTS_DDL, ()).await;
     conn
-}
-
-async fn insert_policy_edge(conn: &Connection, details: (&str, &str, &str, &str)) {
-    let (source, target, vector, created_at) = details;
-    let _ = conn
-        .execute(
-            "INSERT INTO edges (source, target, embedding) VALUES (?1, ?2, vector32(?3))",
-            params![source, target, vector],
-        )
-        .await;
-    let _ = conn
-        .execute(
-            "INSERT INTO events (ts, event_type, source, target) VALUES (?1, 'created', ?2, ?3)",
-            params![created_at, source, target],
-        )
-        .await;
 }
 
 async fn insert_loop(
@@ -330,43 +314,4 @@ fn recent_attention_counts_only_candidate_events_inside_window() {
     };
     assert_eq!(counts.get(&("a".to_string(), "b".to_string())), Some(&2));
     assert_eq!(counts.len(), 1);
-}
-
-#[test]
-fn incubation_counts_only_new_near_live_edges() {
-    let conn = block_on(policy_harness());
-    let note_created = "2026-07-01T12:00:00Z";
-    let cases = [
-        ("near-1", "topic-1", "[1.0,0.0]", "2026-07-02T12:00:00Z"),
-        ("near-2", "topic-2", "[0.99,0.01]", "2026-07-03T12:00:00Z"),
-        ("near-3", "topic-3", "[0.98,0.02]", "2026-07-04T12:00:00Z"),
-        ("old-near", "topic-4", "[1.0,0.0]", "2026-06-30T12:00:00Z"),
-        ("new-far", "topic-5", "[0.0,1.0]", "2026-07-05T12:00:00Z"),
-        (
-            "expired-near",
-            "topic-6",
-            "[1.0,0.0]",
-            "2026-07-06T12:00:00Z",
-        ),
-    ];
-    for details in cases {
-        block_on(insert_policy_edge(&conn, details));
-    }
-    block_on(async {
-        let _ = conn
-                .execute(
-                    "UPDATE edges SET expired_at = '2026-07-07T12:00:00Z' WHERE source = 'expired-near'",
-                    (),
-                )
-                .await;
-    });
-    let Ok(count) = block_on(count_new_embedding_neighbours_async(
-        &conn,
-        &[1.0, 0.0],
-        note_created,
-        0.45,
-    )) else {
-        unreachable!("incubation neighbours count")
-    };
-    assert_eq!(count, 3);
 }

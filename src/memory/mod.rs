@@ -5,7 +5,6 @@ pub mod decay_curve;
 mod decay_simulator;
 mod dream;
 mod embed;
-mod explore;
 mod graph;
 mod heavy;
 mod hygiene;
@@ -27,9 +26,9 @@ pub use agent::{MemoryEvent, MemorySeats, run_memory_agent};
 pub(crate) use agent::{classify_reply_label, describe_tool_call, parse_tool_calls};
 #[allow(unused_imports)]
 pub use db::{
-    PassRun, db_init, finish_pass_run, insert_message, last_sync_error, latest_session_id,
-    read_message_context, register_session, search_messages_fts, start_pass_run, startup_database,
-    sync_now, sync_push_best_effort,
+    PassRun, db_init, finish_pass_run, insert_message, last_sync_error, read_message_context,
+    register_session, search_messages_fts, start_pass_run, startup_database, sync_now,
+    sync_push_best_effort,
 };
 pub(crate) use db::{Finding, InboxItem, acquire_write_lock, oldest_queued_inbox, open_connection, resolve_inbox_item};
 pub(crate) use db::{
@@ -43,7 +42,6 @@ pub(crate) use db::{insert_interest, top_interests_with};
 pub use dream::{DreamEvent, run_dream_pass};
 pub use decay_simulator::run as run_decay_simulator;
 pub use embed::{SemanticEdge, edges_to_toon, run_embed_pass, select_semantic_edges, select_semantic_edges_routed};
-pub use explore::{ExploreEvent, run_exploration_pass};
 pub use ingest::{IngestEvent, run_focused_ingestion_pass, run_ingestion_pass};
 pub(crate) use news::run_news_scan;
 pub use ledger::{

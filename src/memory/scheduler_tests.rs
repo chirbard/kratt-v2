@@ -6,11 +6,8 @@
             acquisition_debt: 60,
             queued_inbox: 0,
             re_read_candidates: vec![],
-            open_curiosity_notes_count: 0,
-            coldest_edge_age_days: Some(20),
             actor_positions: vec![],
             news_scan_due: false,
-            last_curiosity_had_yield: None,
         };
         let action = decide(&inputs);
         match action {
@@ -36,11 +33,8 @@
                 3,
                 "node1".to_string(),
             )],
-            open_curiosity_notes_count: 0,
-            coldest_edge_age_days: Some(5),
             actor_positions: vec![],
             news_scan_due: false,
-            last_curiosity_had_yield: None,
         };
         let action = decide(&inputs);
 
@@ -57,97 +51,7 @@
     }
 
     #[test]
-    fn test_decide_explore_when_open_notes_exist() {
-        let inputs = SchedulerInputs {
-            acquisition_debt: 10,
-            queued_inbox: 0,
-            re_read_candidates: vec![("path/to/file.md".to_string(), 2, "node1".to_string())],
-            open_curiosity_notes_count: 5,
-            coldest_edge_age_days: Some(5),
-            actor_positions: vec![],
-            news_scan_due: false,
-            last_curiosity_had_yield: None,
-        };
-        let action = decide(&inputs);
-        match action {
-            SchedulerAction::Explore { reason } => {
-                assert!(reason.contains("5"));
-            }
-            _ => panic!("Expected Explore action, got {:?}", action),
-        }
-    }
-
-    #[test]
-    fn test_decide_explore_when_cold_region() {
-        let inputs = SchedulerInputs {
-            acquisition_debt: 10,
-            queued_inbox: 0,
-            re_read_candidates: vec![],
-            open_curiosity_notes_count: 0,
-            coldest_edge_age_days: Some(15), // > COLD_REGION_DAYS (14)
-            actor_positions: vec![],
-            news_scan_due: false,
-            last_curiosity_had_yield: None,
-        };
-        let action = decide(&inputs);
-        match action {
-            SchedulerAction::Explore { reason } => {
-                assert!(reason.contains("15"));
-                assert!(reason.contains("14"));
-            }
-            _ => panic!("Expected Explore action, got {:?}", action),
-        }
-    }
-
-    #[test]
-    fn test_decide_curiosity_when_no_visit_data() {
-        let inputs = SchedulerInputs {
-            acquisition_debt: 10,
-            queued_inbox: 0,
-            re_read_candidates: vec![],
-            open_curiosity_notes_count: 0,
-            coldest_edge_age_days: None, // no edge_actor_views rows yet
-            actor_positions: vec![],
-            news_scan_due: false,
-            last_curiosity_had_yield: None,
-        };
-        let action = decide(&inputs);
-        match action {
-            SchedulerAction::Curiosity { .. } => {}
-            _ => panic!("Expected Curiosity action, got {:?}", action),
-        }
-    }
-
-    #[test]
-    fn test_decide_curiosity_when_nothing_to_do() {
-        let inputs = SchedulerInputs {
-            acquisition_debt: 10,
-            queued_inbox: 0,
-            re_read_candidates: vec![],
-            open_curiosity_notes_count: 0,
-            coldest_edge_age_days: Some(5),
-            actor_positions: vec![],
-            news_scan_due: false,
-            last_curiosity_had_yield: None,
-        };
-        let action = decide(&inputs);
-        match action {
-            SchedulerAction::Curiosity { reason } => assert!(reason.contains("idle")),
-            _ => panic!("Expected Curiosity action, got {:?}", action),
-        }
-    }
-
-    #[test]
-    fn test_decide_rest_after_empty_curiosity() {
-        let inputs = SchedulerInputs {
-            last_curiosity_had_yield: Some(false),
-            ..SchedulerInputs::default()
-        };
-        assert!(matches!(decide(&inputs), SchedulerAction::Rest { .. }));
-    }
-
-    #[test]
-    fn news_scan_runs_below_maintenance_and_above_curiosity() {
+    fn news_scan_runs_below_maintenance_and_above_rest() {
         let due = SchedulerInputs {
             news_scan_due: true,
             ..SchedulerInputs::default()
@@ -165,10 +69,7 @@
             news_scan_due: false,
             ..SchedulerInputs::default()
         };
-        assert!(matches!(
-            decide(&scanned),
-            SchedulerAction::Curiosity { .. }
-        ));
+        assert!(matches!(decide(&scanned), SchedulerAction::Rest { .. }));
     }
 
     #[test]
@@ -178,11 +79,8 @@
             acquisition_debt: 60, // >= 50
             queued_inbox: 0,
             re_read_candidates: vec![("path/to/file.md".to_string(), 5, "node1".to_string())],
-            open_curiosity_notes_count: 0,
-            coldest_edge_age_days: Some(5),
             actor_positions: vec![],
             news_scan_due: false,
-            last_curiosity_had_yield: None,
         };
         let action = decide(&inputs);
         match action {
@@ -234,27 +132,4 @@
             ..SchedulerInputs::default()
         };
         assert!(matches!(decide(&inputs), SchedulerAction::Dream { .. }));
-    }
-
-    #[test]
-    fn test_rule_priority_ingest_over_explore() {
-        // Ingest should win over explore when notes are above threshold
-        let inputs = SchedulerInputs {
-            acquisition_debt: 10,
-            queued_inbox: 0,
-            re_read_candidates: vec![("path/to/file.md".to_string(), 3, "node1".to_string())],
-            open_curiosity_notes_count: 5,
-            coldest_edge_age_days: Some(5),
-            actor_positions: vec![],
-            news_scan_due: false,
-            last_curiosity_had_yield: None,
-        };
-        // Note: This test assumes the file exists. In a real scenario,
-        // the decision function checks file existence, but for this test
-        // we can't create actual files, so the ingest rule might not trigger.
-        // This is acceptable as the file existence check is environment-dependent.
-        let action = decide(&inputs);
-        // The action could be either Ingest or Explore depending on file existence
-        // For the test, we just verify it doesn't panic
-        let _ = action;
     }

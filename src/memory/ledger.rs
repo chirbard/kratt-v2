@@ -11,8 +11,6 @@ const HALF_LIFE_CYCLES: f64 = 20.0; // replay-tunable.
 const POSITION_EPSILON: f64 = 0.05; // replay-tunable.
 const DIRECTION_SNAPSHOTS: usize = 5; // replay-tunable.
 const DIRECTION_NORM_EPSILON: f64 = 1e-9; // replay-tunable.
-const TIER_ACTIVE: f64 = 2.0; // replay-tunable.
-const TIER_MARKED: f64 = 3.0; // replay-tunable.
 
 #[derive(Clone)]
 pub struct Event {
@@ -105,27 +103,6 @@ impl Event {
             edge,
             context,
             EventBody::new(1.0, payload),
-        )
-    }
-
-    pub fn retrieved(actor: Actor, edge: EdgeRef, context: EventContext) -> Self {
-        Self::new(
-            actor,
-            "retrieved",
-            edge,
-            context,
-            EventBody::new(TIER_ACTIVE, String::new()),
-        )
-    }
-
-    pub fn marked(actor: Actor, edge: EdgeRef, context: EventContext, reason: &str) -> Self {
-        let payload = serde_json::json!({"reason": reason}).to_string();
-        Self::new(
-            actor,
-            "marked",
-            edge,
-            context,
-            EventBody::new(TIER_MARKED, payload),
         )
     }
 

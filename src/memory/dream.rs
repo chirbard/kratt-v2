@@ -37,15 +37,6 @@ const BIOLOGIST_ANCHOR: &str =
 const HISTORIAN_ANCHOR: &str = "history timeline events temporal sequence causation past future";
 const ECONOMIST_ANCHOR: &str = "economics incentives trade-offs optimization value cost benefit";
 
-pub fn domain_anchor(agent_name: &str) -> Option<&'static str> {
-    match agent_name {
-        "biologist" => Some(BIOLOGIST_ANCHOR),
-        "historian" => Some(HISTORIAN_ANCHOR),
-        "economist" => Some(ECONOMIST_ANCHOR),
-        _ => None,
-    }
-}
-
 pub enum DreamEvent {
     Log { phase: &'static str, text: String },
     Append { phase: &'static str, text: String },

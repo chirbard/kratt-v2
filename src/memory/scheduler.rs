@@ -5,14 +5,11 @@ use turso::{Connection, Value};
 
 use super::db;
 use super::ledger;
-use crate::timeutil::{self, epoch_seconds_now};
 
 // replay-tunable.
 const ACQUISITION_DEBT_THRESHOLD: usize = 50;
 // replay-tunable.
 const RE_READ_NOTE_THRESHOLD: usize = 3;
-// replay-tunable.
-const COLD_REGION_DAYS: i64 = 14;
 // replay-tunable.
 const DRIFT_WARN_DISTANCE: f64 = 0.10;
 
@@ -20,8 +17,6 @@ const DRIFT_WARN_DISTANCE: f64 = 0.10;
 #[derive(Debug, Clone, PartialEq)]
 pub enum SchedulerAction {
     Dream { reason: String },
-    Explore { reason: String },
-    Curiosity { reason: String },
     NewsScan { reason: String },
     InboxStudy { reason: String },
     Ingest { path: PathBuf, reason: String },
@@ -34,11 +29,8 @@ pub struct SchedulerInputs {
     pub acquisition_debt: usize,
     pub queued_inbox: usize,
     pub re_read_candidates: Vec<(String, usize, String)>, // (path, note_count, source_node_id)
-    pub open_curiosity_notes_count: usize,
-    pub coldest_edge_age_days: Option<i64>,
     pub actor_positions: Vec<(String, String, Option<Vec<f64>>)>, // (actor_type, actor_id, position)
     pub news_scan_due: bool,
-    pub last_curiosity_had_yield: Option<bool>,
 }
 
 /// Gather all inputs from the database for scheduler decision
@@ -54,19 +46,14 @@ async fn gather_inputs_async(conn: &Connection) -> SchedulerInputs {
     let acquisition_debt = count_acquisition_debt(conn).await;
     let queued_inbox = db::count_queued_inbox(conn).await;
     let re_read_candidates = find_re_read_candidates(conn).await;
-    let open_curiosity_notes_count = count_open_curiosity_notes(conn).await;
-    let coldest_edge_age_days = find_coldest_edge_age_days(conn).await;
     let actor_positions = load_all_actor_positions(conn).await;
 
     SchedulerInputs {
         acquisition_debt,
         queued_inbox,
         re_read_candidates,
-        open_curiosity_notes_count,
-        coldest_edge_age_days,
         actor_positions,
         news_scan_due: true,
-        last_curiosity_had_yield: None,
     }
 }
 
@@ -125,20 +112,9 @@ pub fn decide(inputs: &SchedulerInputs) -> SchedulerAction {
     if let Some(action) = check_re_read_candidates(inputs) {
         return action;
     }
-    if let Some(action) = check_open_notes(inputs) {
-        return action;
-    }
-    if let Some(action) = check_cold_region(inputs) {
-        return action;
-    }
     if inputs.news_scan_due {
         return SchedulerAction::NewsScan {
             reason: "daily interest-driven scan".to_string(),
-        };
-    }
-    if inputs.last_curiosity_had_yield != Some(false) {
-        return SchedulerAction::Curiosity {
-            reason: "idle — curiosity exploration".to_string(),
         };
     }
     rest_action(inputs)
@@ -172,42 +148,9 @@ fn check_re_read_candidates(inputs: &SchedulerInputs) -> Option<SchedulerAction>
     None
 }
 
-fn check_open_notes(inputs: &SchedulerInputs) -> Option<SchedulerAction> {
-    if inputs.open_curiosity_notes_count > 0 {
-        Some(SchedulerAction::Explore {
-            reason: format!(
-                "{} open curiosity notes to process",
-                inputs.open_curiosity_notes_count
-            ),
-        })
-    } else {
-        None
-    }
-}
-
-// None means "no visit data yet" — most edges never get edge_actor_views
-// rows (only exploration writes them), so absence of views is the normal
-// state, not a cold signal. Cold = the oldest recorded visit is stale.
-fn check_cold_region(inputs: &SchedulerInputs) -> Option<SchedulerAction> {
-    let age_days = inputs.coldest_edge_age_days?;
-    if age_days > COLD_REGION_DAYS {
-        return Some(SchedulerAction::Explore {
-            reason: format!(
-                "coldest edge age {} days > {} days",
-                age_days, COLD_REGION_DAYS
-            ),
-        });
-    }
-    None
-}
-
 fn rest_action(inputs: &SchedulerInputs) -> SchedulerAction {
-    let coldest_days = inputs.coldest_edge_age_days.unwrap_or(-1);
     SchedulerAction::Rest {
-        reason: format!(
-            "nothing to do (debt: {}, open notes: {}, coldest edge: {} days)",
-            inputs.acquisition_debt, inputs.open_curiosity_notes_count, coldest_days
-        ),
+        reason: format!("nothing to do (debt: {})", inputs.acquisition_debt),
     }
 }
 
@@ -300,12 +243,6 @@ pub fn log_scheduler_decision(action: &SchedulerAction) {
     match action {
         SchedulerAction::Dream { reason } => {
             crate::runlog::log("sched", &format!("[autonomy] dream — {reason}"));
-        }
-        SchedulerAction::Explore { reason } => {
-            crate::runlog::log("sched", &format!("[autonomy] explore — {reason}"));
-        }
-        SchedulerAction::Curiosity { reason } => {
-            crate::runlog::log("sched", &format!("[autonomy] curiosity — {reason}"));
         }
         SchedulerAction::NewsScan { reason } => {
             crate::runlog::log("sched", &format!("[autonomy] news scan — {reason}"));
@@ -507,57 +444,6 @@ fn payload_source_path(payload: &str) -> Option<String> {
     Some(json.get("source")?.as_str()?.to_string())
 }
 
-/// Count total open curiosity notes
-async fn count_open_curiosity_notes(conn: &Connection) -> usize {
-    let mut rows = match conn
-        .query(
-            "SELECT COUNT(*)
-             FROM nodes n
-             JOIN edges e ON e.source = n.id
-             LEFT JOIN (
-                 SELECT DISTINCT ev.source, ev.target
-                 FROM events ev
-                 JOIN sessions s ON s.id = ev.session_id
-                 WHERE s.session_type = 'exploration' AND ev.event_type = 'retrieved'
-             ) consumed ON consumed.source = e.source AND consumed.target = e.target
-             WHERE n.node_type = 'note' AND e.expired_at IS NULL AND consumed.source IS NULL",
-            (),
-        )
-        .await
-    {
-        Ok(rows) => rows,
-        Err(_) => return 0,
-    };
-
-    if let Ok(Some(row)) = rows.next().await {
-        match row.get_value(0) {
-            Ok(value) => db::int(value) as usize,
-            Err(_) => 0,
-        }
-    } else {
-        0
-    }
-}
-
-/// Age in days of the oldest recorded visit across all actors.
-/// None when there is no visit data (empty table) — not a cold signal.
-async fn find_coldest_edge_age_days(conn: &Connection) -> Option<i64> {
-    let mut rows = conn
-        .query("SELECT MIN(last_visited_at) FROM edge_actor_views", ())
-        .await
-        .ok()?;
-    let row = rows.next().await.ok()??;
-    let Ok(oldest_value) = row.get_value(0) else {
-        return None;
-    };
-    let oldest_ts = db::text(oldest_value);
-    if oldest_ts.trim().is_empty() {
-        return None;
-    }
-    let oldest_epoch = timeutil::timestamp_to_epoch_seconds(&oldest_ts)?;
-    let current_epoch = epoch_seconds_now() as i64;
-    Some((current_epoch - oldest_epoch) / 86_400)
-}
 
 /// Load all actor positions for drift monitoring
 async fn load_all_actor_positions(conn: &Connection) -> Vec<(String, String, Option<Vec<f64>>)> {

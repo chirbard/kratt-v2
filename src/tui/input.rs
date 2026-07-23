@@ -2,7 +2,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use std::path::PathBuf;
 
-use super::app::{self, App, DreamState, ExploreState, IngestState, MemoryState, Mode, State};
+use super::app::{self, App, DreamState, IngestState, MemoryState, Mode, State};
 use super::stream::start_stream;
 
 pub(crate) fn handle_key(key: KeyEvent, app: &mut App) -> bool {
@@ -16,23 +16,17 @@ fn handle_insert_key(key: KeyEvent, app: &mut App) -> bool {
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
         KeyCode::Esc => app.mode = Mode::Normal,
-        // Chat and ingestion both require no running background pass: dream,
-        // explore, and ingest hold transactions open across LLM calls, and a
+        // Chat and ingestion both require no running background pass: dream
+        // and ingest hold transactions open across LLM calls, and a
         // concurrent chat turn's memory writes abort them (turso allows only
         // one writer; a second commit kills the open transaction).
         KeyCode::Enter if app.state == State::Idle && !app.input.is_empty() => {
             let path = ingest_command_path(&app.input);
-            let outcome_score = outcome_command_score(&app.input);
             if let Some(path) = path {
                 if maintenance_allowed(app) {
                     let path = path.to_string();
                     app.input.clear();
                     app::start_ingestion(app, PathBuf::from(path));
-                }
-            } else if let Some(score) = outcome_score {
-                if background_passes_idle(app) {
-                    app.input.clear();
-                    app::run_outcome_command(app, score);
                 }
             } else if background_passes_idle(app) {
                 start_stream(app);
@@ -62,7 +56,6 @@ fn handle_normal_key(key: KeyEvent, app: &mut App) -> bool {
         KeyCode::Char('a') => app.show_attribution = !app.show_attribution,
         KeyCode::Char('P') if maintenance_allowed(app) => app::start_recompute_positions(app),
         KeyCode::Char('D') if maintenance_allowed(app) => app::start_dream(app),
-        KeyCode::Char('E') if maintenance_allowed(app) => app::start_exploration(app),
         KeyCode::Char('S') if maintenance_allowed(app) => app::start_sync(app),
         KeyCode::Char('A') => toggle_autonomous_mode(app),
         _ => {}
@@ -75,19 +68,17 @@ fn toggle_autonomous_mode(app: &mut App) {
     app::reset_scheduler_idle(app);
 }
 
-// Background maintenance actions (recompute, dream, explore, sync) are
+// Background maintenance actions (recompute, dream, sync) are
 // mutually exclusive and must not run during streaming or memory updates.
 fn maintenance_allowed(app: &App) -> bool {
     app.state == State::Idle
         && app.memory_state == MemoryState::Idle
         && app.dream_state != DreamState::Running
-        && app.explore_state != ExploreState::Running
         && app.ingest_state != IngestState::Running
 }
 
 fn background_passes_idle(app: &App) -> bool {
     app.dream_state != DreamState::Running
-        && app.explore_state != ExploreState::Running
         && app.ingest_state != IngestState::Running
 }
 
@@ -99,13 +90,6 @@ fn ingest_command_path(input: &str) -> Option<&str> {
         return None;
     }
     Some(path)
-}
-
-fn outcome_command_score(input: &str) -> Option<f64> {
-    let trimmed = input.trim();
-    let arg = trimmed.strip_prefix("/outcome ")?;
-    let score = arg.trim().parse::<f64>().ok()?;
-    Some(score.clamp(-1.0, 1.0))
 }
 
 fn scroll_down(app: &mut App) {

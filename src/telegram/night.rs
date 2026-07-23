@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use crate::api::{EmbeddingClient, LlmClient};
 use crate::memory::scheduler::{self, SchedulerAction};
-use crate::memory::{self, DreamEvent, ExploreEvent, IngestEvent};
+use crate::memory::{self, DreamEvent, IngestEvent};
 use crate::runlog;
 use crate::timeutil;
 use crate::web::SearchClient;
@@ -133,7 +133,6 @@ struct NightGate {
     dream_skip_recorded: bool,
     studied_inbox_tonight: bool,
     scanned_news_today: bool,
-    last_curiosity_had_yield: Option<bool>,
 }
 
 impl NightGate {
@@ -151,7 +150,6 @@ impl NightGate {
             dream_skip_recorded: false,
             studied_inbox_tonight: false,
             scanned_news_today: false,
-            last_curiosity_had_yield: None,
         }
     }
 
@@ -168,7 +166,6 @@ impl NightGate {
             self.dream_skip_recorded = false;
             self.studied_inbox_tonight = false;
             self.scanned_news_today = false;
-            self.last_curiosity_had_yield = None;
             self.dirty = true;
         }
         inside && self.dirty && self.cooldown_elapsed(now) && self.count < self.max_actions
@@ -181,11 +178,10 @@ impl NightGate {
         }
     }
 
-    // A dream/explore counts against both the cooldown and the per-night cap.
+    // A completed action counts against both the cooldown and the per-night cap.
     fn record_action(&mut self, now: Instant) {
         self.count += 1;
         self.last_action = Some(now);
-        self.last_curiosity_had_yield = None;
     }
 
     fn can_attempt_dream(&self) -> bool {
@@ -198,14 +194,7 @@ impl NightGate {
         self.record_action(now);
     }
 
-    fn record_curiosity(&mut self, now: Instant, had_yield: bool) {
-        self.count += 1;
-        self.last_action = Some(now);
-        self.last_curiosity_had_yield = Some(had_yield);
-        self.dirty = had_yield;
-    }
-
-    // A skipped action (ingest, non-headless explore) consumes the cooldown so
+    // A skipped action consumes the cooldown so
     // the daemon does not re-decide it every idle tick, but not the cap.
     fn record_skipped(&mut self, now: Instant) {
         self.last_action = Some(now);
@@ -267,7 +256,6 @@ impl NightCycle {
     // differ now, so the next idle poll inside the window re-evaluates.
     pub fn mark_dirty(&mut self) {
         self.gate.dirty = true;
-        self.gate.last_curiosity_had_yield = None;
     }
 
     // The nightly-dream guarantee: a brain dreams every night that anything
@@ -302,7 +290,6 @@ impl NightCycle {
         if self.gate.scanned_news_today {
             inputs.news_scan_due = false;
         }
-        inputs.last_curiosity_had_yield = self.gate.last_curiosity_had_yield;
         let action = scheduler::decide(&inputs);
         scheduler::log_scheduler_decision(&action);
         if !matches!(action, SchedulerAction::Rest { .. }) {
@@ -315,16 +302,6 @@ impl NightCycle {
         match action {
             SchedulerAction::Dream { reason } => {
                 self.dispatch_dream(&reason, now);
-            }
-            SchedulerAction::Explore { reason } => {
-                runlog::log("tg", &format!("night action: explore ({reason})"));
-                let _ = self.run_explore();
-                self.gate.record_action(now);
-            }
-            SchedulerAction::Curiosity { reason } => {
-                runlog::log("tg", &format!("night action: curiosity ({reason})"));
-                let had_yield = self.run_explore().items_added > 0;
-                self.gate.record_curiosity(now, had_yield);
             }
             SchedulerAction::NewsScan { reason } => self.dispatch_news_scan(&reason, now),
             SchedulerAction::InboxStudy { reason } => {
@@ -386,25 +363,6 @@ impl NightCycle {
             }
         };
         self.finish_pass(run_id, "dream", &execution);
-        execution
-    }
-
-    fn run_explore(&self) -> PassExecution {
-        let run_id = self.start_pass("exploration");
-        let (sender, receiver) = std::sync::mpsc::channel::<ExploreEvent>();
-        let llm = Arc::clone(&self.memory_llm);
-        let embed = Arc::clone(&self.embed);
-        let search = self.search.clone();
-        let result = memory::run_exploration_pass(llm, embed, search, sender);
-        for _event in receiver {}
-        let execution = match result {
-            Ok(events_recorded) => PassExecution::ok(events_recorded),
-            Err(err) => {
-                runlog::log("tg", &format!("night explore failed: {err}"));
-                PassExecution::failed(classify_pass_error(&err.to_string()))
-            }
-        };
-        self.finish_pass(run_id, "exploration", &execution);
         execution
     }
 

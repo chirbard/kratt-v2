@@ -6,9 +6,7 @@ use ratatui::widgets::{
     Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
 
-use super::app::{
-    App, DreamState, ExploreState, IngestState, MemoryState, Message, Mode, Role, State,
-};
+use super::app::{App, DreamState, IngestState, MemoryState, Message, Mode, Role, State};
 
 pub(crate) const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -65,7 +63,6 @@ fn build_memory_text(app: &App) -> Text<'static> {
     let mut lines: Vec<Line> = Vec::new();
     append_log_section(&mut lines, &app.memory_log, None, app);
     append_log_section(&mut lines, &app.dream_log, Some("dream"), app);
-    append_log_section(&mut lines, &app.explore_log, Some("explore"), app);
     append_log_section(&mut lines, &app.ingest_log, Some("ingest"), app);
     Text::from(lines)
 }
@@ -186,7 +183,6 @@ fn render_stats(frame: &mut Frame, area: Rect, app: &App) {
     let mut text = stats_line(app);
     append_memory_status(&mut text, app);
     append_dream_status(&mut text, app);
-    append_explore_status(&mut text, app);
     append_ingest_status(&mut text, app);
     if let Some(sync_error) = crate::memory::last_sync_error() {
         let line = Line::from(vec![
@@ -236,16 +232,6 @@ fn append_dream_status(text: &mut String, app: &App) {
     }
 }
 
-fn append_explore_status(text: &mut String, app: &App) {
-    if app.explore_state == ExploreState::Running {
-        append_status_text(text, format!("explore {}", spinner_char(app.tick)));
-        return;
-    }
-    if app.explore_state == ExploreState::Done && !app.explore_summary.is_empty() {
-        append_status_text(text, app.explore_summary.clone());
-    }
-}
-
 fn append_ingest_status(text: &mut String, app: &App) {
     if app.ingest_state == IngestState::Running {
         append_status_text(text, format!("ingest {}", spinner_char(app.tick)));
@@ -286,17 +272,13 @@ fn normal_mode_hint(app: &App) -> String {
         app.dream_state == DreamState::Running,
         app.dream_state == DreamState::Done,
     );
-    let explore_hint = explore_hint(
-        app.explore_state == ExploreState::Running,
-        app.explore_state == ExploreState::Done,
-    );
     let ingest_hint = ingest_hint(
         app.ingest_state == IngestState::Running,
         app.ingest_state == IngestState::Done,
     );
     let auto_hint = autonomous_mode_hint(app.autonomous_mode, app.scheduler_paused);
     format!(
-        "-- NORMAL --  {mem_hint}  {rea_hint}  {dbg_hint}  {tool_hint}  {attr_hint}  {dream_hint}  {explore_hint}  {ingest_hint}  [S] sync  {auto_hint}"
+        "-- NORMAL --  {mem_hint}  {rea_hint}  {dbg_hint}  {tool_hint}  {attr_hint}  {dream_hint}  {ingest_hint}  [S] sync  {auto_hint}"
     )
 }
 
@@ -316,16 +298,6 @@ fn dream_hint(running: bool, done: bool) -> &'static str {
         return "[D] dream ✓";
     }
     "[D] dream"
-}
-
-fn explore_hint(running: bool, done: bool) -> &'static str {
-    if running {
-        return "[E] exploring…";
-    }
-    if done {
-        return "[E] explore ✓";
-    }
-    "[E] explore"
 }
 
 fn ingest_hint(running: bool, done: bool) -> &'static str {
@@ -465,7 +437,6 @@ fn phase_color(phase: &str) -> Color {
         "lateral" => Color::Magenta,
         "consolidation" => Color::Yellow,
         "dream" => Color::Green,
-        "explore" => Color::Green,
         "ingest" => Color::Yellow,
         "think" => Color::Magenta,
         "debug" => Color::DarkGray,

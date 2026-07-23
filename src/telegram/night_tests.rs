@@ -179,18 +179,6 @@
     }
 
     #[test]
-    fn empty_curiosity_consumes_a_slot_and_settles() {
-        let mut gate = gate("3-6");
-        let base = Instant::now();
-        assert!(gate.should_evaluate(4, "2026-07-10", base));
-        gate.record_curiosity(base, false);
-        assert_eq!(gate.count, 1);
-        let later = base + Duration::from_secs(1200);
-        assert!(!gate.should_evaluate(4, "2026-07-10", later));
-        assert_eq!(gate.last_curiosity_had_yield, Some(false));
-    }
-
-    #[test]
     fn skipped_action_consumes_cooldown_but_not_cap() {
         let mut gate = gate("3-6");
         let base = Instant::now();

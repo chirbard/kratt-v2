@@ -57,9 +57,8 @@ pub(crate) use retrieval::{
     save_interest_embedding, top_interests, top_interests_with,
 };
 pub use retrieval::{
-    OpenCuriosityNoteRow, SemanticEdgeRow, count_new_embedding_neighbours, edge_count,
-    load_all_edges_semantic, load_edge_actor_views, load_loops_by_similarity,
-    load_loops_for_anchors, load_open_curiosity_notes, load_recent_attention_counts,
+    SemanticEdgeRow, edge_count, load_all_edges_semantic, load_edge_actor_views,
+    load_loops_by_similarity, load_loops_for_anchors, load_recent_attention_counts,
     load_unembedded_edges, parse_vector32_json, query_edges_by_vector, save_edge_embedding,
     vector32_json,
 };
@@ -70,9 +69,8 @@ pub(crate) use sessions::{
     conversation_boundary_async, latest_assistant_message_timestamp_async, register_news_session,
 };
 pub use sessions::{
-    insert_message, latest_session_id, read_message_context, register_dream_session,
-    register_exploration_session, register_ingestion_session, register_session,
-    search_messages_fts, source_session_id,
+    insert_message, read_message_context, register_dream_session, register_ingestion_session,
+    register_session, search_messages_fts, source_session_id,
 };
 pub use task_store::{
     count_task_chain, ensure_task_hub, load_game_edges, load_game_hubs, load_game_nodes,
