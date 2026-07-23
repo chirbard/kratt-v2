@@ -8,10 +8,8 @@ use crate::api::EmbeddingClient;
 use crate::runlog;
 use crate::timeutil;
 
-use super::MemoryEvent;
 use super::db;
 use super::graph::{Edge, Node, closure_nodes, closure_nodes_uncapped};
-use super::ledger;
 use super::toon_display::{self, Table};
 
 type ClosureFn = fn(&[(String, String)], &HashMap<String, Node>) -> Vec<(String, Node)>;
@@ -75,7 +73,6 @@ pub fn embed_text(
 
 pub fn run_embed_pass(
     embed: Arc<dyn EmbeddingClient>,
-    sender: &std::sync::mpsc::Sender<MemoryEvent>,
 ) {
     let _timer = runlog::time_step("embed", "pass");
     let embedded = {
@@ -87,20 +84,20 @@ pub fn run_embed_pass(
             let end = (start + EMBED_BATCH).min(pending.len());
             match embed_batch(&*embed, &pending[start..end]) {
                 Ok(count) => embedded += count,
-                Err(err) => send_log(sender, "embed", format!("batch failed — {err}")),
+                Err(err) => runlog::log("embed", &format!("batch failed — {err}")),
             }
             start = end;
         }
         match embed_interest_batch(&*embed, &db::load_unembedded_interests()) {
             Ok(count) => embedded += count,
-            Err(err) => send_log(sender, "embed", format!("interest batch failed — {err}")),
+            Err(err) => runlog::log("embed", &format!("interest batch failed — {err}")),
         }
         embedded
     };
     if embedded > 0 {
         db::sync_push_best_effort("embed");
     }
-    send_log(sender, "embed", format!("{embedded} edges embedded"));
+    runlog::log("embed", &format!("{embedded} edges embedded"));
 }
 
 fn embed_interest_batch(
@@ -556,7 +553,30 @@ fn similarity_term(query_vector: &[f64], edge_embedding: Option<&[f64]>) -> f64 
     if embedding.len() != query_vector.len() {
         return 0.0;
     }
-    ledger::cosine_similarity(query_vector, embedding).unwrap_or(0.0)
+    cosine_similarity(query_vector, embedding).unwrap_or(0.0)
+}
+
+fn cosine_similarity(
+    left: &[f64],
+    right: &[f64],
+) -> Result<f64, Box<dyn Error + Send + Sync>> {
+    if left.len() != right.len() {
+        return Err("vector dimensions differ".into());
+    }
+    let mut dot = 0.0;
+    let mut left_norm = 0.0;
+    let mut right_norm = 0.0;
+    let mut index = 0usize;
+    while index < left.len() {
+        dot += left[index] * right[index];
+        left_norm += left[index] * left[index];
+        right_norm += right[index] * right[index];
+        index += 1;
+    }
+    if left_norm <= 0.0 || right_norm <= 0.0 {
+        return Ok(0.0);
+    }
+    Ok(dot / (left_norm.sqrt() * right_norm.sqrt()))
 }
 
 fn recency_term(date: &str) -> f64 {
@@ -643,11 +663,6 @@ fn rows_to_semantic_edges(rows: Vec<db::SemanticEdgeRow>) -> Vec<SemanticEdge> {
         });
     }
     edges
-}
-
-fn send_log(sender: &std::sync::mpsc::Sender<MemoryEvent>, phase: &'static str, text: String) {
-    runlog::log(phase, &text);
-    let _ = sender.send(MemoryEvent::Log { phase, text });
 }
 
 #[cfg(test)]

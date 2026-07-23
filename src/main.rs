@@ -1,6 +1,5 @@
 #![deny(clippy::disallowed_methods)]
-// Strip A leaves the lower layers compiled but intentionally unreachable until
-// Strip B removes or reconnects them for the eval harness.
+// The eval harness will reconnect these primitives after the slim-down.
 #![allow(dead_code, unused_imports)]
 #![warn(
     clippy::unwrap_used,
@@ -16,13 +15,9 @@
 mod api;
 mod memory;
 mod paths;
-mod prompts;
 mod runlog;
-mod session;
 mod timeutil;
 mod trace;
-mod turn;
-mod web;
 
 type MainResult<Output> = Result<Output, Box<dyn std::error::Error>>;
 

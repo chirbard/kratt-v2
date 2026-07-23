@@ -8,7 +8,6 @@ use super::{
     add_interest_node_columns, open_connection, optional_text, parse_edge_row, real, text,
 };
 use crate::memory::graph::normalize_id;
-use crate::memory::loops::OpenLoop;
 
 #[cfg(test)]
 #[path = "retrieval_tests.rs"]
@@ -404,39 +403,6 @@ async fn query_edges_by_vector_async(
     }
 }
 
-// Live loops nearest to the query embedding — the similarity trigger for the
-// Open loops block. Loops are excluded from ranked TOP_K, so without this a
-// loop whose fresh anchor has no other edges could never surface contextually.
-pub fn load_loops_by_similarity(
-    conn: &Connection,
-    query_vec: &[f64],
-    max_distance: f64,
-    cap: usize,
-) -> Result<Vec<OpenLoop>, Box<dyn Error + Send + Sync>> {
-    runtime().block_on(load_loops_by_similarity_async(
-        conn,
-        query_vec,
-        max_distance,
-        cap,
-    ))
-}
-
-async fn load_loops_by_similarity_async(
-    conn: &Connection,
-    query_vec: &[f64],
-    max_distance: f64,
-    cap: usize,
-) -> Result<Vec<OpenLoop>, Box<dyn Error + Send + Sync>> {
-    let json_str = vector32_json(query_vec)?;
-    let query = format!(
-        "{OPEN_LOOP_SELECT} WHERE n.node_type = 'loop' AND e.memory_type = 'semantic' AND e.content LIKE 'open loop:%' AND e.expired_at IS NULL AND e.embedding IS NOT NULL AND vector_distance_cos(e.embedding, vector32(?1)) <= ?2 ORDER BY vector_distance_cos(e.embedding, vector32(?1)) ASC LIMIT ?3"
-    );
-    let rows = conn
-        .query(&query, params![json_str, max_distance, cap as i64])
-        .await?;
-    collect_open_loops(rows).await
-}
-
 async fn query_edges_ann(
     conn: &Connection,
     json_str: &str,
@@ -781,18 +747,6 @@ pub(crate) async fn load_open_curiosity_notes_async(
     Ok(notes)
 }
 
-pub(crate) async fn load_open_intentions_async(
-    conn: &Connection,
-    today: &str,
-    limit: usize,
-) -> Result<Vec<OpenLoop>, Box<dyn Error + Send + Sync>> {
-    let query = format!(
-        "{OPEN_LOOP_SELECT} WHERE n.node_type = 'loop' AND e.memory_type = 'semantic' AND e.content LIKE 'open loop:%' AND e.expired_at IS NULL ORDER BY (n.date != '' AND n.date <= ?1) DESC, e.date DESC, e.rowid DESC LIMIT ?2"
-    );
-    let rows = conn.query(&query, params![today, limit as i64]).await?;
-    collect_open_loops(rows).await
-}
-
 pub(crate) async fn load_recent_learning_async(
     conn: &Connection,
     since_days: usize,
@@ -862,74 +816,6 @@ pub(crate) async fn load_inbox_snapshot_async(
 // is the last thing said before the user stepped away, so a catch-up window
 // from it spans whatever the background passes did overnight. None = no gap in
 // the scanned window (continuously active, or first-ever chat).
-
-const OPEN_LOOP_SELECT: &str = "SELECT e.source, e.target, n.body, n.date FROM nodes n JOIN edges e ON e.source = n.id JOIN nodes anchor ON anchor.id = e.target";
-
-pub fn load_loops_for_anchors(
-    conn: &Connection,
-    anchor_ids: &[String],
-    today: &str,
-    cap: usize,
-) -> Result<Vec<OpenLoop>, Box<dyn Error + Send + Sync>> {
-    runtime().block_on(load_loops_for_anchors_async(conn, anchor_ids, today, cap))
-}
-
-async fn load_loops_for_anchors_async(
-    conn: &Connection,
-    anchor_ids: &[String],
-    today: &str,
-    cap: usize,
-) -> Result<Vec<OpenLoop>, Box<dyn Error + Send + Sync>> {
-    let (query, values) = loop_anchor_query(anchor_ids, today, cap);
-    let rows = conn.query(&query, turso::params_from_iter(values)).await?;
-    collect_open_loops(rows).await
-}
-
-fn loop_anchor_query(anchor_ids: &[String], today: &str, cap: usize) -> (String, Vec<Value>) {
-    let mut values = vec![Value::Text(today.to_string())];
-    let mut placeholders = Vec::new();
-    for anchor_id in anchor_ids {
-        values.push(Value::Text(anchor_id.clone()));
-        placeholders.push(format!("?{}", values.len()));
-    }
-    let anchor_filter = if placeholders.is_empty() {
-        String::new()
-    } else {
-        format!(" OR e.target IN ({})", placeholders.join(", "))
-    };
-    values.push(Value::Integer(cap as i64));
-    let limit_param = values.len();
-    let query = format!(
-        "{OPEN_LOOP_SELECT} WHERE n.node_type = 'loop' AND e.memory_type = 'semantic' AND e.content LIKE 'open loop:%' AND e.expired_at IS NULL AND ((n.date != '' AND n.date <= ?1){anchor_filter}) ORDER BY e.date ASC, e.rowid ASC LIMIT ?{limit_param}"
-    );
-    (query, values)
-}
-
-pub(crate) async fn load_due_loops_async(
-    conn: &Connection,
-    today: &str,
-) -> Result<Vec<OpenLoop>, Box<dyn Error + Send + Sync>> {
-    let query = format!(
-        "{OPEN_LOOP_SELECT} WHERE n.node_type = 'loop' AND n.date != '' AND n.date <= ?1 AND e.memory_type = 'semantic' AND e.content LIKE 'open loop:%' AND e.expired_at IS NULL ORDER BY n.date ASC, e.rowid ASC"
-    );
-    let rows = conn.query(&query, params![today]).await?;
-    collect_open_loops(rows).await
-}
-
-async fn collect_open_loops(
-    mut rows: turso::Rows,
-) -> Result<Vec<OpenLoop>, Box<dyn Error + Send + Sync>> {
-    let mut loops = Vec::new();
-    while let Some(row) = rows.next().await? {
-        loops.push(OpenLoop {
-            source: normalize_id(&text(row.get_value(0)?)),
-            target: normalize_id(&text(row.get_value(1)?)),
-            intention: text(row.get_value(2)?),
-            due: text(row.get_value(3)?),
-        });
-    }
-    Ok(loops)
-}
 
 fn parse_optional_vector32(value: Option<Value>) -> Option<Vec<f64>> {
     let json_text = optional_text(value)?;

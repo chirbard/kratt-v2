@@ -57,7 +57,7 @@
     #[test]
     fn injected_context_renders_learned_and_occurred_dates() {
         let mut edge = test_edge("semantic", "");
-        edge.date = crate::prompts::today_iso();
+        edge.date = crate::timeutil::today_iso();
         edge.occurred_at = Some("2022".to_string());
         let toon = edges_to_toon(&[edge]);
         assert!(toon.contains("date"));

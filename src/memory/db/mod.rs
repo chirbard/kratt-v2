@@ -1,5 +1,4 @@
 mod core;
-mod decay_store;
 mod findings;
 mod graph_store;
 #[allow(dead_code)]
@@ -20,7 +19,6 @@ pub use core::{
     last_sync_error, open_connection, startup_database, sync_now, sync_push_best_effort,
     timestamp_now,
 };
-pub use decay_store::{DecayChange, load_last_decay, persist_decay};
 pub(crate) use findings::{
     Finding, PingPolicy, count_findings_in_windows, divert_ping_topic, load_ping_policy,
     mark_finding_surfaced, resume_pings, set_ping_mute, unsurfaced_findings,
@@ -47,18 +45,17 @@ pub(crate) use pass_runs::{
     consecutive_failures_async, last_successful_pass_async, pass_runs_in_window_async,
 };
 use retrieval::delete_edge_actor_views_async;
-pub(crate) use retrieval::load_due_loops_async;
 pub(crate) use retrieval::{
     Interest, RecentLearning, RegionTransition, insert_interest, last_suggestion_for_session,
-    load_inbox_snapshot_async, load_open_curiosity_notes_async, load_open_intentions_async,
+    load_inbox_snapshot_async, load_open_curiosity_notes_async,
     load_previous_turn_region, load_recent_learning_async, load_region_transitions, load_turn_region,
     load_unembedded_interests, save_interest_embedding, top_interests,
 };
 #[cfg(test)]
 pub(crate) use retrieval::top_interests_with;
 pub use retrieval::{
-    SemanticEdgeRow, edge_count, load_all_edges_semantic, load_loops_by_similarity,
-    load_loops_for_anchors, load_unembedded_edges, parse_vector32_json, query_edges_by_vector,
+    SemanticEdgeRow, edge_count, load_all_edges_semantic, load_unembedded_edges,
+    parse_vector32_json, query_edges_by_vector,
     save_edge_embedding, vector32_json,
 };
 #[cfg(test)]
