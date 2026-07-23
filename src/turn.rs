@@ -76,14 +76,10 @@ pub(crate) fn prepare_stream_context(
         crate::runlog::log("chat", &format!("sequence: {line}"));
     }
     let memory = build_memory_block(ctx.embed, ctx.prompt, &session_id, ctx.turn_id);
-    let pressure = memory::pressure_line();
-    if let Some(line) = &pressure {
-        crate::runlog::log("chat", &format!("pressure: {line}"));
-    }
     let system = prompts::build_chat_system_prompt(
         &memory.block,
         &recent_entries,
-        pressure.as_deref(),
+        None,
         sequence.as_deref(),
         ctx.style_hint,
     );

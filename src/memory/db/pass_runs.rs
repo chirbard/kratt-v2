@@ -2,7 +2,7 @@ use std::error::Error;
 
 use turso::{Connection, params};
 
-use super::{acquire_write_lock, block_on, int, open_connection, real, text, timestamp_now};
+use super::{int, real, text};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PassRun {
@@ -15,101 +15,11 @@ pub struct PassRun {
     pub items_added: usize,
 }
 
-pub fn start_pass_run(pass_type: &str) -> Result<i64, Box<dyn Error + Send + Sync>> {
-    validate_pass_type(pass_type)?;
-    let _write_guard = acquire_write_lock();
-    let conn = open_connection()?;
-    block_on(start_pass_run_async(&conn, pass_type))
-}
-
-pub fn finish_pass_run(
-    run_id: i64,
-    outcome: &str,
-    reason_class: &str,
-    items_added: usize,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    validate_pass_outcome(outcome)?;
-    validate_reason_class(reason_class)?;
-    let _write_guard = acquire_write_lock();
-    let conn = open_connection()?;
-    block_on(finish_pass_run_async(
-        &conn,
-        run_id,
-        outcome,
-        reason_class,
-        items_added,
-    ))
-}
-
 fn validate_pass_type(pass_type: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
     if matches!(pass_type, "dream" | "exploration" | "news" | "ingestion") {
         return Ok(());
     }
     Err(format!("invalid pass type: {pass_type}").into())
-}
-
-fn validate_pass_outcome(outcome: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-    if matches!(outcome, "ok" | "failed" | "skipped") {
-        return Ok(());
-    }
-    Err(format!("invalid pass outcome: {outcome}").into())
-}
-
-fn validate_reason_class(reason_class: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
-    if matches!(
-        reason_class,
-        "none"
-            | "context_length"
-            | "provider_error"
-            | "database_error"
-            | "no_material"
-            | "not_eligible"
-            | "unavailable"
-            | "interrupted"
-    ) {
-        return Ok(());
-    }
-    Err(format!("invalid pass reason class: {reason_class}").into())
-}
-
-pub(crate) async fn start_pass_run_async(
-    conn: &Connection,
-    pass_type: &str,
-) -> Result<i64, Box<dyn Error + Send + Sync>> {
-    validate_pass_type(pass_type)?;
-    conn.execute(
-        "INSERT INTO pass_runs (pass_type, started_at) VALUES (?1, ?2)",
-        params![pass_type, timestamp_now()],
-    )
-    .await?;
-    let mut rows = conn.query("SELECT last_insert_rowid()", ()).await?;
-    let Some(row) = rows.next().await? else {
-        return Err("pass run insert did not return an id".into());
-    };
-    Ok(int(row.get_value(0)?))
-}
-
-pub(crate) async fn finish_pass_run_async(
-    conn: &Connection,
-    run_id: i64,
-    outcome: &str,
-    reason_class: &str,
-    items_added: usize,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    validate_pass_outcome(outcome)?;
-    validate_reason_class(reason_class)?;
-    conn.execute(
-        "UPDATE pass_runs SET finished_at = ?1, outcome = ?2, reason_class = ?3, items_added = ?4 WHERE id = ?5",
-        params![
-            timestamp_now(),
-            outcome,
-            reason_class,
-            items_added as i64,
-            run_id
-        ],
-    )
-    .await?;
-    Ok(())
 }
 
 pub(crate) async fn pass_runs_in_window_async(

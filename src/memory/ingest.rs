@@ -72,21 +72,7 @@ pub fn run_ingestion_pass(
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
     let trace_context = crate::trace::TraceContext::new("ingest");
     let llm = crate::trace::TracingClient::wrap(llm, trace_context);
-    let result = execute_ingestion_pass(llm, embed, search, (&path, ""), &sender);
-    db::sync_push_best_effort("ingest");
-    result
-}
-
-pub fn run_focused_ingestion_pass(
-    llm: Arc<dyn LlmClient>,
-    embed: Arc<dyn EmbeddingClient>,
-    search: Option<Arc<dyn SearchClient>>,
-    request: (&Path, &str),
-    sender: Sender<IngestEvent>,
-) -> Result<String, Box<dyn Error + Send + Sync>> {
-    let trace_context = crate::trace::TraceContext::new("ingest");
-    let llm = crate::trace::TracingClient::wrap(llm, trace_context);
-    let result = execute_ingestion_pass(llm, embed, search, request, &sender);
+    let result = execute_ingestion_pass(llm, embed, search, &path, &sender);
     db::sync_push_best_effort("ingest");
     result
 }
@@ -96,11 +82,10 @@ fn execute_ingestion_pass(
     llm: Arc<dyn LlmClient>,
     embed: Arc<dyn EmbeddingClient>,
     search: Option<Arc<dyn SearchClient>>,
-    request: (&Path, &str),
+    path: &Path,
     sender: &Sender<IngestEvent>,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
     let _timer = runlog::time_step("ingest", "pass");
-    let (path, focus) = request;
     validate_ingest_path(path)?;
     let _write_guard = db::acquire_write_lock();
     let conn = db::open_connection()?;
@@ -120,7 +105,7 @@ fn execute_ingestion_pass(
         "ingest",
         format!("chunked {} into {} chunks", doc_path, chunks.len()),
     );
-    let summaries = skim_chunks(&*llm, &chunks, focus, sender)?;
+    let summaries = skim_chunks(&*llm, &chunks, sender)?;
     let document_map = build_document_map(&summaries);
     send_log(sender, "ingest", "skim map built".to_string());
     let full_mask = choose_full_chunks(&*llm, &summaries);
@@ -752,7 +737,6 @@ fn stream_turn_noop_chunks(
 fn skim_chunks(
     llm: &dyn LlmClient,
     chunks: &[String],
-    focus: &str,
     sender: &Sender<IngestEvent>,
 ) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
     let mut summaries = Vec::new();
@@ -763,19 +747,14 @@ fn skim_chunks(
             "ingest",
             format!("skim {}/{}", index + 1, chunks.len()),
         );
-        summaries.push(skim_chunk(llm, chunk, focus)?);
+        summaries.push(skim_chunk(llm, chunk)?);
     }
     Ok(summaries)
 }
 
-fn skim_chunk(llm: &dyn LlmClient, chunk: &str, focus: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
-    let focus_line = if focus.is_empty() {
-        String::new()
-    } else {
-        format!("\nThe reader asked to focus on: {focus}")
-    };
+fn skim_chunk(llm: &dyn LlmClient, chunk: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
     let prompt = format!(
-        "Summarize this document chunk in 1-2 sentences. Be concrete and terse.{focus_line}\n\n{chunk}"
+        "Summarize this document chunk in 1-2 sentences. Be concrete and terse.\n\n{chunk}"
     );
     Ok(llm.collect(&prompt)?.trim().to_string())
 }

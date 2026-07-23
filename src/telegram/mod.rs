@@ -1,5 +1,4 @@
 mod bot;
-mod night;
 mod ping;
 mod render;
 mod report;
@@ -69,13 +68,6 @@ pub fn run(
         Ok(transport) => transport,
         Err(err) => return Err(err.to_string().into()),
     };
-    // Night maintenance and the daily report run on the heavy seat
-    // (MEMORY_MODEL); only the live memory pass consults the split seats.
-    let mut night = night::NightCycle::from_env(
-        Arc::clone(&seats.heavy),
-        Arc::clone(&embed),
-        search.clone(),
-    )?;
     let mut report = report::ReportCycle::from_env(
         Arc::clone(&seats.heavy),
         config.allowed_user_id,
@@ -94,7 +86,7 @@ pub fn run(
         ping: &mut ping,
         shutdown: &shutdown,
     };
-    gateway.poll_loop(&mut ctx, &mut night);
+    gateway.poll_loop(&mut ctx);
     memory::sync_push_best_effort("telegram exit");
     runlog::log("tg", "gateway stopped");
     Ok(())
@@ -170,9 +162,7 @@ struct Gateway {
 }
 
 // The per-poll references threaded down the dispatch chain, bundled so the
-// chain stays under the argument cap. The night cycle is not in here: it is
-// used only at the top of the loop, and keeping it out lets the tests drive
-// poll_once without constructing one.
+// chain stays under the argument cap.
 struct PollCtx<'scope> {
     transport: &'scope dyn BotTransport,
     handler: &'scope mut dyn TurnHandler,
@@ -191,24 +181,16 @@ impl Gateway {
         }
     }
 
-    fn poll_loop(&mut self, ctx: &mut PollCtx, night: &mut night::NightCycle) {
+    fn poll_loop(&mut self, ctx: &mut PollCtx) {
         while !ctx.shutdown.load(Ordering::Relaxed) {
-            // The idle path (no updates) is where the night cycle and the daily
-            // report run: a poll that returned messages spent this cycle
-            // answering them — and changed state, so the night cycle must
-            // re-evaluate next chance.
             if self.poll_once(ctx) {
-                night.maybe_run(ctx.shutdown);
                 ctx.ping.maybe_send(ctx.transport);
                 ctx.report.maybe_send(ctx.transport);
-            } else {
-                night.mark_dirty();
             }
         }
     }
 
-    // Returns true when the poll was idle (no updates delivered) — the signal
-    // the night cycle gates on.
+    // Returns true when the poll was idle (no updates delivered).
     fn poll_once(&mut self, ctx: &mut PollCtx) -> bool {
         match ctx.transport.get_updates(self.offset) {
             Ok(value) => self.handle_batch(ctx, &value),

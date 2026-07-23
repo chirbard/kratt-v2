@@ -55,15 +55,9 @@ fn handle_normal_key(key: KeyEvent, app: &mut App) -> bool {
         KeyCode::Char('a') => app.show_attribution = !app.show_attribution,
         KeyCode::Char('P') if maintenance_allowed(app) => app::start_recompute_positions(app),
         KeyCode::Char('S') if maintenance_allowed(app) => app::start_sync(app),
-        KeyCode::Char('A') => toggle_autonomous_mode(app),
         _ => {}
     }
     false
-}
-
-fn toggle_autonomous_mode(app: &mut App) {
-    app::toggle_autonomous_mode(app);
-    app::reset_scheduler_idle(app);
 }
 
 // Background maintenance actions are mutually exclusive with ingestion and

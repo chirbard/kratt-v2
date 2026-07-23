@@ -1,6 +1,5 @@
     use super::{
-        consecutive_failures_async, finish_pass_run_async, last_successful_pass_async,
-        pass_runs_in_window_async, start_pass_run_async,
+        consecutive_failures_async, last_successful_pass_async, pass_runs_in_window_async,
     };
     use crate::memory::db::block_on;
     use turso::{Builder, Connection};
@@ -21,19 +20,15 @@
     #[test]
     fn pass_run_records_failure_reason_and_items() {
         let conn = block_on(pass_run_harness());
-        let Ok(run_id) = block_on(start_pass_run_async(&conn, "dream")) else {
-            unreachable!("pass starts")
-        };
-        assert!(
-            block_on(finish_pass_run_async(
-                &conn,
-                run_id,
-                "failed",
-                "context_length",
-                0,
-            ))
-            .is_ok()
-        );
+        block_on(async {
+            let _ = conn
+                .execute(
+                    "INSERT INTO pass_runs (pass_type, started_at, finished_at, outcome, reason_class)
+                     VALUES ('dream', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'failed', 'context_length')",
+                    (),
+                )
+                .await;
+        });
         let runs = block_on(pass_runs_in_window_async(&conn, "dream", "", "z")).unwrap_or_default();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].outcome, "failed");
@@ -59,10 +54,15 @@
         );
         let last = block_on(last_successful_pass_async(&conn, "dream")).unwrap_or_default();
         assert!(last.is_some());
-        let Ok(run_id) = block_on(start_pass_run_async(&conn, "dream")) else {
-            unreachable!("success starts")
-        };
-        assert!(block_on(finish_pass_run_async(&conn, run_id, "ok", "none", 4)).is_ok());
+        block_on(async {
+            let _ = conn
+                .execute(
+                    "INSERT INTO pass_runs (pass_type, started_at, finished_at, outcome, reason_class, items_added)
+                     VALUES ('dream', strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+1 second'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+1 second'), 'ok', 'none', 4)",
+                    (),
+                )
+                .await;
+        });
         assert_eq!(
             block_on(consecutive_failures_async(&conn, "dream")).unwrap_or_default(),
             0

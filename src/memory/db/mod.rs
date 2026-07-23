@@ -2,6 +2,7 @@ mod core;
 mod decay_store;
 mod findings;
 mod graph_store;
+#[allow(dead_code)]
 mod inbox;
 mod migrations;
 mod pass_runs;
@@ -34,15 +35,14 @@ use graph_store::{clamped_confidence, node_count};
 pub(crate) use graph_store::{
     ensure_entity_endpoints, parse_edge_row, touch_edge_dates, update_edge_reinforcement,
 };
-pub use inbox::{
-    InboxItem, count_queued_inbox, inbox_source_is_queued, insert_inbox_item, load_inbox_outcomes,
-    load_queued_inbox_names, oldest_queued_inbox, resolve_inbox_item,
-};
+pub use inbox::{inbox_source_is_queued, insert_inbox_item, load_inbox_outcomes};
+#[cfg(test)]
+pub(crate) use inbox::{count_queued_inbox, oldest_queued_inbox, resolve_inbox_item};
 use migrations::{
     add_edge_columns, add_interest_node_columns, backfill_edge_epistemics, clamp_stability_once,
     drop_node_agent_views_table, migrate_entity_bodies_matching_ids, migrate_legacy_if_empty,
 };
-pub use pass_runs::{PassRun, finish_pass_run, start_pass_run};
+pub use pass_runs::PassRun;
 pub(crate) use pass_runs::{
     consecutive_failures_async, last_successful_pass_async, pass_runs_in_window_async,
 };
