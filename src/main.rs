@@ -15,7 +15,6 @@ mod memory;
 mod paths;
 mod prompts;
 mod runlog;
-mod seat_replay;
 mod session;
 mod telegram;
 mod timeutil;
@@ -90,9 +89,6 @@ fn run_application() -> MainResult<()> {
     // scribe default to it unless CLASSIFIER_MODEL/SCRIBE_MODEL override them
     // (which may be an "ollama:" local model). Unset → all three identical.
     let seats = build_memory_seats(&api_key, &memory_model, Arc::clone(&embed));
-    if seat_replay_mode() {
-        return seat_replay::run(&seats);
-    }
     let search: Option<Arc<dyn web::SearchClient>> = if tavily_key.is_empty() {
         None
     } else {
@@ -126,15 +122,6 @@ fn initialize_database() -> Result<(), Box<dyn std::error::Error>> {
 fn telegram_mode() -> bool {
     for arg in std::env::args() {
         if arg == "--telegram" {
-            return true;
-        }
-    }
-    false
-}
-
-fn seat_replay_mode() -> bool {
-    for arg in std::env::args() {
-        if arg == "--seat-replay" {
             return true;
         }
     }

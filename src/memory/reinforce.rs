@@ -24,19 +24,9 @@ struct EdgeDelta {
     norm_factor: f64,
 }
 
-pub fn record_outcome(
-    session_id: &str,
-    outcome_score: f64,
-    payload: &str,
-) -> Result<String, Box<dyn Error + Send + Sync>> {
-    apply_outcome(session_id, "", outcome_score, payload)
-}
-
 // In-transaction outcome: reinforce the session's active edges inside a
 // transaction the caller already opened (the scribe pass at game end). The
-// public record_outcome acquires the write lock and begins its own
-// transaction — calling it from inside the scribe pass would deadlock and
-// nest transactions, so game-end outcomes route through here instead.
+// caller's transaction keeps game-end scoring atomic with the memory pass.
 pub(super) fn record_outcome_in_tx(
     conn: &Connection,
     session_id: &str,
@@ -66,34 +56,6 @@ pub(super) fn record_turn_outcome_in_tx(
         outcome_score.clamp(-1.0, 1.0),
         payload,
     )
-}
-
-fn apply_outcome(
-    session_id: &str,
-    turn_id: &str,
-    outcome_score: f64,
-    payload: &str,
-) -> Result<String, Box<dyn Error + Send + Sync>> {
-    let clamped_score = outcome_score.clamp(-1.0, 1.0);
-    let result = {
-        let _write_guard = db::acquire_write_lock();
-        let conn = db::open_connection()?;
-        db::begin_transaction(&conn)?;
-        match run_reinforcement(&conn, session_id, turn_id, clamped_score, payload) {
-            Ok(summary) => {
-                db::commit_transaction(&conn)?;
-                Ok(summary)
-            }
-            Err(err) => {
-                let _ = db::block_on(async { conn.execute("ROLLBACK", ()).await });
-                Err(err)
-            }
-        }
-    };
-    let summary = result?;
-    db::sync_push_best_effort("reinforce");
-    crate::runlog::log("reinforce", &summary);
-    Ok(summary)
 }
 
 fn run_reinforcement(

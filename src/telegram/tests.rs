@@ -1,7 +1,7 @@
     use super::bot::BotTransport;
     use super::{
         CompletedTurn, DaySession, Gateway, MemoryPassRunner, PendingMemoryPass, PollCtx,
-        TurnHandler, ping, report,
+        TurnHandler, ping,
     };
     use crate::api::{Chunk, EmbeddingClient, LlmClient, TurnOutcome};
     use crate::memory::MemorySeats;
@@ -12,22 +12,22 @@
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    // The gateway poll tests never trigger a report or verdict, so the LLM is
-    // never called — this stub only exists to construct a ReportCycle.
     struct StubLlm;
 
     impl LlmClient for StubLlm {
         fn collect(&self, _prompt: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
-            unreachable!("poll tests never call the LLM")
+            unreachable!("gateway tests never collect")
         }
+
         fn stream(&self, _prompt: String, _system: Option<String>, _sender: Sender<Chunk>) {}
+
         fn stream_turn(
             &self,
             _messages: &[serde_json::Value],
             _tools: Option<&serde_json::Value>,
             _sender: &Sender<Chunk>,
         ) -> Result<TurnOutcome, Box<dyn Error + Send + Sync>> {
-            unreachable!("poll tests never call the LLM")
+            unreachable!("gateway tests never stream")
         }
     }
 
@@ -39,24 +39,18 @@
         }
     }
 
-    fn fake_report() -> report::ReportCycle {
-        report::ReportCycle::for_test(Arc::new(StubLlm), 42)
-    }
-
     // Drives one poll, scoping the PollCtx borrows so the tests can assert on
     // the handler and transport afterwards.
     fn poll(
         gateway: &mut Gateway,
         transport: &dyn BotTransport,
         handler: &mut dyn TurnHandler,
-        report: &mut report::ReportCycle,
         stop: &AtomicBool,
     ) -> bool {
         let mut ping = ping::PingCycle::new(42);
         let mut ctx = PollCtx {
             transport,
             handler,
-            report,
             ping: &mut ping,
             shutdown: stop,
         };
@@ -301,9 +295,8 @@
         let transport = ScriptedTransport::new(vec![Ok(update_batch(1, 999, "hi"))]);
         let mut handler = fake_handler("answer");
         let stop = AtomicBool::new(false);
-        let mut report = fake_report();
         let mut gateway = fast_gateway(42);
-        poll(&mut gateway, &transport, &mut handler, &mut report, &stop);
+        poll(&mut gateway, &transport, &mut handler, &stop);
         assert!(handler.seen.is_empty(), "handler never ran");
         assert_eq!(transport.sent_count(), 0, "nothing sent");
     }
@@ -313,9 +306,8 @@
         let transport = ScriptedTransport::new(vec![Ok(update_batch(1, 42, "hi"))]);
         let mut handler = fake_handler("answer");
         let stop = AtomicBool::new(false);
-        let mut report = fake_report();
         let mut gateway = fast_gateway(42);
-        poll(&mut gateway, &transport, &mut handler, &mut report, &stop);
+        poll(&mut gateway, &transport, &mut handler, &stop);
         assert_eq!(handler.seen, vec!["hi".to_string()]);
         assert_eq!(transport.sent_count(), 1);
     }
@@ -330,9 +322,8 @@
         let transport = ScriptedTransport::new(vec![Ok(batch)]);
         let mut handler = fake_handler("answer");
         let stop = AtomicBool::new(false);
-        let mut report = fake_report();
         let mut gateway = fast_gateway(42);
-        poll(&mut gateway, &transport, &mut handler, &mut report, &stop);
+        poll(&mut gateway, &transport, &mut handler, &stop);
         assert!(handler.seen.is_empty());
         assert_eq!(gateway.offset, 9);
     }
@@ -345,11 +336,10 @@
         ]);
         let mut handler = fake_handler("answer");
         let stop = AtomicBool::new(false);
-        let mut report = fake_report();
         let mut gateway = fast_gateway(42);
         // First poll errors (and sleeps zero), second delivers the update.
-        poll(&mut gateway, &transport, &mut handler, &mut report, &stop);
-        poll(&mut gateway, &transport, &mut handler, &mut report, &stop);
+        poll(&mut gateway, &transport, &mut handler, &stop);
+        poll(&mut gateway, &transport, &mut handler, &stop);
         assert_eq!(handler.seen, vec!["after error".to_string()]);
     }
 
@@ -364,10 +354,9 @@
             events: Some(Arc::clone(&events)),
         };
         let stop = AtomicBool::new(false);
-        let mut report = fake_report();
         let mut gateway = recording_gateway(Arc::clone(&events), false);
 
-        poll(&mut gateway, &transport, &mut handler, &mut report, &stop);
+        poll(&mut gateway, &transport, &mut handler, &stop);
 
         let recorded = recorded_events(&events);
         assert_eq!(
@@ -392,10 +381,9 @@
             ScriptedTransport::recording(vec![Ok(update_batch(1, 42, "hi"))], Arc::clone(&events));
         let mut handler = fake_handler("answer");
         let stop = AtomicBool::new(false);
-        let mut report = fake_report();
         let mut gateway = recording_gateway(Arc::clone(&events), true);
 
-        poll(&mut gateway, &transport, &mut handler, &mut report, &stop);
+        poll(&mut gateway, &transport, &mut handler, &stop);
 
         assert_eq!(transport.sent_texts().len(), 1);
         assert!(transport.sent_texts()[0].contains("answer"));
@@ -407,10 +395,9 @@
         let transport = ScriptedTransport::new(vec![Ok(update_batch(1, 42, "hi"))]);
         let mut handler = FailingHandler;
         let stop = AtomicBool::new(false);
-        let mut report = fake_report();
         let mut gateway = fast_gateway(42);
 
-        poll(&mut gateway, &transport, &mut handler, &mut report, &stop);
+        poll(&mut gateway, &transport, &mut handler, &stop);
 
         assert_eq!(transport.sent_texts(), vec![super::BROKEN_TURN_REPLY]);
     }

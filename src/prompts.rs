@@ -429,27 +429,6 @@ pub fn build_ingestion_prompt(
     prompt
 }
 
-pub const DAILY_REPORT: &str = r#"You are a learning agent writing a short morning note to the person steering your curiosity. Below is a deterministic digest of what you worked with yesterday and consolidated overnight. The reader will score the day from your note, so it must let them judge — a scattered list of topics does not.
-
-Write a first-person report, at most 200 words, plain text (no markdown headers, no lists of raw ids):
-1. The day as at most THREE threads, one or two sentences each, drawn only from the Thread lines (each is one conversation turn's new edges). If the Conversation line says there was no conversation, say so plainly and do not substitute held findings, autonomy, or other material. Name each real thread's subject in plain words and what came of it. Ignore minor one-off topics entirely — do not hop.
-2. One sentence on the night, using the Dream outcome exactly. Report a failed or skipped pass as failed or skipped in one sentence — never infer that work happened from counts, and never describe a failed pass's content. Include the consecutive-failure count when it is greater than one. For a successful dream, say what it consolidated, gists first if any.
-3. Report each Inbox outcome in one sentence: what you studied and the single most interesting thing it added, or that it failed and why. Never pretend a failed or queued item was studied. When a category (inbox, loops) is empty, omit it entirely — never write "no items" sentences.
-4. Mention Due loops in one sentence when present. If a past-due loop is an expected event, ask whether it happened: "X was expected by YYYY-MM-DD; did it happen?" Never treat the deadline alone as evidence of absence.
-5. Mention Held for you findings briefly when present; these are unread items fetched autonomously and deliberately kept for the digest instead of interrupting the user. Never write "we", "discussed", or otherwise present them as conversation.
-6. Report the Autonomy line honestly when present and omit autonomy entirely when no self-directed passes ran.
-7. One honest self-assessment sentence: whether this looks like a good day of learning and WHY — so the reader can agree or correct. Do not call a day productive when there was no conversation, no successful dream, and no acquired knowledge; say plainly that little happened.
-
-Ground every sentence in the digest — invent nothing beyond it, and do not flatter. If the digest is thin, say so plainly and keep it short."#;
-
-pub fn build_daily_report_prompt(digest_text: &str) -> String {
-    let mut prompt = String::new();
-    prompt.push_str(DAILY_REPORT);
-    prompt.push_str("\n\n## Yesterday's digest\n\n");
-    prompt.push_str(digest_text);
-    prompt
-}
-
 pub fn build_chat_system_prompt(
     memory_block: &str,
     recent_entries: &[RecentEntry],

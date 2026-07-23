@@ -212,15 +212,6 @@
             .await;
     }
 
-    async fn insert_dream_session(conn: &Connection, session_id: &str, created_at: &str) {
-        let _ = conn
-            .execute(
-                "INSERT INTO sessions (id, session_type, created_at) VALUES (?1, 'dream', ?2)",
-                params![session_id, created_at],
-            )
-            .await;
-    }
-
     async fn insert_digest_message(
         conn: &Connection,
         details: (&str, &str, &str, &str),
@@ -256,7 +247,13 @@
         day: &str,
         night: &super::NightWindow,
     ) -> super::DayDigest {
-        let Ok(digest) = db::block_on(super::day_digest_async(conn, day, night, TODAY)) else {
+        let activity = super::NightWindow {
+            from: format!("{day}T"),
+            until: format!("{day}U"),
+        };
+        let Ok(digest) =
+            db::block_on(super::window_digest_async(conn, &activity, night, TODAY))
+        else {
             unreachable!("digest query runs")
         };
         digest
@@ -301,7 +298,6 @@
         assert_eq!(digest.turns, 2);
         assert_eq!(digest.created, 1);
         assert_eq!(digest.updated, 1);
-        assert_eq!(digest.new_edges, vec!["a → b".to_string()]);
     }
 
     #[test]
@@ -331,32 +327,6 @@
         ));
         let digest = digest(&conn, &day);
         assert_eq!(digest.conversation_user_messages, 1);
-        assert!(digest.turn_groups.is_empty());
-    }
-
-    #[test]
-    fn conversation_messages_and_thread_material_remain_separate_facts() {
-        let conn = db::block_on(digest_harness());
-        let day = crate::timeutil::today_iso();
-        let timestamp = format!("{day}T04:00:00");
-        db::block_on(insert_digest_message(
-            &conn,
-            ("user-message", "chat-session", "conversation", "user"),
-            &timestamp,
-        ));
-        db::block_on(insert_event(
-            &conn,
-            &day,
-            "chat-session",
-            "turn-a",
-            "created",
-            "a",
-            "b",
-            "",
-        ));
-        let digest = digest(&conn, &day);
-        assert_eq!(digest.conversation_user_messages, 1);
-        assert_eq!(digest.turn_groups, vec!["a → b".to_string()]);
     }
 
     #[test]
@@ -412,23 +382,6 @@
         };
         let digest = digest_with_night(&conn, YESTERDAY, &night);
         assert_eq!(digest.dream_events, 1);
-    }
-
-    #[test]
-    fn digest_groups_created_edges_by_turn() {
-        let conn = db::block_on(digest_harness());
-        db::block_on(insert_event(
-            &conn, YESTERDAY, "tg-x", "turn-a", "created", "a", "b", "",
-        ));
-        db::block_on(insert_event(
-            &conn, YESTERDAY, "tg-x", "turn-a", "created", "c", "d", "",
-        ));
-        db::block_on(insert_event(
-            &conn, YESTERDAY, "tg-x", "turn-b", "created", "e", "f", "",
-        ));
-        let digest = digest(&conn, YESTERDAY);
-        assert_eq!(digest.turn_groups.len(), 2);
-        assert_eq!(digest.turn_groups[0], "a → b; c → d");
     }
 
     #[test]
@@ -594,28 +547,4 @@
                 "check the service (due 2026-07-11)".to_string(),
             ]
         );
-    }
-
-    fn newest_dream(conn: &Connection) -> Option<String> {
-        let Ok(newest) = db::block_on(super::newest_dream_session_id_async(conn)) else {
-            unreachable!("dream session query runs")
-        };
-        newest
-    }
-
-    #[test]
-    fn newest_dream_session_is_the_most_recent() {
-        let conn = db::block_on(digest_harness());
-        assert!(newest_dream(&conn).is_none());
-        db::block_on(insert_dream_session(
-            &conn,
-            "dream-100",
-            "2026-07-10T04:00:00",
-        ));
-        db::block_on(insert_dream_session(
-            &conn,
-            "dream-200",
-            "2026-07-11T04:00:00",
-        ));
-        assert_eq!(newest_dream(&conn), Some("dream-200".to_string()));
     }

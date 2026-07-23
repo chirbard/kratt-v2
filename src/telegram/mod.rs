@@ -1,7 +1,6 @@
 mod bot;
 mod ping;
 mod render;
-mod report;
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -68,10 +67,6 @@ pub fn run(
         Ok(transport) => transport,
         Err(err) => return Err(err.to_string().into()),
     };
-    let mut report = report::ReportCycle::from_env(
-        Arc::clone(&seats.heavy),
-        config.allowed_user_id,
-    )?;
     let mut ping = ping::PingCycle::new(config.allowed_user_id);
     let mut handler = LiveTurnHandler::new(chat_llm, seats, embed, search);
     let shutdown = install_shutdown_flag();
@@ -82,7 +77,6 @@ pub fn run(
     let mut ctx = PollCtx {
         transport: &transport,
         handler: &mut handler,
-        report: &mut report,
         ping: &mut ping,
         shutdown: &shutdown,
     };
@@ -166,7 +160,6 @@ struct Gateway {
 struct PollCtx<'scope> {
     transport: &'scope dyn BotTransport,
     handler: &'scope mut dyn TurnHandler,
-    report: &'scope mut report::ReportCycle,
     ping: &'scope mut ping::PingCycle,
     shutdown: &'scope AtomicBool,
 }
@@ -185,7 +178,6 @@ impl Gateway {
         while !ctx.shutdown.load(Ordering::Relaxed) {
             if self.poll_once(ctx) {
                 ctx.ping.maybe_send(ctx.transport);
-                ctx.report.maybe_send(ctx.transport);
             }
         }
     }
@@ -231,11 +223,6 @@ impl Gateway {
             "tg",
             &format!("update from {} in chat {}", message.user_id, message.chat_id),
         );
-        // A bare-number reply to a pending report is a control message, not a
-        // chat turn: score it and stop, skipping the turn and memory pipeline.
-        if ctx.report.try_handle_verdict(ctx.transport, &message.text) {
-            return;
-        }
         let outcome = with_typing_indicator(ctx.transport, message.chat_id, || {
             ctx.handler.handle(&message.text)
         });

@@ -15,7 +15,6 @@ mod task_chain;
 mod toon_display;
 
 pub use agent::{MemoryEvent, MemorySeats, run_memory_agent};
-pub(crate) use agent::{classify_reply_label, describe_tool_call, parse_tool_calls};
 #[allow(unused_imports)]
 pub use db::{
     PassRun, db_init, insert_message, last_sync_error, read_message_context, register_session,
@@ -36,11 +35,9 @@ pub use embed::{
 };
 pub use ingest::{IngestEvent, run_ingestion_pass};
 pub use ledger::{
-    Actor, Attribution, DayDigest, EdgeRef, Event, EventContext, NightWindow, day_digest,
-    newest_dream_session_id, recompute_positions, record_events, turn_attribution,
+    Actor, Attribution, DayDigest, EdgeRef, Event, EventContext, NightWindow, recompute_positions,
+    record_events, turn_attribution,
 };
 pub(crate) use ledger::catch_up_digest_async;
 pub(crate) use loops::{OpenLoops, load_open_loops};
-#[allow(unused_imports)]
-pub use reinforce::record_outcome;
 pub use task_chain::{GameKnowledge, TaskChain, load_game_knowledge, load_task_chain};

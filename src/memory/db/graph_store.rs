@@ -11,65 +11,15 @@ use super::{
 };
 use crate::memory::graph;
 use crate::memory::graph::{
-    Edge, Graph, Node, PROVENANCE_LEGACY, edge_ceiling, load_from_toon, normalize_id,
+    Edge, Graph, Node, PROVENANCE_LEGACY, edge_ceiling, normalize_id,
 };
 
 #[cfg(test)]
 #[path = "graph_store_tests.rs"]
 mod tests;
 
-async fn seed_empty_graph(
-    conn: &Connection,
-    graph: &Graph,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    conn.execute("BEGIN", ()).await?;
-    for (node_id, node) in &graph.nodes {
-        conn.execute(
-            "INSERT INTO nodes (id, node_type, body, date) VALUES (?1, ?2, ?3, ?4)",
-            params![
-                node_id.as_str(),
-                node.node_type.as_str(),
-                node.body.as_str(),
-                node.date.as_str()
-            ],
-        )
-        .await?;
-    }
-    for edge in &graph.edges {
-        conn.execute(
-            "INSERT INTO edges (source, target, content, stability, confidence, importance, subject, date, occurred_at, expired_at, memory_type, origin_session, provenance, ceiling) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-            params![
-                edge.source.as_str(),
-                edge.target.as_str(),
-                edge.content.as_str(),
-                round2(edge.stability),
-                clamped_confidence(edge.confidence, &edge.provenance, edge.ceiling),
-                round2(edge.importance),
-                edge.subject as i64,
-                edge.date.as_str(),
-                edge.occurred_at.as_deref(),
-                edge.expired_at.as_deref(),
-                edge.memory_type.as_str(),
-                edge.origin_session.as_str(),
-                edge.provenance.as_str(),
-                edge.ceiling,
-            ],
-        )
-        .await?;
-    }
-    conn.execute("COMMIT", ()).await?;
-    Ok(())
-}
-
 pub fn db_init() -> Result<(), Box<dyn Error + Send + Sync>> {
     let conn = open_connection()?;
-    let count = runtime().block_on(node_count(&conn))?;
-    if count == 0 {
-        let graph = load_from_toon();
-        if !graph.nodes.is_empty() || !graph.edges.is_empty() {
-            runtime().block_on(seed_empty_graph(&conn, &graph))?;
-        }
-    }
     let _ = runtime().block_on(backfill_edge_epistemics(&conn))?;
     let today = crate::timeutil::today_iso();
     let _ = runtime().block_on(clamp_stability_once(&conn, &today))?;

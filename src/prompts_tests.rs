@@ -7,7 +7,7 @@
     }
 
     use super::{
-        AgentPrompt, CHAT_SYSTEM_PROMPT, CONSOLIDATE_EXPLANATION, CONTINUE_PASS, DAILY_REPORT,
+        AgentPrompt, CHAT_SYSTEM_PROMPT, CONSOLIDATE_EXPLANATION, CONTINUE_PASS,
         EXTRACT_EXPLANATION, JSON_OUTPUT_RULES, MEMORY_RULES, SCRIBE_EXPLANATION,
         SCRIBE_TOOL_DEFINITIONS, TOOL_DEFINITIONS, build_agent_prompt, build_chat_system_prompt,
         build_classify_prompt, build_continue_prompt, build_scribe_continue_prompt,
@@ -277,16 +277,4 @@
             assert!(prompt.contains("ISO-8601"));
         }
         assert!(CHAT_SYSTEM_PROMPT.contains("your ping policy"));
-    }
-
-    #[test]
-    fn daily_report_prompt_mentions_due_loops_and_confirmed_absence() {
-        assert!(DAILY_REPORT.contains("Mention Due loops in one sentence"));
-        assert!(DAILY_REPORT.contains("did it happen?"));
-        assert!(DAILY_REPORT.contains("Never treat the deadline alone as evidence of absence"));
-        assert!(DAILY_REPORT.contains("Report the Autonomy line honestly"));
-        assert!(DAILY_REPORT.contains("Held for you"));
-        assert!(DAILY_REPORT.contains("Report a failed or skipped pass as failed or skipped"));
-        assert!(DAILY_REPORT.contains("Never write \"we\", \"discussed\""));
-        assert!(DAILY_REPORT.contains("drawn only from the Thread lines"));
     }

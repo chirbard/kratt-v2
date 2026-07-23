@@ -306,7 +306,6 @@ pub fn recompute_positions() -> Result<Vec<String>, Box<dyn Error + Send + Sync>
 // daily report renders this to text and hands it to one small phrasing call.
 #[derive(Default)]
 pub struct DayDigest {
-    pub day: String,
     pub turns: usize,
     pub conversation_user_messages: usize,
     pub created: usize,
@@ -325,11 +324,6 @@ pub struct DayDigest {
     pub gists: Vec<String>,
     // Up to 5 most-injected edges: what memory was actually used for.
     pub top_injected: Vec<String>,
-    // Up to 5 example new edge refs, for concreteness.
-    pub new_edges: Vec<String>,
-    // The day's most active turns, each with the edges it created — the raw
-    // material for narrating the day as a few threads instead of a topic soup.
-    pub turn_groups: Vec<String>,
 }
 
 #[derive(Default)]
@@ -410,40 +404,12 @@ pub struct NightWindow {
     pub until: String,
 }
 
-// Best-effort: any query failure yields an empty (quiet-looking) digest rather
-// than blocking the report path.
-pub fn day_digest(day: &str, night: &NightWindow) -> DayDigest {
-    let conn = match db::open_connection() {
-        Ok(conn) => conn,
-        Err(_) => return DayDigest::default(),
-    };
-    let today = crate::timeutil::today_iso();
-    db::block_on(day_digest_async(&conn, day, night, &today)).unwrap_or_default()
-}
-
-// The id of the most recently registered dream session, if any — the verdict
-// scores the newest dream alongside the day's tg session.
-pub fn newest_dream_session_id() -> Option<String> {
-    let conn = db::open_connection().ok()?;
-    db::block_on(newest_dream_session_id_async(&conn)).unwrap_or_default()
-}
-
-async fn day_digest_async(
-    conn: &Connection,
-    day: &str,
-    night: &NightWindow,
-    today: &str,
-) -> Result<DayDigest, Box<dyn Error + Send + Sync>> {
-    let activity = day_window(day);
-    window_digest_async(conn, &activity, night, today, day).await
-}
-
 pub(crate) async fn catch_up_digest_async(
     conn: &Connection,
     window: &NightWindow,
     today: &str,
 ) -> Result<DayDigest, Box<dyn Error + Send + Sync>> {
-    window_digest_async(conn, window, window, today, today).await
+    window_digest_async(conn, window, window, today).await
 }
 
 async fn window_digest_async(
@@ -451,9 +417,8 @@ async fn window_digest_async(
     activity: &NightWindow,
     night: &NightWindow,
     today: &str,
-    label: &str,
 ) -> Result<DayDigest, Box<dyn Error + Send + Sync>> {
-    let mut digest = window_slice_digest(conn, activity, label).await?;
+    let mut digest = window_slice_digest(conn, activity).await?;
     populate_dream_facts(conn, night, &mut digest).await?;
     digest.gists = load_night_gists(conn, night).await?;
     digest.inbox_outcomes = db::load_inbox_outcomes(conn, &night.from, &night.until).await?;
@@ -622,28 +587,17 @@ async fn count_reactions(
     Ok((positive, negative))
 }
 
-fn day_window(day: &str) -> NightWindow {
-    NightWindow {
-        from: format!("{day}T"),
-        until: format!("{day}U"),
-    }
-}
-
 async fn window_slice_digest(
     conn: &Connection,
     window: &NightWindow,
-    label: &str,
 ) -> Result<DayDigest, Box<dyn Error + Send + Sync>> {
     Ok(DayDigest {
-        day: label.to_string(),
         turns: count_window_turns(conn, window).await?,
         conversation_user_messages: count_window_user_messages(conn, window).await?,
         created: count_window_event_type(conn, window, "created").await?,
         updated: count_window_event_type(conn, window, "updated").await?,
         pruned: count_window_event_type(conn, window, "pruned").await?,
         top_injected: load_window_top_injected(conn, window).await?,
-        new_edges: load_window_new_edges(conn, window).await?,
-        turn_groups: load_window_turn_groups(conn, window).await?,
         ..DayDigest::default()
     })
 }
@@ -750,42 +704,6 @@ async fn load_window_top_injected(
     collect_edge_refs(&mut rows).await
 }
 
-async fn load_window_new_edges(
-    conn: &Connection,
-    window: &NightWindow,
-) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
-    let mut rows = conn
-        .query(
-            "SELECT source, target FROM events WHERE ts >= ?1 AND ts < ?2 AND event_type = 'created' AND source != '' AND target != '' ORDER BY id DESC LIMIT 5",
-            params![window.from.as_str(), window.until.as_str()],
-        )
-        .await?;
-    collect_edge_refs(&mut rows).await
-}
-
-// The day's most active turns (by edges created) with what each created —
-// deterministic thread material. One line per turn, oldest first.
-async fn load_window_turn_groups(
-    conn: &Connection,
-    window: &NightWindow,
-) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
-    let mut rows = conn
-        .query(
-            "SELECT turn_id, GROUP_CONCAT(source || ' → ' || target, '; ') FROM events WHERE ts >= ?1 AND ts < ?2 AND event_type = 'created' AND turn_id != '' AND session_id NOT LIKE 'dream-%' GROUP BY turn_id ORDER BY COUNT(*) DESC LIMIT 6",
-            params![window.from.as_str(), window.until.as_str()],
-        )
-        .await?;
-    let mut groups = Vec::new();
-    while let Some(row) = rows.next().await? {
-        let turn = db::text(row.get_value(0)?);
-        let refs = db::text(row.get_value(1)?);
-        if !turn.is_empty() && !refs.is_empty() {
-            groups.push(refs);
-        }
-    }
-    Ok(groups)
-}
-
 async fn collect_edge_refs(
     rows: &mut turso::Rows,
 ) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
@@ -798,24 +716,6 @@ async fn collect_edge_refs(
         }
     }
     Ok(refs)
-}
-
-async fn newest_dream_session_id_async(
-    conn: &Connection,
-) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
-    let mut rows = conn
-        .query(
-            "SELECT id FROM sessions WHERE session_type = 'dream' ORDER BY created_at DESC LIMIT 1",
-            (),
-        )
-        .await?;
-    if let Some(row) = rows.next().await? {
-        let session_id = db::text(row.get_value(0)?);
-        if !session_id.is_empty() {
-            return Ok(Some(session_id));
-        }
-    }
-    Ok(None)
 }
 
 pub fn turn_attribution(turn_id: &str) -> Attribution {

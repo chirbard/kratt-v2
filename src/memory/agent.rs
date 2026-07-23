@@ -223,46 +223,6 @@ fn classify_turn(
     }
 }
 
-// Read-only classifier verdict label ("task"/"chat") for a raw model reply —
-// used by the seat-replay harness, which never touches the DB.
-pub(crate) fn classify_reply_label(reply: &str) -> &'static str {
-    parse_turn_mode(reply).label()
-}
-
-// One-line human description of a parsed tool call for eyeball inspection in
-// the replay report.
-pub(crate) fn describe_tool_call(call: &ToolCall) -> String {
-    match call {
-        ToolCall::UpsertNode {
-            name, node_type, ..
-        } => {
-            format!("upsert_node {name} ({node_type})")
-        }
-        ToolCall::UpsertEdge { source, target, .. } => format!("upsert_edge {source} → {target}"),
-        ToolCall::DeleteNode { name } => format!("delete_node {name}"),
-        ToolCall::DeleteEdge { source, target } => format!("delete_edge {source} → {target}"),
-        ToolCall::ExpireEdge { source, target, .. } => format!("expire_edge {source} → {target}"),
-        ToolCall::RecordMove { move_text, actor } => format!("record_move {move_text} ({actor})"),
-        ToolCall::DefineTask { name, .. } => format!("define_task {name}"),
-        ToolCall::RecordRule { rule } => format!("record_rule {rule}"),
-        ToolCall::RecordOutcome { result, .. } => format!("record_outcome {result}"),
-        ToolCall::RecordReaction { reaction, .. } => format!("record_reaction {reaction}"),
-        ToolCall::SetPingPolicy { action, topic, .. } => {
-            format!("set_ping_policy {action} {topic}")
-        }
-        ToolCall::OpenLoop { intention, .. } => format!("open_loop {intention}"),
-        ToolCall::CloseLoop {
-            loop_id,
-            resolution,
-            ..
-        } => {
-            format!("close_loop {loop_id} ({resolution})")
-        }
-        ToolCall::InboxAdd { source, .. } => format!("inbox_add {source}"),
-        ToolCall::RegisterInterest { topic } => format!("register_interest {topic}"),
-    }
-}
-
 fn parse_turn_mode(reply: &str) -> TurnMode {
     // Bias toward CHAT (the heavy semantic path): a conversation misclassified
     // as a task would record durable facts as fast-decaying episodic edges —
