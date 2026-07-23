@@ -1,11 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::error::Error;
 
 use turso::{Connection, Value, params};
 
 use super::core::runtime;
 use super::{
-    add_interest_node_columns, block_on, int, open_connection, optional_text, parse_edge_row, real,
+    add_interest_node_columns, block_on, open_connection, optional_text, parse_edge_row, real,
     text, text_or, timestamp_now,
 };
 use crate::memory::graph::{
@@ -36,7 +36,6 @@ pub type SemanticEdgeRow = (
 
 pub type OpenCuriosityNoteRow = (String, String, String, String);
 
-pub(crate) const INTEREST_NEIGHBOUR_DISTANCE: f64 = 0.25; // replay-tunable.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Interest {
     pub node_id: String,
@@ -44,13 +43,6 @@ pub(crate) struct Interest {
     pub origin: String,
     pub created_at: String,
     pub strength: f64,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct InterestTarget {
-    pub topic: String,
-    pub density: usize,
-    pub embedding: Vec<f64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -430,65 +422,6 @@ pub(crate) fn save_interest_embedding(
     })
 }
 
-pub(super) async fn interest_density_with(
-    conn: &Connection,
-    vector: &[f64],
-    max_distance: f64,
-) -> Result<usize, Box<dyn Error + Send + Sync>> {
-    let json_str = vector32_json(vector)?;
-    let mut rows = conn
-        .query(
-            "SELECT COUNT(*) FROM edges WHERE expired_at IS NULL AND embedding IS NOT NULL
-             AND vector_distance_cos(embedding, vector32(?1)) <= ?2",
-            params![json_str, max_distance],
-        )
-        .await?;
-    let Some(row) = rows.next().await? else {
-        return Ok(0);
-    };
-    Ok(int(row.get_value(0)?) as usize)
-}
-
-pub(crate) fn densification_targets(limit: usize) -> Vec<InterestTarget> {
-    let Ok(conn) = open_connection() else {
-        return Vec::new();
-    };
-    runtime()
-        .block_on(densification_targets_with(&conn, limit))
-        .unwrap_or_default()
-}
-
-async fn densification_targets_with(
-    conn: &Connection,
-    limit: usize,
-) -> Result<Vec<InterestTarget>, Box<dyn Error + Send + Sync>> {
-    add_interest_node_columns(conn).await;
-    let mut rows = conn
-        .query(
-            "SELECT body, vector_extract(embedding) FROM nodes
-             WHERE node_type = 'interest' AND embedding IS NOT NULL",
-            (),
-        )
-        .await?;
-    let mut targets = Vec::new();
-    while let Some(row) = rows.next().await? {
-        let topic = text(row.get_value(0)?);
-        let vector_text = text(row.get_value(1)?);
-        let Ok(embedding) = parse_vector32_json(&vector_text) else {
-            continue;
-        };
-        let density = interest_density_with(conn, &embedding, INTEREST_NEIGHBOUR_DISTANCE).await?;
-        targets.push(InterestTarget {
-            topic,
-            density,
-            embedding,
-        });
-    }
-    targets.sort_by_key(|target| target.density);
-    targets.truncate(limit);
-    Ok(targets)
-}
-
 pub(super) async fn load_unembedded_edges_async(
     conn: &Connection,
 ) -> Vec<(String, String, String)> {
@@ -684,65 +617,6 @@ pub(super) async fn load_all_edges_semantic_async(conn: &Connection) -> Vec<Sema
     edges
 }
 
-pub fn load_edge_actor_views(actor_type: &str, actor_id: &str) -> HashMap<(String, String), f64> {
-    let Ok(conn) = open_connection() else {
-        return HashMap::new();
-    };
-    runtime().block_on(load_edge_actor_views_async(&conn, actor_type, actor_id))
-}
-
-pub fn load_recent_attention_counts(
-    candidates: &[(String, String)],
-    window_days: usize,
-) -> HashMap<(String, String), usize> {
-    if candidates.is_empty() {
-        return HashMap::new();
-    }
-    let Ok(conn) = open_connection() else {
-        return HashMap::new();
-    };
-    runtime()
-        .block_on(load_recent_attention_counts_async(
-            &conn,
-            candidates,
-            window_days,
-        ))
-        .unwrap_or_default()
-}
-
-pub(super) async fn load_recent_attention_counts_async(
-    conn: &Connection,
-    candidates: &[(String, String)],
-    window_days: usize,
-) -> Result<HashMap<(String, String), usize>, Box<dyn Error + Send + Sync>> {
-    let mut values = Vec::new();
-    let mut params = Vec::new();
-    for (source, target) in candidates {
-        values.push("(?, ?)");
-        params.push(Value::Text(source.clone()));
-        params.push(Value::Text(target.clone()));
-    }
-    params.push(Value::Integer(-(window_days as i64)));
-    let query = format!(
-        "WITH candidates(source, target) AS (VALUES {})
-         SELECT ev.source, ev.target, COUNT(*)
-         FROM events ev
-         JOIN candidates c ON c.source = ev.source AND c.target = ev.target
-         WHERE ev.event_type IN ('reinforced', 'marked')
-           AND julianday(ev.ts) >= julianday('now', printf('%d days', ?))
-         GROUP BY ev.source, ev.target",
-        values.join(", ")
-    );
-    let mut rows = conn.query(&query, turso::params_from_iter(params)).await?;
-    let mut counts = HashMap::new();
-    while let Some(row) = rows.next().await? {
-        let source = text(row.get_value(0)?);
-        let target = text(row.get_value(1)?);
-        counts.insert((source, target), int(row.get_value(2)?) as usize);
-    }
-    Ok(counts)
-}
-
 pub(crate) async fn load_turn_region(
     conn: &Connection,
     turn_id: &str,
@@ -928,37 +802,6 @@ pub(crate) async fn last_suggestion_for_session(
         source: text(row.get_value(1)?),
         target: text(row.get_value(2)?),
     }))
-}
-
-async fn load_edge_actor_views_async(
-    conn: &Connection,
-    actor_type: &str,
-    actor_id: &str,
-) -> HashMap<(String, String), f64> {
-    let Ok(mut rows) = conn
-        .query(
-            "SELECT source, target, views FROM edge_actor_views WHERE actor_type = ?1 AND actor_id = ?2",
-            params![actor_type, actor_id],
-        )
-        .await
-    else {
-        return HashMap::new();
-    };
-    let mut views = HashMap::new();
-    while let Ok(Some(row)) = rows.next().await {
-        let Some((source, target, count)) = parse_edge_actor_view_row(&row) else {
-            continue;
-        };
-        views.insert((source, target), count);
-    }
-    views
-}
-
-fn parse_edge_actor_view_row(row: &turso::Row) -> Option<(String, String, f64)> {
-    let source = text(row.get_value(0).ok()?);
-    let target = text(row.get_value(1).ok()?);
-    let count = real(row.get_value(2).ok()?);
-    Some((source, target, count))
 }
 
 pub(super) async fn delete_edge_actor_views_async(

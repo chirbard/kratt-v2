@@ -1,10 +1,9 @@
     use std::collections::HashMap;
 
     use super::{
-        CHAT_INITIAL_K, SemanticEdge, edges_to_toon, edges_to_toon_with_nodes, interest_bonus,
-        rank_by_exploration, rank_pool_for_chat, satiation_factor, scope_episodic,
+        CHAT_INITIAL_K, SemanticEdge, edges_to_toon, edges_to_toon_with_nodes,
+        rank_pool_for_chat, scope_episodic,
     };
-    use crate::memory::db::InterestTarget;
     use crate::memory::graph::Node;
 
     fn test_edge(memory_type: &str, origin_session: &str) -> SemanticEdge {
@@ -163,81 +162,4 @@
         let edges = vec![test_edge("semantic", "")];
         let scoped = scope_episodic(edges, Some("game-2"));
         assert_eq!(scoped.len(), 1);
-    }
-
-    #[test]
-    fn satiation_factor_decreases_but_never_reaches_zero() {
-        assert_eq!(satiation_factor(0), 1.0);
-        assert!(satiation_factor(1) < satiation_factor(0));
-        assert!(satiation_factor(4) < satiation_factor(1));
-        assert!(satiation_factor(usize::MAX) > 0.0);
-    }
-
-    #[test]
-    fn satiation_shifts_ranking_without_removing_candidate() {
-        let mut penalized = test_edge("semantic", "");
-        penalized.source = "penalized".to_string();
-        penalized.target = "region".to_string();
-        let mut untouched = test_edge("semantic", "");
-        untouched.source = "untouched".to_string();
-        untouched.target = "region".to_string();
-        let mut attention = HashMap::new();
-        attention.insert(("penalized".to_string(), "region".to_string()), 8);
-
-        let ranked =
-            rank_by_exploration(vec![penalized, untouched], &HashMap::new(), &attention, &[]);
-
-        assert_eq!(ranked.len(), 2);
-        assert_eq!(ranked[0].source, "untouched");
-        let mut found_penalized = false;
-        for edge in ranked {
-            if edge.source == "penalized" {
-                found_penalized = true;
-            }
-        }
-        assert!(found_penalized);
-    }
-
-    #[test]
-    fn sparse_interest_pulls_nearby_candidate_more_strongly() {
-        let mut nearby = test_edge("semantic", "");
-        nearby.embedding = Some(vec![1.0, 0.0]);
-        let sparse = InterestTarget {
-            topic: "libsql internals".to_string(),
-            density: 0,
-            embedding: vec![1.0, 0.0],
-        };
-        let dense = InterestTarget {
-            topic: "rust".to_string(),
-            density: 8,
-            embedding: vec![1.0, 0.0],
-        };
-        assert!(interest_bonus(&nearby, &[sparse]) > interest_bonus(&nearby, &[dense]));
-
-        let mut outside = nearby.clone();
-        outside.embedding = Some(vec![0.0, 1.0]);
-        let target = InterestTarget {
-            topic: "libsql internals".to_string(),
-            density: 0,
-            embedding: vec![1.0, 0.0],
-        };
-        assert!(
-            interest_bonus(&nearby, std::slice::from_ref(&target))
-                > interest_bonus(&outside, &[target])
-        );
-
-        outside.source = "outside".to_string();
-        nearby.source = "nearby".to_string();
-        let target = InterestTarget {
-            topic: "libsql internals".to_string(),
-            density: 0,
-            embedding: vec![1.0, 0.0],
-        };
-        let ranked = rank_by_exploration(
-            vec![outside, nearby],
-            &HashMap::new(),
-            &HashMap::new(),
-            &[target],
-        );
-        assert_eq!(ranked[0].source, "nearby");
     }

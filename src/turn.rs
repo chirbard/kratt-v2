@@ -20,7 +20,7 @@ pub(crate) const MAX_TOOL_ROUNDS: usize = 5;
 const RECALL_K: usize = 7; // replay-tunable
 
 // Front-end-agnostic turn pipeline: memory-block assembly, initial messages,
-// the tool loop, and routing/attribution helpers. Both the TUI streamer and
+// the tool loop, and retrieval/attribution helpers. Both the TUI streamer and
 // the Telegram gateway drive the same logic through here — the TUI streams the
 // chunks to a panel, the gateway collects them into one reply.
 pub(crate) struct MemoryBuild {
@@ -177,7 +177,7 @@ fn collect_content(receiver: &std::sync::mpsc::Receiver<Chunk>) -> String {
 }
 
 pub(crate) fn log_memory_context(memory_build: &MemoryBuild) {
-    runlog::log("routing", &memory_build.debug_log);
+    runlog::log("retrieval", &memory_build.debug_log);
     runlog::log(
         "chat",
         &format!("injected edges: {}", memory_build.injected_edges),
@@ -218,10 +218,10 @@ pub(crate) fn build_memory_block(
     turn_id: &str,
 ) -> MemoryBuild {
     let started = Instant::now();
-    let selection = memory::select_semantic_edges_routed(embed, query, session_id);
+    let selection = memory::select_semantic_edges_for_chat(embed, query, session_id);
     let edges = selection.edges;
-    let sections = load_memory_sections(&edges, session_id, &selection.routing.routing_vector);
-    let events = build_memory_events((session_id, turn_id), &selection.routing, &edges, &sections);
+    let sections = load_memory_sections(&edges, session_id, &selection.query_embedding);
+    let events = build_memory_events((session_id, turn_id), &edges, &sections);
     // Best-effort bookkeeping: a failed ledger write must never abort the turn.
     if let Err(err) = memory::record_events(&events) {
         runlog::log("ledger", &format!("write failed: {err}"));
@@ -234,7 +234,7 @@ pub(crate) fn build_memory_block(
     );
     MemoryBuild {
         block,
-        debug_log: routing_debug_line(&selection.routing),
+        debug_log: "retrieval: plain semantic ranking".to_string(),
         injected_edges: edges.len() + sections.injected_edges(),
         elapsed_ms: started.elapsed().as_millis(),
     }
@@ -265,14 +265,10 @@ fn collect_anchor_ids(edges: &[memory::SemanticEdge]) -> Vec<String> {
 
 fn build_memory_events(
     context: (&str, &str),
-    routing: &memory::Routing,
     edges: &[memory::SemanticEdge],
     sections: &MemorySections,
 ) -> Vec<memory::Event> {
-    let mut events = vec![memory::Event::routed(
-        memory::EventContext::new(context.0, context.1),
-        routed_payload(&routing.expert, routing.expert_score),
-    )];
+    let mut events = Vec::new();
     push_ranked_injected(&mut events, context, edges);
     push_injected_refs(&mut events, context, "local", &sections.loops.refs);
     push_injected_refs(&mut events, context, "game", &sections.chain.refs);
@@ -343,26 +339,6 @@ fn append_section(block: &mut String, section: &str) {
         block.push_str("\n\n");
     }
     block.push_str(section);
-}
-
-fn routed_payload(expert: &Option<String>, score: f64) -> String {
-    json!({
-        "expert": expert,
-        "score": score,
-    })
-    .to_string()
-}
-
-fn routing_debug_line(routing: &memory::Routing) -> String {
-    let Some(expert) = &routing.expert else {
-        return "routing: none (no positions)".to_string();
-    };
-    let suffix = if routing.expert_with_direction {
-        " (pos+dir)"
-    } else {
-        " (pos)"
-    };
-    format!("routing: {expert} {:.2}{suffix}", routing.expert_score)
 }
 
 pub(crate) fn build_initial_messages(prompt: &str, system_opt: Option<&str>) -> Vec<Value> {
@@ -507,7 +483,7 @@ pub(crate) fn build_tools(has_search: bool) -> Value {
     ));
     tools.push(simple_recall_tool(
         "catch_up",
-        "Summarize real graph, dream, study, and due-loop activity since the previous conversation.",
+        "Summarize real graph, study, and due-loop activity since the previous conversation.",
     ));
     Value::Array(tools)
 }
@@ -993,14 +969,11 @@ fn render_catch_up(digest: &memory::DayDigest) -> String {
         return "Nothing has happened since we last talked.".to_string();
     }
     let mut lines = vec![format!(
-        "Since we last talked: {} beliefs added, {} updated, {} pruned; {} dream events.",
-        digest.created, digest.updated, digest.pruned, digest.dream_events
+        "Since we last talked: {} beliefs added, {} updated, {} pruned.",
+        digest.created, digest.updated, digest.pruned
     )];
     if let Some(line) = digest.autonomy.line() {
         lines.push(line);
-    }
-    if !digest.gists.is_empty() {
-        lines.push(format!("Dream gists: {}.", join_capped(&digest.gists)));
     }
     if !digest.inbox_outcomes.is_empty() {
         lines.push(format!("Inbox: {}.", join_capped(&digest.inbox_outcomes)));

@@ -20,19 +20,6 @@ pub fn register_session(session_id: &str, created_at: &str) {
     });
 }
 
-pub fn register_dream_session(session_id: &str, created_at: &str) {
-    let Ok(conn) = open_connection() else {
-        return;
-    };
-    runtime().block_on(async {
-        let _ = conn.execute(
-            "INSERT OR IGNORE INTO sessions (id, session_type, created_at) VALUES (?1, 'dream', ?2)",
-            params![session_id, created_at],
-        )
-        .await;
-    });
-}
-
 pub fn register_ingestion_session(session_id: &str, created_at: &str) {
     let Ok(conn) = open_connection() else {
         return;

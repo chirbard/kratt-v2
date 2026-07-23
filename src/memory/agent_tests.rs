@@ -238,53 +238,6 @@
     }
 
     #[test]
-    fn gist_edge_parses_full_args_and_both_ref_spellings() {
-        let arrow = r#"{"tools":[{"tool":"gist_edge","args":{"source":"early-queen-sorties","target":"chess-openings","content":"queen sorties get punished","confidence":0.6,"stability":0.4,"supported_by":["game3-hub → move-qh5","game4-hub->move-qf3"]}}]}"#;
-        let calls = parse_tool_calls(arrow);
-        assert_eq!(calls.len(), 1);
-        let ToolCall::GistEdge {
-            source,
-            supported_by,
-            confidence,
-            stability,
-            ..
-        } = &calls[0]
-        else {
-            unreachable!("parsed as gist_edge")
-        };
-        assert_eq!(source, "early-queen-sorties");
-        assert!((*confidence - 0.6).abs() < 1e-9);
-        assert!((*stability - 0.4).abs() < 1e-9);
-        // Both "a → b" and "a->b" normalize to the same (source, target) refs.
-        assert_eq!(
-            supported_by,
-            &vec![
-                ("game3-hub".to_string(), "move-qh5".to_string()),
-                ("game4-hub".to_string(), "move-qf3".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn gist_edge_without_supported_by_is_rejected() {
-        let missing = r#"{"tool":"gist_edge","args":{"source":"a","target":"b","content":"c"}}"#;
-        assert!(parse_tool_calls(missing).is_empty());
-        let not_array = r#"{"tool":"gist_edge","args":{"source":"a","target":"b","content":"c","supported_by":"x → y"}}"#;
-        assert!(parse_tool_calls(not_array).is_empty());
-    }
-
-    #[test]
-    fn gist_edge_stability_defaults_to_half_when_absent() {
-        let no_stability = r#"{"tool":"gist_edge","args":{"source":"a","target":"b","content":"c","supported_by":["x → y","p → q"]}}"#;
-        let calls = parse_tool_calls(no_stability);
-        assert_eq!(calls.len(), 1);
-        let ToolCall::GistEdge { stability, .. } = &calls[0] else {
-            unreachable!("parsed as gist_edge")
-        };
-        assert!((*stability - 0.5).abs() < 1e-9);
-    }
-
-    #[test]
     fn upsert_edge_parses_inferred_from_pairs() {
         let text = r#"{"tool":"upsert_edge","args":{"source":"result","target":"fact","inferred_from":[["Premise A","Fact"],["premise-b","fact"]]}}"#;
         let calls = parse_tool_calls(text);
@@ -376,7 +329,6 @@
             confidence: 0.9,
             importance: 0.7,
             subject: false,
-            date: String::new(),
             occurred_at: None,
             memory_type: Some("semantic".to_string()),
             inferred_from: None,
@@ -458,7 +410,6 @@
             confidence: 0.95,
             importance: 0.5,
             subject: false,
-            date: String::new(),
             occurred_at: None,
             memory_type: None,
             inferred_from: Some(vec![
@@ -483,7 +434,6 @@
             confidence: 0.9,
             importance: 0.5,
             subject: false,
-            date: String::new(),
             occurred_at: None,
             memory_type: None,
             inferred_from: Some(vec![("ghost".to_string(), "fact".to_string())]),
@@ -1363,7 +1313,6 @@
                 name: name.to_string(),
                 node_type: node_type.to_string(),
                 body: body.to_string(),
-                date: "model-controlled-date".to_string(),
             }
         }
 
@@ -1380,7 +1329,6 @@
                 confidence: 1.0,
                 importance: 1.0,
                 subject,
-                date: "model-controlled-date".to_string(),
                 occurred_at: None,
                 memory_type: None,
                 inferred_from: None,

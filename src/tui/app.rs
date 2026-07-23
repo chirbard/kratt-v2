@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::api::{Chunk, EmbeddingClient, LlmClient, Stats};
-use crate::memory::{self, DreamEvent, IngestEvent, MemoryEvent, MemorySeats};
+use crate::memory::{self, IngestEvent, MemoryEvent, MemorySeats};
 use crate::session;
 use crate::web::SearchClient;
 
@@ -29,13 +29,6 @@ pub(crate) enum MemoryState {
 }
 
 #[derive(PartialEq)]
-pub(crate) enum DreamState {
-    Idle,
-    Running,
-    Done,
-}
-
-#[derive(PartialEq)]
 pub(crate) enum IngestState {
     Idle,
     Running,
@@ -58,7 +51,7 @@ pub(crate) struct Message {
 pub(crate) struct App {
     pub(crate) chat_llm: Arc<dyn LlmClient>,
     // The memory pass runs on per-seat clients (classifier/scribe/heavy). The
-    // heavy seat is also the model for dream/ingest passes.
+    // heavy seat is also the model for ingestion passes.
     pub(crate) seats: MemorySeats,
     pub(crate) embed: Arc<dyn EmbeddingClient>,
     pub(crate) search: Option<Arc<dyn SearchClient>>,
@@ -84,10 +77,6 @@ pub(crate) struct App {
     pub(crate) show_attribution: bool,
     pub(crate) session_path: PathBuf,
     pub(crate) last_user_message_id: String,
-    pub(crate) dream_state: DreamState,
-    pub(crate) dream_rx: Option<std::sync::mpsc::Receiver<DreamEvent>>,
-    pub(crate) dream_log: Vec<(String, String)>,
-    pub(crate) dream_summary: String,
     pub(crate) ingest_state: IngestState,
     pub(crate) ingest_rx: Option<std::sync::mpsc::Receiver<IngestEvent>>,
     pub(crate) ingest_log: Vec<(String, String)>,
@@ -135,10 +124,6 @@ impl App {
             show_attribution: true,
             session_path,
             last_user_message_id: String::new(),
-            dream_state: DreamState::Idle,
-            dream_rx: None,
-            dream_log: Vec::new(),
-            dream_summary: String::new(),
             ingest_state: IngestState::Idle,
             ingest_rx: None,
             ingest_log: Vec::new(),
@@ -274,37 +259,6 @@ pub(crate) fn drain_embed(app: &mut App) {
     }
 }
 
-pub(crate) fn drain_dream(app: &mut App) {
-    let dream_receiver = match app.dream_rx.take() {
-        Some(dream_receiver) => dream_receiver,
-        None => return,
-    };
-    loop {
-        match dream_receiver.try_recv() {
-            Ok(DreamEvent::Log { phase, text }) => {
-                app.dream_log.push((phase.to_string(), text));
-            }
-            Ok(DreamEvent::Append { phase, text }) => match app.dream_log.last_mut() {
-                Some(last) if last.0 == phase => last.1.push_str(&text),
-                _ => app.dream_log.push((phase.to_string(), text)),
-            },
-            Ok(DreamEvent::Done { edges_added }) => {
-                app.dream_summary = format!("dream done — {edges_added} edges written");
-                app.dream_state = DreamState::Done;
-                return;
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                app.dream_rx = Some(dream_receiver);
-                return;
-            }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                app.dream_state = DreamState::Idle;
-                return;
-            }
-        }
-    }
-}
-
 pub(crate) fn drain_ingest(app: &mut App) {
     let ingest_receiver = match app.ingest_rx.take() {
         Some(ingest_receiver) => ingest_receiver,
@@ -318,7 +272,6 @@ pub(crate) fn drain_ingest(app: &mut App) {
             Ok(IngestEvent::Done { chunks_processed }) => {
                 app.ingest_summary = format!("ingest done — {chunks_processed} chunks");
                 app.ingest_state = IngestState::Done;
-                start_dream(app);
                 return;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -352,19 +305,6 @@ fn start_memory_update(app: &mut App) {
     });
     app.memory_rx = Some(receiver);
     app.memory_state = MemoryState::Updating;
-}
-
-pub(crate) fn start_dream(app: &mut App) {
-    app.dream_log.clear();
-    app.dream_summary.clear();
-    let (sender, receiver) = std::sync::mpsc::channel::<DreamEvent>();
-    let llm = Arc::clone(&app.seats.heavy);
-    let embed = Arc::clone(&app.embed);
-    std::thread::spawn(move || {
-        let _ = memory::run_dream_pass(llm, embed, sender);
-    });
-    app.dream_rx = Some(receiver);
-    app.dream_state = DreamState::Running;
 }
 
 fn clone_search_client(app: &App) -> Option<Arc<dyn SearchClient>> {
@@ -455,7 +395,6 @@ pub(crate) fn second_to_last_content(app: &App) -> String {
 pub(crate) fn scheduler_allowed(app: &App) -> bool {
     app.state == State::Idle
         && app.memory_state == MemoryState::Idle
-        && app.dream_state != DreamState::Running
         && app.ingest_state != IngestState::Running
 }
 
@@ -541,11 +480,6 @@ fn run_scheduler(app: &mut App) {
 fn dispatch_scheduler_action(app: &mut App, action: crate::memory::scheduler::SchedulerAction) {
     use crate::memory::scheduler::SchedulerAction;
     match action {
-        SchedulerAction::Dream { reason } => {
-            crate::runlog::log("sched", &format!("dispatching dream: {}", reason));
-            start_dream(app);
-            app.scheduler_consecutive_actions += 1;
-        }
         SchedulerAction::InboxStudy { reason } => {
             crate::runlog::log("sched", &format!("inbox study is daemon-only: {reason}"));
         }

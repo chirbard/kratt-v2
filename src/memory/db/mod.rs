@@ -49,18 +49,18 @@ pub(crate) use pass_runs::{
 use retrieval::delete_edge_actor_views_async;
 pub(crate) use retrieval::load_due_loops_async;
 pub(crate) use retrieval::{
-    INTEREST_NEIGHBOUR_DISTANCE, Interest, InterestTarget, RecentLearning, RegionTransition,
-    densification_targets, insert_interest, last_suggestion_for_session, load_inbox_snapshot_async,
-    load_open_curiosity_notes_async, load_open_intentions_async, load_previous_turn_region,
-    load_recent_learning_async, load_region_transitions, load_turn_region,
+    Interest, RecentLearning, RegionTransition, insert_interest, last_suggestion_for_session,
+    load_inbox_snapshot_async, load_open_curiosity_notes_async, load_open_intentions_async,
+    load_previous_turn_region, load_recent_learning_async, load_region_transitions, load_turn_region,
     load_unembedded_interests, nearest_live_edges, record_news_graph_material,
-    save_interest_embedding, top_interests, top_interests_with,
+    save_interest_embedding, top_interests,
 };
+#[cfg(test)]
+pub(crate) use retrieval::top_interests_with;
 pub use retrieval::{
-    SemanticEdgeRow, edge_count, load_all_edges_semantic, load_edge_actor_views,
-    load_loops_by_similarity, load_loops_for_anchors, load_recent_attention_counts,
-    load_unembedded_edges, parse_vector32_json, query_edges_by_vector, save_edge_embedding,
-    vector32_json,
+    SemanticEdgeRow, edge_count, load_all_edges_semantic, load_loops_by_similarity,
+    load_loops_for_anchors, load_unembedded_edges, parse_vector32_json, query_edges_by_vector,
+    save_edge_embedding, vector32_json,
 };
 #[cfg(test)]
 use schema::create_pass_run_table;
@@ -69,12 +69,11 @@ pub(crate) use sessions::{
     conversation_boundary_async, latest_assistant_message_timestamp_async, register_news_session,
 };
 pub use sessions::{
-    insert_message, read_message_context, register_dream_session, register_ingestion_session,
-    register_session, search_messages_fts, source_session_id,
+    insert_message, read_message_context, register_ingestion_session, register_session,
+    search_messages_fts, source_session_id,
 };
 pub use task_store::{
-    count_task_chain, ensure_task_hub, load_game_edges, load_game_hubs, load_game_nodes,
-    load_session_game, load_session_outcome, load_task_chain, next_ply,
+    count_task_chain, ensure_task_hub, load_game_edges, load_session_game, load_task_chain, next_ply,
 };
 pub(crate) use values::{int, real, round2, text};
 use values::{optional_real, optional_text, text_or};

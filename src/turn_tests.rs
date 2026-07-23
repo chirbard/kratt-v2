@@ -6,7 +6,7 @@
         execute_recall_recent_learning_with, execute_tool, parse_since_days, tools_for_round,
     };
     use crate::api::{Chunk, EmbeddingClient, ToolCallRequest};
-    use crate::memory::{EdgeRef, GameKnowledge, OpenLoops, Routing, SemanticEdge, TaskChain};
+    use crate::memory::{EdgeRef, GameKnowledge, OpenLoops, SemanticEdge, TaskChain};
     use turso::{Builder, Connection};
 
     struct TestEmbed;
@@ -178,18 +178,12 @@
             knowledge: knowledge(""),
             chain: chain(""),
         };
-        let routing = Routing {
-            routing_vector: Vec::new(),
-            expert: None,
-            expert_score: 0.0,
-            expert_with_direction: false,
-        };
-        let events = build_memory_events(("session", "turn"), &routing, &[], &sections);
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[1].event_type, "injected");
-        assert_eq!(events[1].actor_id, "local");
-        assert_eq!(events[1].source, "loop-reminder");
-        assert_eq!(events[1].target, "home-server");
+        let events = build_memory_events(("session", "turn"), &[], &sections);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "injected");
+        assert_eq!(events[0].actor_id, "local");
+        assert_eq!(events[0].source, "loop-reminder");
+        assert_eq!(events[0].target, "home-server");
     }
 
     #[test]
@@ -291,8 +285,7 @@
         );
         crate::memory::block_on(async {
             let _ = conn.execute("INSERT INTO sessions (id, session_type, created_at) VALUES ('explore-1', 'exploration', '2026-07-14T08:30:00')", ()).await;
-            let _ = conn.execute("INSERT INTO events (ts, session_id, turn_id, event_type, source, target) VALUES ('2026-07-14T09:00:00', 'explore-1', 'turn-1', 'created', 'new', 'belief'), ('2026-07-14T10:00:00', 'dream-1', '', 'updated', 'gist', 'sleep')", ()).await;
-            let _ = conn.execute("INSERT INTO events (ts, session_id, event_type, source, target, payload) VALUES ('2026-07-14T10:01:00', 'dream-1', 'updated', 'gist', 'sleep', 'gist_of: x')", ()).await;
+            let _ = conn.execute("INSERT INTO events (ts, session_id, turn_id, event_type, source, target) VALUES ('2026-07-14T09:00:00', 'explore-1', 'turn-1', 'created', 'new', 'belief')", ()).await;
             let _ = conn.execute("INSERT INTO inbox (accepted_at, source, status, resolved_at, result) VALUES ('2026-07-14T08:30:00', 'paper.pdf', 'done', '2026-07-14T11:00:00', 'study-1')", ()).await;
         });
         let rendered = execute_catch_up_with(
@@ -302,8 +295,6 @@
             "2026-07-14",
         );
         assert!(rendered.contains("1 beliefs added"));
-        assert!(rendered.contains("2 dream events"));
-        assert!(rendered.contains("Dream gists: gist → sleep"));
         assert!(rendered.contains("Inbox: paper.pdf: done"));
         assert!(rendered.contains("Autonomy: Ran 1 self-directed pass (1 added knowledge)."));
     }

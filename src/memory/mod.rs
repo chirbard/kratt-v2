@@ -2,23 +2,18 @@ mod agent;
 mod db;
 mod decay;
 pub mod decay_curve;
-mod decay_simulator;
-mod dream;
 mod embed;
 mod graph;
 mod heavy;
-mod hygiene;
 mod ingest;
 mod ledger;
 mod loops;
 mod news;
 mod reinforce;
-mod routing;
 mod sequence;
 pub mod scheduler;
 pub use scheduler::pressure_line;
 pub use sequence::sequence_line;
-mod synthesis;
 mod task_chain;
 mod toon_display;
 
@@ -39,9 +34,10 @@ pub(crate) use db::{
 };
 #[cfg(test)]
 pub(crate) use db::{insert_interest, top_interests_with};
-pub use dream::{DreamEvent, run_dream_pass};
-pub use decay_simulator::run as run_decay_simulator;
-pub use embed::{SemanticEdge, edges_to_toon, run_embed_pass, select_semantic_edges, select_semantic_edges_routed};
+pub use embed::{
+    SemanticEdge, edges_to_toon, run_embed_pass, select_semantic_edges,
+    select_semantic_edges_for_chat,
+};
 pub use ingest::{IngestEvent, run_focused_ingestion_pass, run_ingestion_pass};
 pub(crate) use news::run_news_scan;
 pub use ledger::{
@@ -52,5 +48,4 @@ pub(crate) use ledger::catch_up_digest_async;
 pub(crate) use loops::{OpenLoops, load_open_loops};
 #[allow(unused_imports)]
 pub use reinforce::record_outcome;
-pub use routing::Routing;
 pub use task_chain::{GameKnowledge, TaskChain, load_game_knowledge, load_task_chain};

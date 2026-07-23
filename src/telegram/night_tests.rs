@@ -1,7 +1,7 @@
     use super::*;
 
-    fn window(raw: &str) -> DreamWindow {
-        match DreamWindow::parse(raw) {
+    fn window(raw: &str) -> NightWindow {
+        match NightWindow::parse(raw) {
             Ok(win) => win,
             Err(err) => panic!("valid window {raw}: {err}"),
         }
@@ -33,10 +33,10 @@
 
     #[test]
     fn malformed_window_is_an_error_not_a_default() {
-        assert!(DreamWindow::parse("banana").is_err());
-        assert!(DreamWindow::parse("3").is_err());
-        assert!(DreamWindow::parse("3-99").is_err());
-        assert!(DreamWindow::parse("4-4").is_err());
+        assert!(NightWindow::parse("banana").is_err());
+        assert!(NightWindow::parse("3").is_err());
+        assert!(NightWindow::parse("3-99").is_err());
+        assert!(NightWindow::parse("4-4").is_err());
     }
 
     #[test]
@@ -105,18 +105,18 @@
     }
 
     #[test]
-    fn a_new_day_sets_dirty_and_resets_the_nightly_dream_flag() {
+    fn a_new_day_sets_dirty_and_resets_nightly_state() {
         let mut gate = gate("3-6");
         let base = Instant::now();
         // Establish the night first — entering the window on a new day is
         // itself a dirtying event, so the rest must come after.
         assert!(gate.should_evaluate(4, "2026-07-10", base));
-        gate.dreamed_tonight = true;
+        gate.studied_inbox_tonight = true;
         gate.record_rest();
         assert!(!gate.should_evaluate(4, "2026-07-10", base));
-        // Window re-entry on the next day: dirty again, dream flag cleared.
+        // Window re-entry on the next day: dirty again, nightly state cleared.
         assert!(gate.should_evaluate(4, "2026-07-11", base));
-        assert!(!gate.dreamed_tonight);
+        assert!(!gate.studied_inbox_tonight);
     }
 
     #[test]
@@ -128,33 +128,6 @@
         // Cooldown gates the timing, but the state is still dirty.
         let later = base + Duration::from_secs(1200);
         assert!(gate.should_evaluate(4, "2026-07-10", later));
-    }
-
-    #[test]
-    fn failed_dream_allows_one_cooldown_gated_retry() {
-        let mut gate = gate("3-6");
-        let base = Instant::now();
-        let day = timeutil::today_iso();
-        assert!(gate.should_evaluate(4, &day, base));
-        gate.record_dream(base, false);
-        assert!(!gate.dreamed_tonight);
-        assert!(gate.can_attempt_dream());
-        assert!(!gate.should_evaluate(4, &day, base + Duration::from_secs(60)));
-        let retry = base + Duration::from_secs(1200);
-        assert!(gate.should_evaluate(4, &day, retry));
-        gate.record_dream(retry, false);
-        assert!(gate.dreamed_tonight);
-        assert!(!gate.can_attempt_dream());
-    }
-
-    #[test]
-    fn successful_dream_closes_the_nightly_gate() {
-        let mut gate = gate("3-6");
-        let now = Instant::now();
-        gate.record_dream(now, true);
-        assert!(gate.dreamed_tonight);
-        assert!(!gate.can_attempt_dream());
-        assert_eq!(gate.dream_attempts, 1);
     }
 
     #[test]

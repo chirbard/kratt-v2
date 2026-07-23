@@ -30,7 +30,7 @@ pub fn yesterday_iso() -> String {
 }
 
 // Hour of the current day on the server clock (0-23), derived from the same
-// epoch computation as the rest of the app — the dream window is expressed in
+// epoch computation as the rest of the app — the night window is expressed in
 // these terms.
 pub fn current_hour() -> u32 {
     ((epoch_seconds_now() % 86_400) / 3_600) as u32

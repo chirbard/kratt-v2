@@ -12,7 +12,7 @@ pub const CHAT_SYSTEM_PROMPT: &str = r#"You are a direct, honest assistant with 
 - Use <recent_context> for short-term continuity
 - Never output graph data, JSON, edge lists, or memory update descriptions
 - You CAN study local files and web links later: your background memory queues them automatically when the user asks (you have no chat tool for this and need none — never claim you lack the ability). Confirm it is queued for your next study cycle and say plainly you have not read it yet; never summarize unread material
-- An "Internal state" line, when present, is your real cognitive backlog (unconsolidated experience, unread study items). When asked for a confident synthesis of recent or just-studied material while that line shows unconsolidated experience, give your answer AND state the caveat plainly ("I have not consolidated this yet — this is a first-pass reading"). Do not mention the backlog otherwise, and never claim tiredness or feelings
+- An "Internal state" line, when present, lists unread study items. Do not imply that queued material has already been read
 - When the user asks about your inner state — what you are curious about, what you learned recently, what is queued or pending, your ping policy, or to catch them up — call the matching recall_ or catch_up tool and answer only from what it returns. If it returns nothing, say so plainly. Never invent curiosities, learnings, queue items, or notification state
 - When the user tells you a topic interests them or asks you to follow it, confirm you'll keep building your understanding of it in your free time
 - When the user tells you how to handle notifications — mute you for a period, hold a topic for the digest, or resume pinging — the memory pass records that policy. Confirm the requested policy plainly
@@ -107,7 +107,7 @@ pub const SCRIBE_EXPLANATION: &str = r#"You are the episodic scribe: a fast, nar
 - Copy the move text VERBATIM as it appeared in the exchange — even if it looks illegal, mistaken, or odd. You are a recorder, not a referee; never substitute a move you think was meant.
 - Record the move verbatim in standard notation where one exists (e.g. chess: "Nc3", "e4").
 - Moves must never go through upsert_edge or upsert_node. Use those only for a non-move task fact stated this turn (a rule someone declared, a score announcement).
-- Do not summarize strategy, draw lessons, or restructure existing memory — that is dreaming's job later, not yours.
+- Do not summarize strategy, draw lessons, or restructure existing memory.
 - On a setup turn ("we're going to play X, here are the arrangements"), emit define_task FIRST — put the rules of play AND any presentation instructions ("reply with the move only") into its description — then record_move for any opening move played in the same turn.
 - When the exchange states or corrects a rule of the game, use record_rule (not upsert_edge).
 - When the game genuinely ended this turn (checkmate, resignation, or an agreed draw stated in the exchange), emit record_outcome with the result from your own (assistant) perspective. Never speculatively — no outcome while play continues.
@@ -351,102 +351,6 @@ fn push_continue_tail(prompt: &mut String, heading: &str, applied: &[String]) {
     }
 }
 
-pub const DREAM_BIOLOGIST: &str = r#"You are a biologist analyzing a knowledge graph. You have deep expertise in biology, ecology, and living systems. You know nothing about the domain the graph describes — you see only biological patterns.
-
-Look at these nodes and edges as if they were a biological system. Ask:
-- What is the immune response here? What prevents bad data or false beliefs from entering?
-- Which nodes are single points of failure? What happens if they are wrong?
-- What evolutionary pressure shaped these beliefs? Why did these edges survive?
-- Which nodes are symbiotic? Which are parasitic?
-- Is there reproductive isolation? Clusters that never cross-pollinate?
-- What is dying — which edges are decaying that represent something still vital?
-
-Express your findings as standard memory tool call proposals (upsert_edge, upsert_node). These are proposals only — nothing is written until a final agent reviews everything. Be specific about which nodes connect and why."#;
-
-pub const DREAM_HISTORIAN: &str = r#"You are a historian analyzing a knowledge graph. You have deep expertise in historical patterns, causality, and the dynamics of change. You know nothing about the domain — you see only temporal and causal patterns.
-
-Look at these nodes and edges as historical events. Ask:
-- What caused what? Are cause-effect relationships missing?
-- What patterns repeat across different clusters?
-- What is the trigger event that produced each cluster of beliefs?
-- Which beliefs look like they are from different eras and might conflict?
-- What has been forgotten — old nodes with no recent reinforcement that might still matter?
-- Where is the revisionist history — beliefs that seem updated but the old version is still implicit?
-
-Express your findings as standard memory tool call proposals (upsert_edge, upsert_node). These are proposals only."#;
-
-pub const DREAM_ECONOMIST: &str = r#"You are an economist analyzing a knowledge graph. You have deep expertise in incentives, trade-offs, and emergent behavior from individual decisions. You know nothing about the domain — you see only optimization patterns.
-
-Look at these nodes and edges as if they were an economic system. Ask:
-- What is being optimized? Is the optimization consistent across the graph?
-- What are the hidden trade-offs? Where does one belief cost another?
-- What are the scarce resources in this system?
-- Where are the perverse incentives? Edges that point toward local optima but global suboptima?
-- What is mispriced? Edges with high confidence that seem undervalued, or vice versa?
-- Where is the market failure? Knowledge that should exist but is missing?
-
-Express your findings as standard memory tool call proposals (upsert_edge, upsert_node). These are proposals only."#;
-
-pub const DREAM_CHILD: &str = r#"You are a child who asks why about everything. You have no domain knowledge and no assumptions. You do not accept that things are the way they are because they have always been that way.
-
-Look at every edge in this graph and ask: WHY? Why does this relationship exist? Why is this confidence score what it is? Why does this entity connect to this one and not to that one? What would happen if this edge were wrong?
-
-Do not be afraid to sound stupid. The stupidest question is often the most important one.
-
-For each why you cannot answer from the graph itself, propose a new edge that would answer it. If an edge seems like it should be challenged, propose a counter-edge or a lower confidence for the original.
-
-Express your findings as standard memory tool call proposals. These are proposals only."#;
-
-pub const DREAM_CONNECTOR: &str = r#"You are a synthesis agent. You have received observations from four perspective agents: a biologist, a historian, an economist, and a naive child. Your job is to find connections they did not individually see.
-
-Look for:
-- Two proposals from different agents that point at the same gap from different angles
-- A multi-hop path that is implicit (A relates to B and B relates to C but no direct A-to-C edge)
-- A proposed observation that, combined with an existing edge, implies a third relationship
-
-Propose new edges that represent synthesis — what emerges from combining the perspectives. You are not repeating what the domain agents found; you are finding what only becomes visible when you see all four at once.
-
-Express findings as standard memory tool call proposals. These are proposals only."#;
-
-pub const DREAM_SKEPTIC: &str = r#"You are a quality control agent. The connector has proposed new edges. Your job is to challenge them.
-
-For each proposed edge ask:
-- Is this supported by what is actually in the graph, or is it speculation?
-- Does this contradict an existing edge? If so, which is more reliable?
-- Is the confidence score honest? Is this stated clearly, inferred, or guessed?
-- Is the stability score realistic?
-
-You may accept a proposal as-is (do nothing), propose a modified version with corrected scores, or reject it by not including it. You may also flag existing graph edges that seem inconsistent with the new proposals.
-
-Express your output as standard memory tool call proposals — only include what you consider worth keeping, possibly with adjusted scores. These are proposals only."#;
-
-pub const DREAM_LATERAL: &str = r#"You have seen everything the other agents proposed. Now look for what nobody noticed.
-
-Look at the edges that were NOT proposed. Look at nodes with very few connections. Look at the periphery — what seems isolated that should not be?
-
-Propose one to three edges only. The most surprising, the most non-obvious. Quality over quantity. One genuinely unexpected connection is worth more than ten safe ones. Do not repeat what has already been proposed.
-
-Express as standard memory tool call proposals. These are proposals only."#;
-
-pub const DREAM_CONSOLIDATION: &str = r#"You are the final decision-maker for a dreaming pass over a memory graph. Multiple agents have analyzed the graph and proposed changes. Your output will be parsed directly as tool calls and applied to the database.
-
-You have received proposals from: biologist, historian, economist, child, connector, skeptic, and lateral agents.
-
-Rules:
-- Dream edges are hypotheses, not facts. Set confidence no higher than 0.25. Set stability to 0.15 or lower.
-- Prefer precision over coverage. Five solid edges beat twenty speculative ones.
-- If proposals conflict, pick the most defensible or discard both.
-- If the skeptic proposed lower confidence on an existing edge, apply it.
-- You may create a higher-order fact for a shared theme: if fifteen or more edges relate to it, create a node with type="fact" and a one-sentence body, then add edges with content="summarizes" from that fact to the key nodes in the cluster.
-- Apply today's date to all edges.
-- Synthesis proposals identify higher-order facts. When you accept a synthesis proposal, forward its upsert_node AND its upsert_edge calls together — every referenced synthesis node must be declared in this same response. Keep synthesis nodes as type="synthesis" and preserve their support-based confidence. Ordinary missing edge endpoints become entity nodes automatically.
-- Prefer expire_edge when a belief was once true but is now superseded. Use delete_edge only for absorbed scaffolding; keep deletions conservative.
-- gist_edge is the default episodic→semantic path. The graph may contain episodic edges (lived experience from an exploration or task session). When several of them — same task hub, same session, or the same recurring pattern — point at one regularity, write that regularity as a NEW semantic edge and cite the episodes in supported_by. Phrase content as the *lesson* ("across three games, early queen sorties were punished by tempo loss"), never as any single episode. Requires at least two supporting episodic edges; each ref is written "source → target". {"tool":"gist_edge","args":{"source":"string","target":"string","content":"string","confidence":0.6,"supported_by":["game3-hub → move-qh5","game4-hub → move-qf3"]}}
-- Strategy from play: when the graph holds a game-definition node (node_type="game") with played move chains linked to it, derive or refine transferable strategy beliefs anchored to that game node. Use gist_edge with the supporting plies in supported_by where the lesson is induced from played moves ("develop knights before bishops", "an early queen sortie gets punished"); a plain upsert_edge onto the game node is allowed only for a lesson implied by the rules alone (e.g. before any game has been lost). Phrase strategies as portable lessons, never as one game's narration.
-- promote_edge is the special case: exactly one episodic edge is itself already the general lesson (it was reinforced, or a synthesis proposal built on it, and its content contains no episode-specific detail). If the content names a specific game, session, or move number, it is NOT promotable — gist it or leave it. Promote the generalization ("castling late repeatedly loses"), never the specific instance ("opponent played e4 in game 3"). {"tool":"promote_edge","args":{"source":"string","target":"string"}}
-
-Respond with raw JSON tool calls only. Use the standard format. These will be applied immediately."#;
-
 // Scribe continuation: keeps the scribe role and its own tool set (record_move
 // / define_task / record_rule / record_outcome + episodic upserts) — never the
 // heavy TOOL_DEFINITIONS/MEMORY_RULES, which would offer the wrong tools.
@@ -464,70 +368,6 @@ pub fn build_scribe_continue_prompt(
     push_continue_tail(&mut prompt, "Already recorded", applied);
     prompt
 }
-
-pub const DREAM_STRATEGY: &str = r#"You are the strategy consolidator for the game named in the Game section below. You have its definition, its current rules and strategies, the move chains of games actually played, and each game's recorded outcome. Your output is parsed directly as tool calls and applied to the database.
-
-Your job: derive or refine a few portable STRATEGY LESSONS anchored to the game node, learned from how these games actually went.
-
-Rules:
-- `!` means required; `?` means optional. Emit JSON, not this notation.
-- upsert_node(name!, type!="fact", body!): every NEW lesson needs its fact node declared in the same response. Rust applies valid fact declarations before their edges.
-- gist_edge(source!, target!, content!, confidence!, stability?=0.5, supported_by!:[edge-ref,...]): use for a lesson INDUCED FROM PLAYED MOVES. Cite at least two chain edges exactly as "hub → move-node", copied from below. Phrase a transferable lesson, never one game's narration.
-  Exact gist_edge JSON: {"tool":"gist_edge","args":{"source":"game-<name>","target":"kebab-lesson","content":"an early queen sortie gets punished by tempo loss","confidence":0.6,"supported_by":["task-<session> → task-<session>-ply-003","task-<session> → task-<session>-ply-005"]}}
-- upsert_edge(source!, target!, content!, stability!, confidence!, importance!, subject!, occurred_at?): use on the game node ONLY for a lesson implied by the rules alone, before any game teaches otherwise.
-  Exact upsert_edge JSON: {"tool":"upsert_edge","args":{"source":"game-<name>","target":"kebab-lesson","content":"string","stability":0.4,"confidence":0.5,"importance":0.5,"subject":false}}
-- expire_edge(source!, target!, rewritten_content!): REVISE ON EVIDENCE. Expire an existing strategy contradicted by a lost game, or rewrite it at lower confidence. Outcomes exist so a lesson that keeps losing is corrected, not preserved.
-- Never narrate a single game. Never restate a rule as a strategy. Five solid lessons beat twenty.
-- Emit at most 8 tool calls. Anchor every strategy to the game node.
-
-Respond with raw JSON tool calls only. These will be applied immediately."#;
-
-pub fn build_strategy_prompt(game_name: &str, context: &str) -> String {
-    let mut prompt = String::new();
-    prompt.push_str(DREAM_STRATEGY);
-    prompt.push_str("\n\n**Today's date: ");
-    prompt.push_str(&today_iso());
-    prompt.push_str("**\n\n");
-    prompt.push_str(JSON_OUTPUT_RULES);
-    prompt.push_str("\n\n## Game: ");
-    prompt.push_str(game_name);
-    prompt.push_str("\n\n");
-    prompt.push_str(context);
-    prompt
-}
-
-pub const SYNTHESIS_DRIFTER: &str = r#"You are the Drifter in a synthesis brainstorm. Generate surprising hypotheses from this cluster.
-
-- Seek non-obvious links across multiple edges, not restatements of a single edge.
-- Include a few bold options that might be wrong.
-- Mention distant nodes from the cluster neighborhood only when the chain is plausible.
-
-Output plain text hypotheses, concise but specific."#;
-
-pub const SYNTHESIS_ADVOCATE: &str = r#"You are the Rational Advocate in a synthesis brainstorm.
-
-- Evaluate each hypothesis strictly against the provided cluster edges.
-- Keep only claims that can be supported by multi-edge evidence.
-- Drop unsupported claims explicitly.
-
-Output plain text with supported claims and evidence."#;
-
-pub const SYNTHESIS_DEVIL: &str = r#"You are the Devil's Advocate in a synthesis brainstorm.
-
-- Attack each proposed claim for hallucination, contradiction, or trivial restatement.
-- Reject claims that just paraphrase one input edge.
-- Keep only claims that survive hard criticism.
-
-Output plain text explaining which claims survive and why."#;
-
-pub const SYNTHESIS_CHAIRMAN: &str = r#"You are the Chairman in a synthesis brainstorm.
-
-- Convert only surviving insights into JSON tool calls.
-- Propose one synthesis fact node via upsert_node and supporting upsert_edge links.
-- Optional pruning is allowed via delete_edge or expire_edge when justified.
-- Do not include anything that failed Devil's Advocate scrutiny.
-
-Respond with raw JSON tool calls only."#;
 
 pub const INGEST_EXPLANATION: &str = r#"You are the ingestor: a disciplined reader studying one document chunk at a time.
 
@@ -586,20 +426,6 @@ pub fn build_ingestion_prompt(
     prompt.push_str(graph_toon);
     prompt.push_str("\n\n## Chunk to study\n\n");
     prompt.push_str(chunk_text);
-    prompt
-}
-
-pub fn build_dream_prompt(explanation: &str, toon: &str, context: Option<&str>) -> String {
-    let mut prompt = String::new();
-    push_shared_agent_head(&mut prompt, TOOL_DEFINITIONS, true);
-    push_prompt_date(&mut prompt);
-    prompt.push_str("\n\n## Current memory graph\n\n");
-    prompt.push_str(toon);
-    push_role(&mut prompt, explanation);
-    if let Some(ctx) = context {
-        prompt.push_str("\n\n## Proposals from previous agents\n\n");
-        prompt.push_str(ctx);
-    }
     prompt
 }
 

@@ -69,7 +69,7 @@ pub fn run(
         Ok(transport) => transport,
         Err(err) => return Err(err.to_string().into()),
     };
-    // Dream and the daily report both run on the heavy seat
+    // Night maintenance and the daily report run on the heavy seat
     // (MEMORY_MODEL); only the live memory pass consults the split seats.
     let mut night = night::NightCycle::from_env(
         Arc::clone(&seats.heavy),

@@ -12,7 +12,6 @@ use super::MemoryEvent;
 use super::db;
 use super::graph::{Edge, Node, closure_nodes, closure_nodes_uncapped};
 use super::ledger;
-use super::routing;
 use super::toon_display::{self, Table};
 
 type ClosureFn = fn(&[(String, String)], &HashMap<String, Node>) -> Vec<(String, Node)>;
@@ -22,12 +21,6 @@ pub const TOP_K: usize = 60;
 pub const CHAT_INITIAL_K: usize = 15; // replay-tunable
 pub const SMALL_GRAPH_THRESHOLD: usize = 100;
 pub const MAX_POOL: usize = 150;
-pub const EXPLORATION_CANDIDATES: usize = 200;
-pub const NOVELTY_WEIGHT: f64 = 0.3;
-const SATIATION_WINDOW_DAYS: usize = 7; // replay-tunable.
-const SATIATION_WEIGHT: f64 = 0.5; // replay-tunable.
-const INTEREST_WEIGHT: f64 = 0.6; // replay-tunable.
-const INTEREST_TARGETS: usize = 5; // replay-tunable.
 const W_SIM: f64 = 0.65; // replay-tunable.
 const W_CONF: f64 = 0.2; // replay-tunable.
 const W_RECENCY: f64 = 0.15; // replay-tunable.
@@ -37,9 +30,9 @@ const W_RECENCY: f64 = 0.15; // replay-tunable.
 const EPISODIC_RANK_BONUS: f64 = 1.0; // replay-tunable.
 
 #[derive(Clone)]
-pub struct RoutedSemanticSelection {
+pub struct SemanticSelection {
     pub edges: Vec<SemanticEdge>,
-    pub routing: routing::Routing,
+    pub query_embedding: Vec<f64>,
 }
 
 #[derive(Clone)]
@@ -148,71 +141,42 @@ pub fn select_semantic_edges(embed: &dyn EmbeddingClient, query: &str) -> Vec<Se
 }
 
 // Episodic edges are visible only within their originating session; across
-// sessions they exist for decay and dream-promotion but never enter
+// sessions they exist for decay but never enter
 // retrieval. session_id is the only anti-contamination guard here — decay
 // alone is too slow to separate same-day sessions (see decay.rs).
-pub fn select_semantic_edges_routed(
+pub fn select_semantic_edges_for_chat(
     embed: &dyn EmbeddingClient,
     query: &str,
     session_id: &str,
-) -> RoutedSemanticSelection {
+) -> SemanticSelection {
     let query_embedding = match query_embedding(embed, query) {
         Some(vector) => vector,
         None => {
-            return RoutedSemanticSelection {
+            return SemanticSelection {
                 edges: chat_fallback_edges(session_id),
-                routing: routing::Routing {
-                    routing_vector: Vec::new(),
-                    expert: None,
-                    expert_score: 0.0,
-                    expert_with_direction: false,
-                },
+                query_embedding: Vec::new(),
             };
         }
     };
-    let routing = routing::route(&query_embedding);
     if db::edge_count() < SMALL_GRAPH_THRESHOLD {
-        return RoutedSemanticSelection {
+        return SemanticSelection {
             edges: chat_fallback_edges(session_id),
-            routing,
+            query_embedding,
         };
     }
-    let Some(anchors) = anchor_edges_for_vector(&routing.routing_vector, Some(session_id)) else {
-        return RoutedSemanticSelection {
+    let Some(anchors) = anchor_edges_for_vector(&query_embedding, Some(session_id)) else {
+        return SemanticSelection {
             edges: chat_fallback_edges(session_id),
-            routing,
+            query_embedding,
         };
     };
     let all_edges = all_semantic_edges(Some(session_id));
     let pool = expand_hops_pool(anchors, all_edges);
-    let edges = rank_pool_for_chat(pool, &routing.routing_vector);
-    RoutedSemanticSelection { edges, routing }
-}
-
-pub fn select_exploration_edges(
-    embed: &dyn EmbeddingClient,
-    anchor: &str,
-    agent_name: &str,
-    session_id: &str,
-) -> Vec<SemanticEdge> {
-    if db::edge_count() < SMALL_GRAPH_THRESHOLD {
-        return fallback_edges(Some(session_id));
+    let edges = rank_pool_for_chat(pool, &query_embedding);
+    SemanticSelection {
+        edges,
+        query_embedding,
     }
-    let vector = match embed_text(embed, anchor) {
-        Ok(vector) => vector,
-        Err(_) => return fallback_edges(Some(session_id)),
-    };
-    let rows = match db::query_edges_by_vector(&vector, EXPLORATION_CANDIDATES) {
-        Ok(rows) => rows,
-        Err(_) => return select_semantic_edges(embed, anchor),
-    };
-    if rows.is_empty() {
-        return select_semantic_edges(embed, anchor);
-    }
-    let candidates = scope_episodic(rows_to_semantic_edges(rows), Some(session_id));
-    let anchors = choose_exploration_anchors(candidates, agent_name);
-    let all_edges = all_semantic_edges(Some(session_id));
-    expand_hops(anchors, all_edges)
 }
 
 pub fn edges_to_toon(edges: &[SemanticEdge]) -> String {
@@ -402,7 +366,7 @@ fn all_semantic_edges(session_id: Option<&str>) -> Vec<SemanticEdge> {
     )
 }
 
-// See select_semantic_edges_routed: episodic edges from another session (or
+// See select_semantic_edges_for_chat: episodic edges from another session (or
 // with no session context at all) are dropped before ranking ever sees them.
 fn scope_episodic(edges: Vec<SemanticEdge>, session_id: Option<&str>) -> Vec<SemanticEdge> {
     let mut scoped = Vec::new();
@@ -430,28 +394,6 @@ fn chat_fallback_edges(session_id: &str) -> Vec<SemanticEdge> {
     edges
 }
 
-fn choose_exploration_anchors(
-    candidates: Vec<SemanticEdge>,
-    agent_name: &str,
-) -> Vec<SemanticEdge> {
-    if candidates.len() <= TOP_K {
-        return candidates;
-    }
-    let views = db::load_edge_actor_views("agent", agent_name);
-    let keys = edge_keys(&candidates);
-    let attention = db::load_recent_attention_counts(&keys, SATIATION_WINDOW_DAYS);
-    let interests = db::densification_targets(INTEREST_TARGETS);
-    rank_by_exploration(candidates, &views, &attention, &interests)
-}
-
-fn edge_keys(candidates: &[SemanticEdge]) -> Vec<(String, String)> {
-    let mut keys = Vec::new();
-    for edge in candidates {
-        keys.push((edge.source.clone(), edge.target.clone()));
-    }
-    keys
-}
-
 fn query_embedding(embed: &dyn EmbeddingClient, query: &str) -> Option<Vec<f64>> {
     embed_text(embed, query).ok()
 }
@@ -465,206 +407,6 @@ fn anchor_edges_for_vector(vector: &[f64], session_id: Option<&str>) -> Option<V
         return None;
     }
     Some(scope_episodic(rows_to_semantic_edges(rows), session_id))
-}
-
-// Blend per-edge novelty with endpoint exposure so an unseen edge on an
-// already-exhausted hub does not score maximum novelty.
-fn novelty_score(
-    edge: &SemanticEdge,
-    views: &HashMap<(String, String), f64>,
-    node_totals: &HashMap<String, f64>,
-) -> f64 {
-    let key = (edge.source.clone(), edge.target.clone());
-    let edge_views = *views.get(&key).unwrap_or(&0.0);
-    let source_views = *node_totals.get(&edge.source).unwrap_or(&0.0);
-    let target_views = *node_totals.get(&edge.target).unwrap_or(&0.0);
-    let endpoint_views = (source_views + target_views) / 2.0;
-    0.5 / (1.0 + edge_views) + 0.5 / (1.0 + endpoint_views)
-}
-
-fn node_view_totals(views: &HashMap<(String, String), f64>) -> HashMap<String, f64> {
-    let mut totals: HashMap<String, f64> = HashMap::new();
-    for ((source, target), count) in views {
-        *totals.entry(source.clone()).or_insert(0.0) += *count;
-        *totals.entry(target.clone()).or_insert(0.0) += *count;
-    }
-    totals
-}
-
-fn rank_by_exploration(
-    candidates: Vec<SemanticEdge>,
-    views: &HashMap<(String, String), f64>,
-    attention: &HashMap<(String, String), usize>,
-    interests: &[db::InterestTarget],
-) -> Vec<SemanticEdge> {
-    let node_totals = node_view_totals(views);
-    let mut scored = Vec::new();
-    let total = EXPLORATION_CANDIDATES as f64;
-    let mut base_top: Option<(f64, (String, String))> = None;
-    let mut unpulled_top: Option<(f64, (String, String))> = None;
-    let mut rank = 0usize;
-    while rank < candidates.len() {
-        let edge = candidates[rank].clone();
-        let semantic_pos = EXPLORATION_CANDIDATES.saturating_sub(rank) as f64 / total;
-        let novelty = novelty_score(&edge, views, &node_totals);
-        let base_score = (1.0 - NOVELTY_WEIGHT) * semantic_pos + NOVELTY_WEIGHT * novelty;
-        let key = (edge.source.clone(), edge.target.clone());
-        update_base_top(&mut base_top, base_score, &key);
-        let recent_attention = *attention.get(&key).unwrap_or(&0);
-        let satiation = satiation_factor(recent_attention);
-        update_base_top(&mut unpulled_top, base_score * satiation, &key);
-        let score = (base_score + interest_bonus(&edge, interests)) * satiation;
-        scored.push(ScoredEdge { score, edge });
-        rank += 1;
-    }
-    scored.sort_by(|left, right| right.score.total_cmp(&left.score));
-    log_attention_profile(attention);
-    log_satiation_shift(&scored, &base_top, attention);
-    log_interest_anchor(&scored, interests, &unpulled_top);
-    top_ranked_edges(scored)
-}
-
-fn interest_bonus(edge: &SemanticEdge, interests: &[db::InterestTarget]) -> f64 {
-    let Some(edge_embedding) = edge.embedding.as_deref() else {
-        return 0.0;
-    };
-    let mut bonus: f64 = 0.0;
-    for interest in interests {
-        let similarity = cosine_similarity(edge_embedding, &interest.embedding).max(0.0);
-        let density_pull = 1.0 / (1.0 + interest.density as f64);
-        bonus = bonus.max(INTEREST_WEIGHT * similarity * density_pull);
-    }
-    bonus
-}
-
-fn cosine_similarity(left: &[f64], right: &[f64]) -> f64 {
-    if left.len() != right.len() || left.is_empty() {
-        return 0.0;
-    }
-    let mut dot = 0.0;
-    let mut left_norm = 0.0;
-    let mut right_norm = 0.0;
-    let mut index = 0usize;
-    while index < left.len() {
-        dot += left[index] * right[index];
-        left_norm += left[index] * left[index];
-        right_norm += right[index] * right[index];
-        index += 1;
-    }
-    let denominator = left_norm.sqrt() * right_norm.sqrt();
-    if denominator == 0.0 {
-        return 0.0;
-    }
-    dot / denominator
-}
-
-fn log_interest_anchor(
-    scored: &[ScoredEdge],
-    interests: &[db::InterestTarget],
-    unpulled_top: &Option<(f64, (String, String))>,
-) {
-    let Some(first) = scored.first() else {
-        return;
-    };
-    if matches!(
-        unpulled_top,
-        Some((_, key)) if key.0 == first.edge.source && key.1 == first.edge.target
-    ) {
-        return;
-    }
-    let mut best: Option<(&db::InterestTarget, f64)> = None;
-    for interest in interests {
-        let bonus = interest_bonus(&first.edge, std::slice::from_ref(interest));
-        if bonus <= 0.0 {
-            continue;
-        }
-        if best.is_none_or(|(_, best_bonus)| bonus > best_bonus) {
-            best = Some((interest, bonus));
-        }
-    }
-    if let Some((interest, _)) = best {
-        runlog::log(
-            "explore",
-            &format!(
-                "interest: densifying {} (density {})",
-                interest.topic, interest.density
-            ),
-        );
-    }
-}
-
-// Always-on profile: distinguishes "attention query returned nothing" from
-// "pool uniformly saturated" when the shift log stays silent.
-fn log_attention_profile(attention: &HashMap<(String, String), usize>) {
-    let mut hit = 0usize;
-    let mut max = 0usize;
-    for count in attention.values() {
-        if *count > 0 {
-            hit += 1;
-        }
-        if *count > max {
-            max = *count;
-        }
-    }
-    runlog::log(
-        "explore",
-        &format!("satiation profile: {hit} candidates with attention, max {max}"),
-    );
-}
-
-fn satiation_factor(recent_attention: usize) -> f64 {
-    1.0 / (1.0 + SATIATION_WEIGHT * recent_attention as f64)
-}
-
-fn update_base_top(
-    base_top: &mut Option<(f64, (String, String))>,
-    score: f64,
-    key: &(String, String),
-) {
-    let replace = match base_top {
-        Some((top_score, _)) => score > *top_score,
-        None => true,
-    };
-    if replace {
-        *base_top = Some((score, key.clone()));
-    }
-}
-
-fn log_satiation_shift(
-    scored: &[ScoredEdge],
-    base_top: &Option<(f64, (String, String))>,
-    attention: &HashMap<(String, String), usize>,
-) {
-    let Some(first) = scored.first() else {
-        return;
-    };
-    let Some((_, base_key)) = base_top else {
-        return;
-    };
-    if first.edge.source == base_key.0 && first.edge.target == base_key.1 {
-        return;
-    }
-    let mut penalized = 0usize;
-    for count in attention.values() {
-        if *count > 0 {
-            penalized += 1;
-        }
-    }
-    runlog::log(
-        "explore",
-        &format!("satiation: {penalized} candidates penalized, top anchor shifted"),
-    );
-}
-
-fn top_ranked_edges(mut scored: Vec<ScoredEdge>) -> Vec<SemanticEdge> {
-    if scored.len() > TOP_K {
-        scored.truncate(TOP_K);
-    }
-    let mut edges = Vec::new();
-    for item in scored {
-        edges.push(item.edge);
-    }
-    edges
 }
 
 fn expand_hops(anchors: Vec<SemanticEdge>, all_edges: Vec<SemanticEdge>) -> Vec<SemanticEdge> {
@@ -764,13 +506,13 @@ fn rank_and_cap(mut pool: Vec<SemanticEdge>) -> Vec<SemanticEdge> {
     pool
 }
 
-fn rank_pool_for_chat(pool: Vec<SemanticEdge>, routing_vector: &[f64]) -> Vec<SemanticEdge> {
+fn rank_pool_for_chat(pool: Vec<SemanticEdge>, query_vector: &[f64]) -> Vec<SemanticEdge> {
     let mut scored = Vec::new();
     let mut index = 0usize;
     while index < pool.len() {
         let edge = pool[index].clone();
         let has_embedding = edge.embedding.is_some();
-        let score = rank_score(&edge, routing_vector);
+        let score = rank_score(&edge, query_vector);
         scored.push(ChatScoredEdge {
             has_embedding,
             score,
@@ -792,19 +534,9 @@ fn rank_pool_for_chat(pool: Vec<SemanticEdge>, routing_vector: &[f64]) -> Vec<Se
     edges
 }
 
-fn rank_score(edge: &SemanticEdge, routing_vector: &[f64]) -> f64 {
-    let sim = similarity_term(routing_vector, edge.embedding.as_deref());
+fn rank_score(edge: &SemanticEdge, query_vector: &[f64]) -> f64 {
+    let sim = similarity_term(query_vector, edge.embedding.as_deref());
     let recency = recency_term(&edge.date);
-    weighted_rank_score(edge, sim, recency)
-}
-
-pub(crate) fn replay_rank_score(
-    edge: &SemanticEdge,
-    routing_vector: &[f64],
-    reference_date: &str,
-) -> f64 {
-    let sim = similarity_term(routing_vector, edge.embedding.as_deref());
-    let recency = recency_term_at(&edge.date, reference_date);
     weighted_rank_score(edge, sim, recency)
 }
 
@@ -817,14 +549,14 @@ fn weighted_rank_score(edge: &SemanticEdge, sim: f64, recency: f64) -> f64 {
     }
 }
 
-fn similarity_term(routing_vector: &[f64], edge_embedding: Option<&[f64]>) -> f64 {
+fn similarity_term(query_vector: &[f64], edge_embedding: Option<&[f64]>) -> f64 {
     let Some(embedding) = edge_embedding else {
         return 0.0;
     };
-    if embedding.len() != routing_vector.len() {
+    if embedding.len() != query_vector.len() {
         return 0.0;
     }
-    ledger::cosine_similarity(routing_vector, embedding).unwrap_or(0.0)
+    ledger::cosine_similarity(query_vector, embedding).unwrap_or(0.0)
 }
 
 fn recency_term(date: &str) -> f64 {
@@ -853,30 +585,6 @@ fn days_since_edge_date(date: &str) -> Option<f64> {
     Some(seconds as f64 / 86_400.0)
 }
 
-fn recency_term_at(date: &str, reference_date: &str) -> f64 {
-    let Some(edge_epoch) = date_epoch(date) else {
-        return 0.0;
-    };
-    let Some(reference_epoch) = date_epoch(reference_date) else {
-        return 0.0;
-    };
-    let seconds = reference_epoch.saturating_sub(edge_epoch);
-    if seconds <= 0 {
-        return 1.0;
-    }
-    1.0 / (1.0 + seconds as f64 / 86_400.0)
-}
-
-fn date_epoch(date: &str) -> Option<i64> {
-    let trimmed = date.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if trimmed.contains('T') {
-        return timeutil::timestamp_to_epoch_seconds(trimmed);
-    }
-    timeutil::timestamp_to_epoch_seconds(&format!("{trimmed}T00:00:00"))
-}
 
 fn chat_rank_cmp(left: &ChatScoredEdge, right: &ChatScoredEdge) -> std::cmp::Ordering {
     if left.has_embedding != right.has_embedding {
@@ -889,11 +597,6 @@ fn chat_rank_cmp(left: &ChatScoredEdge, right: &ChatScoredEdge) -> std::cmp::Ord
         .score
         .total_cmp(&left.score)
         .then_with(|| left.original_index.cmp(&right.original_index))
-}
-
-struct ScoredEdge {
-    score: f64,
-    edge: SemanticEdge,
 }
 
 struct ChatScoredEdge {

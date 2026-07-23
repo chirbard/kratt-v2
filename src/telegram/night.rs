@@ -1,8 +1,5 @@
-// The daemon's night cycle: a dream window during quiet hours, not a general
-// autonomous mode. Inside the window, after an idle poll, the daemon may run
-// one scheduler cycle inline on the poll thread — a message arriving mid-dream
-// waits in Telegram's queue and is answered when the pass finishes. That is
-// acceptable at 3-6am by construction; that is what the window is for.
+// The daemon's night cycle runs autonomous maintenance during quiet hours.
+// After an idle poll, it may run one scheduler cycle inline on the poll thread.
 
 use std::error::Error;
 use std::sync::Arc;
@@ -11,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::api::{EmbeddingClient, LlmClient};
 use crate::memory::scheduler::{self, SchedulerAction};
-use crate::memory::{self, DreamEvent, IngestEvent};
+use crate::memory::{self, IngestEvent};
 use crate::runlog;
 use crate::timeutil;
 use crate::web::SearchClient;
@@ -20,8 +17,7 @@ use crate::web::SearchClient;
 const NIGHT_ACTION_COOLDOWN: Duration = Duration::from_secs(20 * 60);
 // replay-tunable.
 const MAX_NIGHT_ACTIONS: usize = 3;
-const MAX_DREAM_ATTEMPTS: usize = 2; // replay-tunable.
-const DEFAULT_DREAM_HOURS: &str = "3-6";
+const DEFAULT_NIGHT_HOURS: &str = "3-6";
 
 struct PassExecution {
     outcome: &'static str,
@@ -54,10 +50,6 @@ impl PassExecution {
         }
     }
 
-    fn succeeded(&self) -> bool {
-        self.outcome == "ok"
-    }
-
     fn completed(&self) -> bool {
         self.outcome != "failed"
     }
@@ -67,12 +59,12 @@ impl PassExecution {
 // like every date in the app), end exclusive. A wrapping range like `23-5`
 // means 23,0,1,2,3,4 are inside.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct DreamWindow {
+pub struct NightWindow {
     start: u32,
     end: u32,
 }
 
-impl DreamWindow {
+impl NightWindow {
     fn parse(raw: &str) -> Result<Self, String> {
         let (start_raw, end_raw) = match raw.split_once('-') {
             Some(parts) => parts,
@@ -115,7 +107,7 @@ fn parse_hour(raw: &str) -> Result<u32, String> {
 // Pure window/cooldown/cap gate: no clients, no IO — tests inject the hour,
 // the day, and the current instant.
 struct NightGate {
-    window: DreamWindow,
+    window: NightWindow,
     cooldown: Duration,
     max_actions: usize,
     last_action: Option<Instant>,
@@ -128,15 +120,12 @@ struct NightGate {
     // If a second write path is ever added, its author must set the flag (or
     // revert to periodic checks) — correctness depends on single-writer.
     dirty: bool,
-    dreamed_tonight: bool,
-    dream_attempts: usize,
-    dream_skip_recorded: bool,
     studied_inbox_tonight: bool,
     scanned_news_today: bool,
 }
 
 impl NightGate {
-    fn new(window: DreamWindow, cooldown: Duration, max_actions: usize) -> Self {
+    fn new(window: NightWindow, cooldown: Duration, max_actions: usize) -> Self {
         Self {
             window,
             cooldown,
@@ -145,25 +134,18 @@ impl NightGate {
             count: 0,
             night_day: None,
             dirty: true,
-            dreamed_tonight: false,
-            dream_attempts: 0,
-            dream_skip_recorded: false,
             studied_inbox_tonight: false,
             scanned_news_today: false,
         }
     }
 
     // May a scheduler evaluation run right now? Re-entering the window on a
-    // new day resets the per-night action count and the nightly-dream flag,
-    // and marks state dirty (the day-derived inputs just changed).
+    // new day resets per-night state and marks inputs dirty.
     fn should_evaluate(&mut self, hour: u32, today: &str, now: Instant) -> bool {
         let inside = self.window.contains(hour);
         if inside && self.night_day.as_deref() != Some(today) {
             self.night_day = Some(today.to_string());
             self.count = 0;
-            self.dreamed_tonight = false;
-            self.dream_attempts = 0;
-            self.dream_skip_recorded = false;
             self.studied_inbox_tonight = false;
             self.scanned_news_today = false;
             self.dirty = true;
@@ -182,16 +164,6 @@ impl NightGate {
     fn record_action(&mut self, now: Instant) {
         self.count += 1;
         self.last_action = Some(now);
-    }
-
-    fn can_attempt_dream(&self) -> bool {
-        !self.dreamed_tonight && self.dream_attempts < MAX_DREAM_ATTEMPTS
-    }
-
-    fn record_dream(&mut self, now: Instant, succeeded: bool) {
-        self.dream_attempts += 1;
-        self.dreamed_tonight = succeeded || self.dream_attempts >= MAX_DREAM_ATTEMPTS;
-        self.record_action(now);
     }
 
     // A skipped action consumes the cooldown so
@@ -220,11 +192,11 @@ impl NightCycle {
         embed: Arc<dyn EmbeddingClient>,
         search: Option<Arc<dyn SearchClient>>,
     ) -> Result<Self, Box<dyn Error>> {
-        let raw = std::env::var("KRATT_DREAM_HOURS").unwrap_or_else(|_| DEFAULT_DREAM_HOURS.into());
-        let window = DreamWindow::parse(&raw)?;
+        let raw = std::env::var("KRATT_DREAM_HOURS").unwrap_or_else(|_| DEFAULT_NIGHT_HOURS.into());
+        let window = NightWindow::parse(&raw)?;
         runlog::log(
             "tg",
-            &format!("dream window {}-{}", window.start, window.end),
+            &format!("night window {}-{}", window.start, window.end),
         );
         let gate = NightGate::new(window, NIGHT_ACTION_COOLDOWN, MAX_NIGHT_ACTIONS);
         Ok(Self {
@@ -246,9 +218,6 @@ impl NightCycle {
         if !self.gate.should_evaluate(hour, &today, now) {
             return;
         }
-        if self.try_guaranteed_dream(now) {
-            return;
-        }
         self.run_scheduler_cycle(now);
     }
 
@@ -256,30 +225,6 @@ impl NightCycle {
     // differ now, so the next idle poll inside the window re-evaluates.
     pub fn mark_dirty(&mut self) {
         self.gate.dirty = true;
-    }
-
-    // The nightly-dream guarantee: a brain dreams every night that anything
-    // happened, regardless of debt thresholds. Once per night, if any
-    // experience postdates the last dream, dream — bypassing decide().
-    fn try_guaranteed_dream(&mut self, now: Instant) -> bool {
-        if !self.gate.can_attempt_dream() {
-            return false;
-        }
-        if !scheduler::has_unconsolidated_experience() {
-            if !self.gate.dream_skip_recorded {
-                self.record_skipped_pass("dream", "no_material");
-                self.gate.dream_skip_recorded = true;
-            }
-            return false;
-        }
-        let reason = "nightly guarantee: unconsolidated experience";
-        scheduler::log_scheduler_decision(&SchedulerAction::Dream {
-            reason: reason.to_string(),
-        });
-        runlog::log("tg", &format!("night action: dream ({reason})"));
-        let result = self.run_dream();
-        self.record_dream_result(now, &result);
-        true
     }
 
     fn run_scheduler_cycle(&mut self, now: Instant) {
@@ -300,9 +245,6 @@ impl NightCycle {
 
     fn dispatch(&mut self, action: SchedulerAction, now: Instant) {
         match action {
-            SchedulerAction::Dream { reason } => {
-                self.dispatch_dream(&reason, now);
-            }
             SchedulerAction::NewsScan { reason } => self.dispatch_news_scan(&reason, now),
             SchedulerAction::InboxStudy { reason } => {
                 runlog::log("tg", &format!("night action: inbox study ({reason})"));
@@ -328,42 +270,11 @@ impl NightCycle {
         }
     }
 
-    fn dispatch_dream(&mut self, reason: &str, now: Instant) {
-        runlog::log("tg", &format!("night action: dream ({reason})"));
-        if !self.gate.can_attempt_dream() {
-            self.record_skipped_pass("dream", "not_eligible");
-            self.gate.record_skipped(now);
-            return;
-        }
-        let result = self.run_dream();
-        self.record_dream_result(now, &result);
-    }
-
     fn dispatch_news_scan(&mut self, reason: &str, now: Instant) {
         runlog::log("tg", &format!("night action: news scan ({reason})"));
         let result = self.run_news_scan();
         self.gate.scanned_news_today = result.completed();
         self.gate.record_action(now);
-    }
-
-    // Inline drain, same pattern as run_memory_to_completion: the pass drops
-    // its sender on return, so draining the receiver runs to completion.
-    fn run_dream(&self) -> PassExecution {
-        let run_id = self.start_pass("dream");
-        let (sender, receiver) = std::sync::mpsc::channel::<DreamEvent>();
-        let llm = Arc::clone(&self.memory_llm);
-        let embed = Arc::clone(&self.embed);
-        let result = memory::run_dream_pass(llm, embed, sender);
-        for _event in receiver {}
-        let execution = match result {
-            Ok(edges_added) => PassExecution::ok(edges_added),
-            Err(err) => {
-                runlog::log("tg", &format!("night dream failed: {err}"));
-                PassExecution::failed(classify_pass_error(&err.to_string()))
-            }
-        };
-        self.finish_pass(run_id, "dream", &execution);
-        execution
     }
 
     fn run_news_scan(&self) -> PassExecution {
@@ -431,21 +342,6 @@ impl NightCycle {
         };
         self.finish_pass(run_id, "ingestion", &execution);
         execution
-    }
-
-    fn record_dream_result(&mut self, now: Instant, result: &PassExecution) {
-        self.gate.record_dream(now, result.succeeded());
-        if result.succeeded() {
-            return;
-        }
-        if self.gate.can_attempt_dream() {
-            runlog::log(
-                "tg",
-                "night dream retry permitted after the normal action cooldown",
-            );
-        } else {
-            runlog::log("tg", "night dream retry cap reached");
-        }
     }
 
     fn start_pass(&self, pass_type: &str) -> Option<i64> {

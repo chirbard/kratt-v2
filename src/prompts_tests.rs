@@ -8,10 +8,10 @@
 
     use super::{
         AgentPrompt, CHAT_SYSTEM_PROMPT, CONSOLIDATE_EXPLANATION, CONTINUE_PASS, DAILY_REPORT,
-        DREAM_BIOLOGIST, EXTRACT_EXPLANATION, JSON_OUTPUT_RULES, MEMORY_RULES,
-        SCRIBE_EXPLANATION, SCRIBE_TOOL_DEFINITIONS, TOOL_DEFINITIONS, build_agent_prompt,
-        build_chat_system_prompt, build_classify_prompt, build_continue_prompt, build_dream_prompt,
-        build_scribe_continue_prompt, build_scribe_prompt,
+        EXTRACT_EXPLANATION, JSON_OUTPUT_RULES, MEMORY_RULES, SCRIBE_EXPLANATION,
+        SCRIBE_TOOL_DEFINITIONS, TOOL_DEFINITIONS, build_agent_prompt, build_chat_system_prompt,
+        build_classify_prompt, build_continue_prompt, build_scribe_continue_prompt,
+        build_scribe_prompt,
     };
 
     const INJECTED_HEADING: &str = "## Beliefs injected into this turn";
@@ -92,22 +92,6 @@
     }
 
     #[test]
-    fn dream_prompt_orders_shared_graph_before_role_and_context() {
-        let prompt = build_dream_prompt(DREAM_BIOLOGIST, "shared toon", Some("prior proposals"));
-        assert!(
-            position(&prompt, JSON_OUTPUT_RULES) < position(&prompt, "## Current memory graph")
-        );
-        assert!(
-            position(&prompt, "## Current memory graph")
-                < position(&prompt, "\n\n## Your role\n\n")
-        );
-        assert!(
-            position(&prompt, "\n\n## Your role\n\n")
-                < position(&prompt, "## Proposals from previous agents")
-        );
-    }
-
-    #[test]
     fn scribe_and_classifier_put_role_after_the_shared_framing() {
         let scribe = build_scribe_prompt("user", "assistant");
         assert!(position(&scribe, JSON_OUTPUT_RULES) < position(&scribe, "\n\n## Your role\n\n"));
@@ -185,13 +169,11 @@
         let with = build_chat_system_prompt(
             "",
             &[],
-            Some(
-                "Internal state: 30 unconsolidated experience events since the last dream (a dream is forced at 50).",
-            ),
+            Some("Internal state: queued study items not yet read: paper.md."),
             None,
             None,
         );
-        assert!(with.contains("Internal state: 30 unconsolidated"));
+        assert!(with.contains("Internal state: queued study items"));
         let without = build_chat_system_prompt("", &[], None, None, None);
         assert!(!without.contains("Internal state:"));
     }

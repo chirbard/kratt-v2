@@ -3,9 +3,8 @@ use super::super::{
     test_support::{EVENTS_DDL, NODES_DDL, harness},
 };
 use super::{
-    insert_interest, interest_density_with, load_all_edges_semantic_async, load_due_loops_async,
-    load_loops_for_anchors, load_recent_attention_counts_async, load_unembedded_edges_async,
-    top_interests_with,
+    insert_interest, load_all_edges_semantic_async, load_due_loops_async, load_loops_for_anchors,
+    load_unembedded_edges_async, top_interests_with,
 };
 use turso::{Connection, params};
 
@@ -49,26 +48,9 @@ fn top_interests_unifies_registered_and_derived_regions_and_caps() {
     assert_eq!(capped[0].topic, "rust");
 }
 
-#[test]
-fn interest_density_counts_live_embedding_neighbours() {
-    let conn = block_on(harness());
-    block_on(async {
-        let _ = conn.execute(NODES_DDL, ()).await;
-        let _ = conn.execute("INSERT INTO edges (source, target, embedding) VALUES ('a', 'b', vector32('[1.0,0.0]')), ('c', 'd', vector32('[0.0,1.0]'))", ()).await;
-    });
-    let density = block_on(interest_density_with(&conn, &[1.0, 0.0], 0.1)).unwrap_or(0);
-    assert_eq!(density, 1);
-}
-
 async fn loop_harness() -> Connection {
     let conn = harness().await;
     let _ = conn.execute(NODES_DDL, ()).await;
-    conn
-}
-
-async fn policy_harness() -> Connection {
-    let conn = harness().await;
-    let _ = conn.execute(EVENTS_DDL, ()).await;
     conn
 }
 
@@ -290,28 +272,4 @@ fn ordinary_retrieval_excludes_loop_anchor_edges() {
     let semantic = block_on(load_all_edges_semantic_async(&conn));
     assert_eq!(semantic.len(), 1);
     assert_eq!(semantic[0].0, "ordinary");
-}
-
-#[test]
-fn recent_attention_counts_only_candidate_events_inside_window() {
-    let conn = block_on(policy_harness());
-    block_on(async {
-        let _ = conn
-            .execute(
-                "INSERT INTO events (ts, event_type, source, target) VALUES
-                     (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'reinforced', 'a', 'b'),
-                     (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'marked', 'a', 'b'),
-                     (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'retrieved', 'a', 'b'),
-                     (strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-8 days'), 'reinforced', 'a', 'b'),
-                     (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'marked', 'other', 'edge')",
-                (),
-            )
-            .await;
-    });
-    let candidates = vec![("a".to_string(), "b".to_string())];
-    let Ok(counts) = block_on(load_recent_attention_counts_async(&conn, &candidates, 7)) else {
-        unreachable!("attention counts load")
-    };
-    assert_eq!(counts.get(&("a".to_string(), "b".to_string())), Some(&2));
-    assert_eq!(counts.len(), 1);
 }

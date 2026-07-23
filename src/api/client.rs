@@ -255,15 +255,6 @@ fn request_area(messages: &[Value]) -> &'static str {
             return "chat";
         }
     }
-    for message in messages {
-        let content = match message.get("content") {
-            Some(value) => value.as_str().unwrap_or(""),
-            None => "",
-        };
-        if content.contains("## Current memory graph") {
-            return "dream";
-        }
-    }
     "mem"
 }
 

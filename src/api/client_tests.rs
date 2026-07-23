@@ -77,17 +77,12 @@
     }
 
     #[test]
-    fn request_area_distinguishes_chat_memory_and_dream_calls() {
+    fn request_area_distinguishes_chat_and_memory_calls() {
         let chat = vec![
             json!({"role": "system", "content": "chat rules"}),
             json!({"role": "user", "content": "hello"}),
         ];
         let memory = vec![json!({"role": "user", "content": "## Your role\nextract"})];
-        let dream = vec![json!({
-            "role": "user",
-            "content": "## Current memory graph\nnodes: []"
-        })];
         assert_eq!(request_area(&chat), "chat");
         assert_eq!(request_area(&memory), "mem");
-        assert_eq!(request_area(&dream), "dream");
     }

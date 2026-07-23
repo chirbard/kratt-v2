@@ -2,7 +2,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use std::path::PathBuf;
 
-use super::app::{self, App, DreamState, IngestState, MemoryState, Mode, State};
+use super::app::{self, App, IngestState, MemoryState, Mode, State};
 use super::stream::start_stream;
 
 pub(crate) fn handle_key(key: KeyEvent, app: &mut App) -> bool {
@@ -16,10 +16,9 @@ fn handle_insert_key(key: KeyEvent, app: &mut App) -> bool {
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
         KeyCode::Esc => app.mode = Mode::Normal,
-        // Chat and ingestion both require no running background pass: dream
-        // and ingest hold transactions open across LLM calls, and a
-        // concurrent chat turn's memory writes abort them (turso allows only
-        // one writer; a second commit kills the open transaction).
+        // Chat and ingestion both require no running ingestion pass: it holds
+        // a transaction open across LLM calls, and concurrent chat memory
+        // writes abort it (turso allows only one writer).
         KeyCode::Enter if app.state == State::Idle && !app.input.is_empty() => {
             let path = ingest_command_path(&app.input);
             if let Some(path) = path {
@@ -55,7 +54,6 @@ fn handle_normal_key(key: KeyEvent, app: &mut App) -> bool {
         KeyCode::Char('t') => app.show_tools = !app.show_tools,
         KeyCode::Char('a') => app.show_attribution = !app.show_attribution,
         KeyCode::Char('P') if maintenance_allowed(app) => app::start_recompute_positions(app),
-        KeyCode::Char('D') if maintenance_allowed(app) => app::start_dream(app),
         KeyCode::Char('S') if maintenance_allowed(app) => app::start_sync(app),
         KeyCode::Char('A') => toggle_autonomous_mode(app),
         _ => {}
@@ -68,18 +66,16 @@ fn toggle_autonomous_mode(app: &mut App) {
     app::reset_scheduler_idle(app);
 }
 
-// Background maintenance actions (recompute, dream, sync) are
-// mutually exclusive and must not run during streaming or memory updates.
+// Background maintenance actions are mutually exclusive with ingestion and
+// must not run during streaming or memory updates.
 fn maintenance_allowed(app: &App) -> bool {
     app.state == State::Idle
         && app.memory_state == MemoryState::Idle
-        && app.dream_state != DreamState::Running
         && app.ingest_state != IngestState::Running
 }
 
 fn background_passes_idle(app: &App) -> bool {
-    app.dream_state != DreamState::Running
-        && app.ingest_state != IngestState::Running
+    app.ingest_state != IngestState::Running
 }
 
 fn ingest_command_path(input: &str) -> Option<&str> {

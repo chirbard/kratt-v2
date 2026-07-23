@@ -45,7 +45,6 @@ pub const PROVENANCE_INFERRED: &str = "inferred";
 pub const PROVENANCE_SYNTHESIZED: &str = "synthesized";
 pub const PROVENANCE_LEGACY: &str = "legacy";
 pub const INFERENCE_DISCOUNT: f64 = 0.9; // replay-tunable.
-pub const SYNTHESIS_DISCOUNT: f64 = 0.9; // replay-tunable.
 pub const CLOSURE_NODE_CAP: usize = 40; // replay-tunable.
 
 pub fn node_type_is_loop(node_type: &str) -> bool {
@@ -94,16 +93,6 @@ pub fn inferred_ceiling(confidences: &[f64]) -> Option<f64> {
     }
     Some(round_ceiling(
         (minimum * INFERENCE_DISCOUNT).max(provenance_ceiling(PROVENANCE_DREAMED)),
-    ))
-}
-
-pub fn synthesized_ceiling(confidences: &[f64]) -> Option<f64> {
-    if confidences.is_empty() {
-        return None;
-    }
-    let mean = confidences.iter().sum::<f64>() / confidences.len() as f64;
-    Some(round_ceiling(
-        (mean * SYNTHESIS_DISCOUNT).max(provenance_ceiling(PROVENANCE_DREAMED)),
     ))
 }
 
@@ -272,10 +261,6 @@ pub fn load_from_toon() -> Graph {
     graph
 }
 
-pub(crate) fn round2(value: f64) -> f64 {
-    (value * 100.0).round() / 100.0
-}
-
 pub fn node_carries_value(node: &Node) -> bool {
     node.node_type != "entity" || !node.body.trim().is_empty()
 }
@@ -343,48 +328,6 @@ fn collect_closure_node(node_id: &str, nodes: &HashMap<String, Node>, state: &mu
     if state.limit.is_none_or(|cap| state.selected.len() < cap) {
         state.selected.push((node_id.to_string(), node.clone()));
     }
-}
-
-#[cfg(test)]
-pub fn graph_to_json(graph: &Graph) -> serde_json::Value {
-    let mut node_names: Vec<&String> = graph.nodes.keys().collect();
-    node_names.sort();
-    let mut nodes_json = Vec::new();
-    for node_name in node_names {
-        let Some(node) = graph.nodes.get(node_name) else {
-            continue;
-        };
-        if !node_carries_value(node) {
-            continue;
-        }
-        nodes_json.push(serde_json::json!({
-            "body": node.body,
-            "date": node.date,
-            "id": node_name,
-            "type": node.node_type,
-        }));
-    }
-    let mut edges_json = Vec::new();
-    for edge in &graph.edges {
-        edges_json.push(serde_json::json!({
-            "confidence": round2(edge.confidence),
-            "content": edge.content,
-            "date": edge.date,
-            "expired_at": edge.expired_at,
-            "occurred_at": edge.occurred_at,
-            "importance": round2(edge.importance),
-            "provenance": edge.provenance,
-            "ceiling": edge.ceiling,
-            "source": edge.source,
-            "stability": round2(edge.stability),
-            "subject": edge.subject,
-            "target": edge.target,
-        }));
-    }
-    serde_json::json!({
-        "nodes": nodes_json,
-        "edges": edges_json,
-    })
 }
 
 #[cfg(test)]

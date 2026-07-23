@@ -215,7 +215,7 @@ fn execute_ingestion_pass(
     send_log(
         sender,
         "ingest",
-        "pass complete — dream required".to_string(),
+        "pass complete".to_string(),
     );
     let _ = sender.send(IngestEvent::Done {
         chunks_processed: chunks.len(),

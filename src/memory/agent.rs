@@ -111,7 +111,6 @@ pub(crate) enum ToolCall {
         name: String,
         node_type: String,
         body: String,
-        date: String,
     },
     UpsertEdge {
         source: String,
@@ -121,7 +120,6 @@ pub(crate) enum ToolCall {
         confidence: f64,
         importance: f64,
         subject: bool,
-        date: String,
         occurred_at: Option<String>,
         // None means the caller did not specify memory_type — the writer's
         // default (ApplyToolOptions::default_memory_type) applies.
@@ -140,22 +138,6 @@ pub(crate) enum ToolCall {
         target: String,
         rewritten_content: String,
     },
-    PromoteEdge {
-        source: String,
-        target: String,
-    },
-    // Lossy consolidation: a new semantic generalization induced from several
-    // episodic edges. supported_by holds the (source, target) refs of those
-    // episodes, already normalized. Dream-side only — the chat apply path
-    // denies it.
-    GistEdge {
-        source: String,
-        target: String,
-        content: String,
-        confidence: f64,
-        stability: f64,
-        supported_by: Vec<(String, String)>,
-    },
     // Scribe-only: the model supplies only the move text and whose move it was;
     // code derives the task hub, ply number, and move-node id (apply_record_move).
     // Denied on every non-scribe apply path.
@@ -170,7 +152,7 @@ pub(crate) enum ToolCall {
         description: String,
     },
     // Scribe or heavy: anchor a stated rule of the current game as durable
-    // knowledge on the game-definition node. Dream denies it.
+    // knowledge on the game-definition node.
     RecordRule {
         rule: String,
     },
@@ -260,8 +242,6 @@ pub(crate) fn describe_tool_call(call: &ToolCall) -> String {
         ToolCall::DeleteNode { name } => format!("delete_node {name}"),
         ToolCall::DeleteEdge { source, target } => format!("delete_edge {source} → {target}"),
         ToolCall::ExpireEdge { source, target, .. } => format!("expire_edge {source} → {target}"),
-        ToolCall::PromoteEdge { source, target } => format!("promote_edge {source} → {target}"),
-        ToolCall::GistEdge { source, target, .. } => format!("gist_edge {source} → {target}"),
         ToolCall::RecordMove { move_text, actor } => format!("record_move {move_text} ({actor})"),
         ToolCall::DefineTask { name, .. } => format!("define_task {name}"),
         ToolCall::RecordRule { rule } => format!("record_rule {rule}"),
@@ -828,8 +808,6 @@ fn known_tool_name(name: &str) -> bool {
             | "delete_node"
             | "delete_edge"
             | "expire_edge"
-            | "promote_edge"
-            | "gist_edge"
             | "record_move"
             | "define_task"
             | "record_rule"
@@ -935,8 +913,6 @@ fn parse_single_tool(obj: &serde_json::Value) -> Option<ToolCall> {
         "delete_node" => parse_delete_node(args),
         "delete_edge" => parse_delete_edge(args),
         "expire_edge" => parse_expire_edge(args),
-        "promote_edge" => parse_promote_edge(args),
-        "gist_edge" => parse_gist_edge(args),
         "record_move" => parse_record_move(args),
         "define_task" => parse_define_task(args),
         "record_rule" => parse_record_rule(args),
@@ -971,7 +947,6 @@ pub(crate) fn parse_tool_call_request(call: &ToolCallRequest) -> Option<ToolCall
         "delete_node" => parse_delete_node(&args),
         "delete_edge" => parse_delete_edge(&args),
         "expire_edge" => parse_expire_edge(&args),
-        "promote_edge" => parse_promote_edge(&args),
         "inbox_add" => parse_inbox_add(&args),
         "record_reaction" => parse_record_reaction(&args),
         "register_interest" => parse_register_interest(&args),
@@ -1092,7 +1067,6 @@ fn parse_upsert_node(args: &serde_json::Value) -> Option<ToolCall> {
         name,
         node_type,
         body: json_str(args, "body"),
-        date: json_str(args, "date"),
     })
 }
 
@@ -1102,14 +1076,6 @@ fn parse_upsert_edge(args: &serde_json::Value) -> Option<ToolCall> {
     if source.is_empty() || target.is_empty() {
         return None;
     }
-    let date = {
-        let date_val = json_str(args, "date");
-        if date_val.is_empty() {
-            json_str(args, "reinforced_at")
-        } else {
-            date_val
-        }
-    };
     let occurred_at = json_str(args, "occurred_at");
     Some(ToolCall::UpsertEdge {
         source,
@@ -1119,7 +1085,6 @@ fn parse_upsert_edge(args: &serde_json::Value) -> Option<ToolCall> {
         confidence: json_f64(args, "confidence"),
         importance: json_f64(args, "importance"),
         subject: json_bool(args, "subject"),
-        date,
         occurred_at: if occurred_at.trim().is_empty() {
             None
         } else {
@@ -1127,47 +1092,6 @@ fn parse_upsert_edge(args: &serde_json::Value) -> Option<ToolCall> {
         },
         memory_type: json_opt_str(args, "memory_type"),
         inferred_from: parse_optional_edge_refs(args, "inferred_from"),
-    })
-}
-
-fn parse_promote_edge(args: &serde_json::Value) -> Option<ToolCall> {
-    let source = json_str(args, "source");
-    let target = json_str(args, "target");
-    if source.is_empty() || target.is_empty() {
-        return None;
-    }
-    Some(ToolCall::PromoteEdge { source, target })
-}
-
-// supported_by is mandatory and must be an array — a gist without provenance
-// is a dream hypothesis, not a consolidation, so a missing/malformed field
-// rejects the whole call rather than degrading it silently.
-fn parse_gist_edge(args: &serde_json::Value) -> Option<ToolCall> {
-    let source = json_str(args, "source");
-    let target = json_str(args, "target");
-    if source.is_empty() || target.is_empty() {
-        return None;
-    }
-    let refs = args.get("supported_by")?.as_array()?;
-    let mut supported_by = Vec::new();
-    for value in refs {
-        if let Some(text) = value.as_str()
-            && let Some(edge_ref) = parse_support_ref(text)
-        {
-            supported_by.push(edge_ref);
-        }
-    }
-    let stability = match args.get("stability") {
-        Some(value) => value.as_f64().unwrap_or(0.5),
-        None => 0.5,
-    };
-    Some(ToolCall::GistEdge {
-        source,
-        target,
-        content: json_str(args, "content"),
-        confidence: json_f64(args, "confidence"),
-        stability,
-        supported_by,
     })
 }
 
@@ -1733,9 +1657,9 @@ pub(crate) fn apply_tool_call<'scope>(
         return Ok("mutation denied: loop lifecycle requires open_loop or close_loop".to_string());
     }
     match call {
-        ToolCall::UpsertNode { name, node_type, body, date: _ } =>
+        ToolCall::UpsertNode { name, node_type, body } =>
             apply_declared_upsert_node(conn, name, node_type, body),
-        ToolCall::UpsertEdge { source, target, content, stability, confidence, importance, subject, date: _, occurred_at, memory_type, inferred_from } =>
+        ToolCall::UpsertEdge { source, target, content, stability, confidence, importance, subject, occurred_at, memory_type, inferred_from } =>
             apply_upsert_edge_call(conn, options, events, UpsertEdgeCall { source, target, content, stability, confidence, importance, subject, occurred_at, memory_type, inferred_from }),
         ToolCall::DeleteNode { name } =>
             apply_delete_node(conn, name, options, events),
@@ -1743,10 +1667,6 @@ pub(crate) fn apply_tool_call<'scope>(
             apply_delete_edge(conn, EdgeRef::new(&source, &target), options, events),
         ToolCall::ExpireEdge { source, target, rewritten_content } =>
             apply_expire_edge(conn, ExpireEdgeCall { source, target, rewritten_content }, options, events),
-        ToolCall::PromoteEdge { source, target } =>
-            apply_promote_edge(conn, EdgeRef::new(&source, &target), options.actor.clone(), options.context.clone(), events),
-        ToolCall::GistEdge { .. } =>
-            Ok("gist_edge denied: gist_edge is a dreaming tool".to_string()),
         ToolCall::RecordMove { move_text, actor } =>
             apply_record_move_call(conn, options, events, RecordMoveCall { move_text, actor }),
         ToolCall::DefineTask { name, description } =>
@@ -2153,9 +2073,7 @@ pub(super) fn tool_call_touches_loop(
         ToolCall::DeleteNode { name } => node_or_neighbor_is_loop(conn, name),
         ToolCall::UpsertEdge { source, target, .. }
         | ToolCall::DeleteEdge { source, target }
-        | ToolCall::ExpireEdge { source, target, .. }
-        | ToolCall::PromoteEdge { source, target }
-        | ToolCall::GistEdge { source, target, .. } => edge_touches_loop(conn, source, target),
+        | ToolCall::ExpireEdge { source, target, .. } => edge_touches_loop(conn, source, target),
         ToolCall::RecordMove { .. }
         | ToolCall::DefineTask { .. }
         | ToolCall::RecordRule { .. }
@@ -2691,43 +2609,6 @@ fn edge_is_pinned_in_db(
         None => "",
     };
     Ok(edge_is_pinned(edge, source_type))
-}
-
-// Dreaming's promotion path: an episodic edge that kept being reinforced or
-// that synthesis built on becomes a durable belief. Flips memory_type,
-// clears origin_session (it is no longer session-scoped), and refreshes
-// date so semantic decay restarts from the promotion point. Reused by both
-// the chat/explore/ingest tool-call path and dream's consolidation agent.
-pub(crate) fn apply_promote_edge(
-    conn: &Connection,
-    edge_ref: EdgeRef,
-    actor: Actor,
-    context: EventContext,
-    events: &mut Vec<Event>,
-) -> Result<String, Box<dyn Error + Send + Sync>> {
-    let EdgeRef { source, target } = edge_ref;
-    let normalized_source = normalize_id(&source);
-    let normalized_target = normalize_id(&target);
-    let Some(mut edge) = db::load_edge(conn, &normalized_source, &normalized_target)? else {
-        return Ok(format!(
-            "promote_edge skipped: {source} → {target} (not found)"
-        ));
-    };
-    edge.memory_type = "semantic".to_string();
-    edge.origin_session = String::new();
-    edge.date = crate::prompts::today_iso();
-    db::write_edge(conn, &edge, "")?;
-    events.push(Event::updated(
-        actor,
-        EdgeRef::new(&edge.source, &edge.target),
-        context,
-        serde_json::json!({"promoted_from": "episodic"}).to_string(),
-    ));
-    runlog::log(
-        "mem",
-        &format!("promoted {} → {} to semantic", edge.source, edge.target),
-    );
-    Ok(format!("promote_edge: {} → {}", edge.source, edge.target))
 }
 
 fn apply_delete_node<'scope>(

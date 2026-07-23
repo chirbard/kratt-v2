@@ -1,13 +1,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use turso::{Connection, Value};
+use turso::Connection;
 
 use super::db;
 use super::ledger;
 
-// replay-tunable.
-const ACQUISITION_DEBT_THRESHOLD: usize = 50;
 // replay-tunable.
 const RE_READ_NOTE_THRESHOLD: usize = 3;
 // replay-tunable.
@@ -16,7 +14,6 @@ const DRIFT_WARN_DISTANCE: f64 = 0.10;
 /// Action that the scheduler decides to take
 #[derive(Debug, Clone, PartialEq)]
 pub enum SchedulerAction {
-    Dream { reason: String },
     NewsScan { reason: String },
     InboxStudy { reason: String },
     Ingest { path: PathBuf, reason: String },
@@ -26,7 +23,6 @@ pub enum SchedulerAction {
 /// Input data for the decision function (pure, testable)
 #[derive(Debug, Clone, Default)]
 pub struct SchedulerInputs {
-    pub acquisition_debt: usize,
     pub queued_inbox: usize,
     pub re_read_candidates: Vec<(String, usize, String)>, // (path, note_count, source_node_id)
     pub actor_positions: Vec<(String, String, Option<Vec<f64>>)>, // (actor_type, actor_id, position)
@@ -43,13 +39,11 @@ pub fn gather_inputs() -> SchedulerInputs {
 }
 
 async fn gather_inputs_async(conn: &Connection) -> SchedulerInputs {
-    let acquisition_debt = count_acquisition_debt(conn).await;
     let queued_inbox = db::count_queued_inbox(conn).await;
     let re_read_candidates = find_re_read_candidates(conn).await;
     let actor_positions = load_all_actor_positions(conn).await;
 
     SchedulerInputs {
-        acquisition_debt,
         queued_inbox,
         re_read_candidates,
         actor_positions,
@@ -57,53 +51,31 @@ async fn gather_inputs_async(conn: &Connection) -> SchedulerInputs {
     }
 }
 
-// Half the dream-forcing threshold: pressure becomes visible in conversation
-// before the scheduler is forced to act on it.
-const PRESSURE_VISIBLE_DEBT: usize = 25; // replay-tunable
-
 // The chat-visible slice of interoception: real backlog counters, surfaced
-// only when they would actually change behaviour (a dream is approaching, or
-// queued study exists). None = no line, zero cost in the prompt.
+// only when queued study exists. None = no line, zero cost in the prompt.
 pub fn pressure_line() -> Option<String> {
     let Ok(conn) = db::open_connection() else {
         return None;
     };
-    let (debt, queued) = db::block_on(async {
-        (
-            count_acquisition_debt(&conn).await,
-            db::load_queued_inbox_names(&conn).await,
-        )
-    });
-    render_pressure(debt, &queued)
+    let queued = db::block_on(db::load_queued_inbox_names(&conn));
+    render_pressure(&queued)
 }
 
 // Names, not counts: a bare count made the model guess wrongly at WHICH items
 // were unread (observed live: it refused to synthesize an already-studied
 // document, assuming it was among the queued ones).
-fn render_pressure(debt: usize, queued: &[String]) -> Option<String> {
-    if debt < PRESSURE_VISIBLE_DEBT && queued.is_empty() {
+fn render_pressure(queued: &[String]) -> Option<String> {
+    if queued.is_empty() {
         return None;
     }
-    let mut parts = Vec::new();
-    if debt >= PRESSURE_VISIBLE_DEBT {
-        parts.push(format!(
-            "{debt} unconsolidated experience events since the last dream (a dream is forced at {ACQUISITION_DEBT_THRESHOLD})"
-        ));
-    }
-    if !queued.is_empty() {
-        parts.push(format!(
-            "queued study items not yet read: {}",
-            queued.join(", ")
-        ));
-    }
-    Some(format!("Internal state: {}.", parts.join("; ")))
+    Some(format!(
+        "Internal state: queued study items not yet read: {}.",
+        queued.join(", ")
+    ))
 }
 
 /// Pure decision function - first matching rule wins (priority order)
 pub fn decide(inputs: &SchedulerInputs) -> SchedulerAction {
-    if let Some(action) = check_consolidation_debt(inputs) {
-        return action;
-    }
     if inputs.queued_inbox > 0 {
         return SchedulerAction::InboxStudy {
             reason: format!("{} inbox items queued", inputs.queued_inbox),
@@ -118,19 +90,6 @@ pub fn decide(inputs: &SchedulerInputs) -> SchedulerAction {
         };
     }
     rest_action(inputs)
-}
-
-fn check_consolidation_debt(inputs: &SchedulerInputs) -> Option<SchedulerAction> {
-    if inputs.acquisition_debt >= ACQUISITION_DEBT_THRESHOLD {
-        Some(SchedulerAction::Dream {
-            reason: format!(
-                "acquisition debt {} >= {}",
-                inputs.acquisition_debt, ACQUISITION_DEBT_THRESHOLD
-            ),
-        })
-    } else {
-        None
-    }
 }
 
 fn check_re_read_candidates(inputs: &SchedulerInputs) -> Option<SchedulerAction> {
@@ -148,9 +107,9 @@ fn check_re_read_candidates(inputs: &SchedulerInputs) -> Option<SchedulerAction>
     None
 }
 
-fn rest_action(inputs: &SchedulerInputs) -> SchedulerAction {
+fn rest_action(_inputs: &SchedulerInputs) -> SchedulerAction {
     SchedulerAction::Rest {
-        reason: format!("nothing to do (debt: {})", inputs.acquisition_debt),
+        reason: "nothing to do".to_string(),
     }
 }
 
@@ -241,9 +200,6 @@ fn log_drift_warning(distance: f64, actor_a: &str, actor_b: &str) {
 /// Log the scheduler action decision
 pub fn log_scheduler_decision(action: &SchedulerAction) {
     match action {
-        SchedulerAction::Dream { reason } => {
-            crate::runlog::log("sched", &format!("[autonomy] dream — {reason}"));
-        }
         SchedulerAction::NewsScan { reason } => {
             crate::runlog::log("sched", &format!("[autonomy] news scan — {reason}"));
         }
@@ -263,120 +219,6 @@ pub fn log_scheduler_decision(action: &SchedulerAction) {
 }
 
 // ==================== Input Gathering Helpers ====================
-
-/// Count acquisition debt: retrieved/marked/created/updated events from exploration/ingestion
-/// sessions whose ts is later than the newest event of any dream session
-async fn count_acquisition_debt(conn: &Connection) -> usize {
-    // First, find the newest dream session event timestamp
-    let newest_dream_ts = get_newest_dream_event_ts(conn).await;
-
-    let query;
-    let params: Vec<Value>;
-
-    match &newest_dream_ts {
-        Some(dream_ts) => {
-            query = "SELECT COUNT(*) FROM events ev 
-             JOIN sessions s ON s.id = ev.session_id 
-             WHERE s.session_type IN ('exploration', 'ingestion') 
-               AND ev.event_type IN ('retrieved', 'marked', 'created', 'updated') 
-               AND ev.ts > ?1";
-            params = vec![Value::Text(dream_ts.clone())];
-        }
-        None => {
-            query = "SELECT COUNT(*) FROM events ev 
-             JOIN sessions s ON s.id = ev.session_id 
-             WHERE s.session_type IN ('exploration', 'ingestion') 
-               AND ev.event_type IN ('retrieved', 'marked', 'created', 'updated')";
-            params = vec![];
-        }
-    }
-
-    let mut rows = match conn.query(query, params).await {
-        Ok(rows) => rows,
-        Err(_) => return 0,
-    };
-
-    if let Ok(Some(row)) = rows.next().await {
-        match row.get_value(0) {
-            Ok(value) => db::int(value) as usize,
-            Err(_) => 0,
-        }
-    } else {
-        0
-    }
-}
-
-// The nightly-dream guarantee's input: has anything been experienced since
-// the last dream? True when the newest non-dream event is newer than the
-// newest dream event (or no dream has ever run but events exist).
-pub fn has_unconsolidated_experience() -> bool {
-    let Ok(conn) = db::open_connection() else {
-        return false;
-    };
-    db::block_on(async {
-        let newest_experience = get_newest_experience_event_ts(&conn).await;
-        let Some(experience_ts) = newest_experience else {
-            return false;
-        };
-        match get_newest_dream_event_ts(&conn).await {
-            Some(dream_ts) => experience_ts > dream_ts,
-            None => true,
-        }
-    })
-}
-
-/// Newest event timestamp outside dream sessions — lived experience.
-async fn get_newest_experience_event_ts(conn: &Connection) -> Option<String> {
-    let mut rows = match conn
-        .query(
-            "SELECT MAX(ev.ts) FROM events ev
-             LEFT JOIN sessions s ON s.id = ev.session_id
-             WHERE s.session_type IS NULL OR s.session_type != 'dream'",
-            (),
-        )
-        .await
-    {
-        Ok(rows) => rows,
-        Err(_) => return None,
-    };
-    let Ok(Some(row)) = rows.next().await else {
-        return None;
-    };
-    match row.get_value(0) {
-        Ok(turso::Value::Null) => None,
-        Ok(value) => {
-            let text = db::text(value);
-            if text.is_empty() { None } else { Some(text) }
-        }
-        Err(_) => None,
-    }
-}
-
-/// Get the newest event timestamp from any dream session
-async fn get_newest_dream_event_ts(conn: &Connection) -> Option<String> {
-    let mut rows = match conn
-        .query(
-            "SELECT MAX(ev.ts) FROM events ev 
-             JOIN sessions s ON s.id = ev.session_id 
-             WHERE s.session_type = 'dream' 
-             LIMIT 1",
-            (),
-        )
-        .await
-    {
-        Ok(rows) => rows,
-        Err(_) => return None,
-    };
-
-    if let Ok(Some(row)) = rows.next().await {
-        match row.get_value(0) {
-            Ok(value) => Some(db::text(value)),
-            Err(_) => None,
-        }
-    } else {
-        None
-    }
-}
 
 /// Find documents that have >= RE_READ_NOTE_THRESHOLD open curiosity notes.
 /// The document path lives in the note's `created` event payload

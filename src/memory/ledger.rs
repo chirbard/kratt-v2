@@ -9,8 +9,6 @@ use crate::memory::graph::Edge;
 
 const HALF_LIFE_CYCLES: f64 = 20.0; // replay-tunable.
 const POSITION_EPSILON: f64 = 0.05; // replay-tunable.
-const DIRECTION_SNAPSHOTS: usize = 5; // replay-tunable.
-const DIRECTION_NORM_EPSILON: f64 = 1e-9; // replay-tunable.
 
 #[derive(Clone)]
 pub struct Event {
@@ -108,16 +106,6 @@ impl Event {
 
     pub fn pruned(actor: Actor, edge: EdgeRef, context: EventContext, payload: String) -> Self {
         Self::new(actor, "pruned", edge, context, EventBody::new(1.0, payload))
-    }
-
-    pub fn routed(context: EventContext, payload: String) -> Self {
-        Self::new(
-            Actor::new("system", "router"),
-            "routed",
-            EdgeRef::new("", ""),
-            context,
-            EventBody::new(1.0, payload),
-        )
     }
 
     // turn_id is empty for a session-level outcome and set for per-turn credit;
@@ -311,22 +299,6 @@ pub fn recompute_positions() -> Result<Vec<String>, Box<dyn Error + Send + Sync>
         }
         Ok(logs)
     })
-}
-
-pub fn load_actor_position(actor_type: &str, actor_id: &str) -> Option<Vec<f64>> {
-    let conn = match db::open_connection() {
-        Ok(conn) => conn,
-        Err(_) => return None,
-    };
-    db::block_on(load_actor_position_async(&conn, actor_type, actor_id)).unwrap_or_default()
-}
-
-pub fn load_actor_direction(actor_type: &str, actor_id: &str) -> Option<Vec<f64>> {
-    let conn = match db::open_connection() {
-        Ok(conn) => conn,
-        Err(_) => return None,
-    };
-    db::block_on(load_actor_direction_async(&conn, actor_type, actor_id)).unwrap_or_default()
 }
 
 // Deterministic aggregate of one civil day's ledger slice (events where the
@@ -861,26 +833,6 @@ pub(crate) fn cosine_similarity(
     Ok(1.0 - cosine_distance(left, right)?)
 }
 
-pub(crate) fn normalized_vector(vector: &[f64]) -> Option<Vec<f64>> {
-    let mut norm = 0.0;
-    let mut index = 0usize;
-    while index < vector.len() {
-        norm += vector[index] * vector[index];
-        index += 1;
-    }
-    if norm <= DIRECTION_NORM_EPSILON {
-        return None;
-    }
-    let scale = norm.sqrt();
-    let mut normalized = Vec::with_capacity(vector.len());
-    let mut normalize_index = 0usize;
-    while normalize_index < vector.len() {
-        normalized.push(vector[normalize_index] / scale);
-        normalize_index += 1;
-    }
-    Some(normalized)
-}
-
 async fn turn_attribution_async(
     conn: &Connection,
     turn_id: &str,
@@ -1191,53 +1143,6 @@ async fn load_position_state(
         total_weight: 0.0,
         updated_at: db::timestamp_now(),
     })
-}
-
-async fn load_actor_position_async(
-    conn: &Connection,
-    actor_type: &str,
-    actor_id: &str,
-) -> Result<Option<Vec<f64>>, Box<dyn Error + Send + Sync>> {
-    let state = load_position_state(conn, actor_type, actor_id).await?;
-    Ok(position_from_state(&state))
-}
-
-async fn load_actor_direction_async(
-    conn: &Connection,
-    actor_type: &str,
-    actor_id: &str,
-) -> Result<Option<Vec<f64>>, Box<dyn Error + Send + Sync>> {
-    let mut rows = conn
-        .query(
-            "SELECT CASE WHEN embedding IS NULL THEN NULL ELSE vector_extract(embedding) END FROM actor_position_history WHERE actor_type = ?1 AND actor_id = ?2 ORDER BY recorded_at DESC LIMIT ?3",
-            params![actor_type, actor_id, DIRECTION_SNAPSHOTS as i64],
-        )
-        .await?;
-    let mut snapshots: Vec<Vec<f64>> = Vec::new();
-    while let Some(row) = rows.next().await? {
-        let embedding = match row.get_value(0).ok() {
-            Some(value) => parse_vector_blob(value),
-            None => None,
-        };
-        if let Some(vector) = embedding {
-            snapshots.push(vector);
-        }
-    }
-    if snapshots.len() < 2 {
-        return Ok(None);
-    }
-    let newest = &snapshots[0];
-    let oldest = &snapshots[snapshots.len() - 1];
-    if newest.len() != oldest.len() {
-        return Ok(None);
-    }
-    let mut delta = Vec::with_capacity(newest.len());
-    let mut index = 0usize;
-    while index < newest.len() {
-        delta.push(newest[index] - oldest[index]);
-        index += 1;
-    }
-    Ok(normalized_vector(&delta))
 }
 
 pub(crate) fn parse_vector_blob(value: Value) -> Option<Vec<f64>> {

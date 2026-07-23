@@ -167,19 +167,19 @@ fn finish_stream(
 ) {
     // Done must be sent last: the app drops the stream receiver once it
     // leaves the Streaming state, so anything sent after Done is lost.
-    emit_routing_debug(&job.sender, &memory_build.debug_log);
+    emit_retrieval_debug(&job.sender, &memory_build.debug_log);
     emit_attribution(job);
     let final_stats = send_final_stats(&job.sender, stats, stats_agg, first_turn);
     runlog::log("chat", &format_stats_line(&final_stats));
 }
 
-fn emit_routing_debug(sender: &std::sync::mpsc::Sender<Chunk>, routing_debug: &str) {
-    if routing_debug.is_empty() {
+fn emit_retrieval_debug(sender: &std::sync::mpsc::Sender<Chunk>, retrieval_debug: &str) {
+    if retrieval_debug.is_empty() {
         return;
     }
     let _ = sender.send(Chunk::MemoryLog {
         phase: "debug",
-        text: routing_debug.to_string(),
+        text: retrieval_debug.to_string(),
     });
 }
 

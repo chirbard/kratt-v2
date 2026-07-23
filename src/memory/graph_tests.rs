@@ -1,11 +1,11 @@
     use std::collections::HashMap;
 
     use super::{
-        CLOSURE_NODE_CAP, Edge, Graph, Node, PROVENANCE_DREAMED, PROVENANCE_INFERRED,
+        CLOSURE_NODE_CAP, Edge, Node, PROVENANCE_DREAMED, PROVENANCE_INFERRED,
         PROVENANCE_LEGACY, PROVENANCE_SYNTHESIZED, PROVENANCE_USER_CONFIRMED,
         PROVENANCE_WEB_CONFIRMED, PROVENANCE_WEB_SURFACED, closure_nodes, edge_ceiling,
-        edge_is_pinned, graph_to_json, inferred_ceiling, node_carries_value, normalize_memory_type,
-        provenance_ceiling, stability_seed_max, synthesized_ceiling,
+        edge_is_pinned, inferred_ceiling, node_carries_value, normalize_memory_type,
+        provenance_ceiling, stability_seed_max,
     };
 
     fn node(node_type: &str, body: &str) -> Node {
@@ -70,40 +70,6 @@
     }
 
     #[test]
-    fn full_graph_filters_only_mute_entities_deterministically() {
-        let mut graph = Graph::new();
-        graph.nodes.insert("mute".to_string(), node("entity", " "));
-        graph
-            .nodes
-            .insert("entity".to_string(), node("entity", "body"));
-        graph.nodes.insert("task".to_string(), node("task", ""));
-        graph.edges.push(Edge {
-            source: "entity".to_string(),
-            target: "task".to_string(),
-            content: String::new(),
-            stability: 0.0,
-            confidence: 0.0,
-            importance: 0.0,
-            date: String::new(),
-            subject: false,
-            occurred_at: None,
-            expired_at: None,
-            memory_type: "semantic".to_string(),
-            origin_session: String::new(),
-            provenance: PROVENANCE_LEGACY.to_string(),
-            ceiling: None,
-            last_decayed_at: String::new(),
-        });
-        let first = graph_to_json(&graph);
-        let second = graph_to_json(&graph);
-        let Some(emitted) = first["nodes"].as_array() else {
-            panic!("nodes array missing");
-        };
-        assert_eq!(emitted.len(), 2);
-        assert_eq!(first, second);
-    }
-
-    #[test]
     fn normalize_memory_type_accepts_episodic() {
         assert_eq!(normalize_memory_type("episodic"), "episodic");
     }
@@ -157,10 +123,7 @@
     fn derived_ceiling_math_uses_premise_strength_and_floor() {
         assert_eq!(inferred_ceiling(&[1.0, 0.9]), Some(0.81));
         assert_eq!(inferred_ceiling(&[0.25, 0.25]), Some(0.25));
-        assert_eq!(synthesized_ceiling(&[1.0, 0.5]), Some(0.68));
-        assert_eq!(synthesized_ceiling(&[0.25; 10]), Some(0.25));
         assert_eq!(inferred_ceiling(&[]), None);
-        assert_eq!(synthesized_ceiling(&[]), None);
     }
 
     #[test]
