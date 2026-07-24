@@ -9,6 +9,7 @@ pub use db::{
     search_messages_fts, startup_database, sync_now, sync_push_best_effort,
 };
 pub(crate) use db::{Finding, acquire_write_lock, open_connection};
+pub(crate) use db::{write_edge, write_node};
 pub(crate) use db::{
     Interest, PingPolicy, RecentLearning, block_on, conversation_boundary_async,
     latest_assistant_message_timestamp_async, load_inbox_snapshot_async,
@@ -21,3 +22,4 @@ pub use embed::{
     SemanticEdge, edges_to_toon, run_embed_pass, select_semantic_edges,
     select_semantic_edges_for_chat,
 };
+pub(crate) use graph::{Edge, Node};

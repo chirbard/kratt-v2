@@ -13,6 +13,7 @@
 )]
 
 mod api;
+mod eval;
 mod memory;
 mod paths;
 mod runlog;
@@ -34,6 +35,7 @@ fn install_panic_runlog() {
 }
 
 fn main() -> MainResult<()> {
+    let _ = dotenvy::dotenv();
     let trace_view = trace_view_target()?;
     // All data paths (kratt-data/, logs, .env) are relative — pin the working
     // directory to the crate root so `cargo run` from a subdirectory doesn't
@@ -43,8 +45,27 @@ fn main() -> MainResult<()> {
     if let Some(target) = trace_view {
         return trace::view(&target);
     }
+    if let Some(repo) = predict_eval_target()? {
+        return match eval::run(&repo) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(error as Box<dyn std::error::Error>),
+        };
+    }
     println!("kratt: no interactive entry point yet — eval harness pending");
     Ok(())
+}
+
+fn predict_eval_target() -> MainResult<Option<String>> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--predict-eval" {
+            return match args.next() {
+                Some(target) => Ok(Some(target)),
+                None => Err("--predict-eval requires a repository path".into()),
+            };
+        }
+    }
+    Ok(None)
 }
 
 fn trace_view_target() -> MainResult<Option<String>> {
