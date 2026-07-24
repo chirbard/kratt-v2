@@ -126,27 +126,33 @@ fn checkpoints(total: usize) -> Vec<usize> {
     values.into_iter().collect()
 }
 
+/// Takes the most RECENT `train + holdout` qualifying commits, chronologically
+/// ordered, and holds out the latest `holdout` of them. Recent history reflects
+/// the codebase that exists now; the oldest commits describe one that is gone.
 fn chronological_split(commits: &[Commit], train: usize, holdout: usize) -> (Vec<Commit>, Vec<Commit>) {
-    let split_at = train.min(commits.len());
-    let end = (split_at + holdout).min(commits.len());
-    (commits[..split_at].to_vec(), commits[split_at..end].to_vec())
+    let window = train.saturating_add(holdout);
+    let start = commits.len().saturating_sub(window);
+    let recent = &commits[start..];
+    let holdout_len = holdout.min(recent.len());
+    let split_at = recent.len() - holdout_len;
+    (recent[..split_at].to_vec(), recent[split_at..].to_vec())
 }
 
 fn extract_commits(repo: &Path) -> EvalResult<Vec<Commit>> {
-    let output = git(repo, &["log", "--no-merges", "--reverse", "--format=%H%x00%aI%x00%s%x00%b%x01"])?;
+    let output = git(repo, &["log", "--no-merges", "--reverse", "--name-only", "--format=%x01%H%x00%aI%x00%s%x00%b%x00"])?;
     let mut commits = Vec::new();
     for record in output.split('\x01') {
-        let fields: Vec<&str> = record.trim_matches('\n').split('\0').collect();
-        if fields.len() < 4 || fields[0].trim().is_empty() { continue; }
-        let file_output = git(repo, &["show", "--name-only", "--format=", fields[0]])?;
+        if record.trim().is_empty() { continue; }
+        let fields: Vec<&str> = record.split('\0').collect();
+        if fields.len() < 5 || fields[0].trim().is_empty() { continue; }
         let mut files = Vec::new();
-        for line in file_output.lines() {
+        for line in fields[4].lines() {
             let file = line.trim();
             if !file.is_empty() { files.push(file.to_string()); }
         }
         let files = filter_files(files);
         if files.len() >= 3 {
-            commits.push(Commit { hash: fields[0].to_string(), timestamp: fields[1].to_string(), subject: fields[2].to_string(), body: fields[3].trim().to_string(), files });
+            commits.push(Commit { hash: fields[0].trim().to_string(), timestamp: fields[1].to_string(), subject: fields[2].to_string(), body: fields[3].trim().to_string(), files });
         }
     }
     Ok(commits)
@@ -315,8 +321,9 @@ mod tests {
         let mut commits = Vec::new();
         for index in 0..5 { commits.push(Commit { hash: index.to_string(), timestamp: String::new(), subject: String::new(), body: String::new(), files: Vec::new() }); }
         let first = chronological_split(&commits, 2, 2);
-        assert_eq!(first.0[0].hash, "0");
-        assert_eq!(first.0[1].hash, "1");
+        assert_eq!(first.0[0].hash, "1");
+        assert_eq!(first.0[1].hash, "2");
+        assert_eq!(first.1[1].hash, "4");
         assert_eq!(first, chronological_split(&commits, 2, 2));
     }
 
