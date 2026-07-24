@@ -27,6 +27,7 @@ struct Score {
 }
 
 struct RunCtx<'ctx> {
+    repo: &'ctx Path,
     llm: &'ctx dyn LlmClient,
     embed: Option<&'ctx dyn EmbeddingClient>,
     output: &'ctx Path,
@@ -37,6 +38,7 @@ struct RunCtx<'ctx> {
 struct DumpRow<'row> {
     commit: &'row Commit,
     task: &'row str,
+    tree: &'row str,
     claims: &'row str,
     prediction: &'row Prediction,
     score: &'row Score,
@@ -48,7 +50,7 @@ struct Prediction {
 }
 
 const EXTRACT_PROMPT: &str = "You are given a development task and the repository-relative files the change actually touched. For each given file, write one short claim stating its role in this kind of change. Return JSON only as {\"claims\":[{\"file\":\"repo-relative path\",\"why\":\"short reason\"}]}. Use only the given paths.\n\n";
-const PREDICT_PROMPT: &str = "Predict the repository-relative files this task will touch. Return JSON only as {\"paths\":[\"path\"]}. Use exact paths when a claim supports them; do not explain.\n\nTASK:\n";
+const PREDICT_PROMPT: &str = "You are given the repository's current file tree and a development task. Predict which files the task changes — existing files from the tree, plus any new files it must add. Return JSON only as {\"paths\":[\"repo-relative path\"]}. Prefer exact paths from the tree; do not explain.\n";
 
 type EvalResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -56,7 +58,8 @@ pub fn run(repo: &str) -> EvalResult<()> {
     let train_n = cli_usize("--train", env_usize("PREDICT_TRAIN", 20));
     let holdout_n = cli_usize("--holdout", env_usize("PREDICT_HOLDOUT", 10));
     let skip_n = cli_usize("--skip", env_usize("PREDICT_SKIP", 0));
-    let commits = extract_commits(Path::new(repo))?;
+    let repo_path = Path::new(repo);
+    let commits = extract_commits(repo_path)?;
     let split = chronological_split(&commits, train_n, holdout_n, skip_n);
     if split.1.is_empty() {
         return Err("not enough qualifying commits for holdout split".into());
@@ -75,9 +78,9 @@ pub fn run(repo: &str) -> EvalResult<()> {
             consumed += 1;
         }
         memory::run_embed_pass(Arc::clone(&embed));
-        let cold_ctx = RunCtx { llm: &*llm, embed: None, output: &output, checkpoint, mode: "cold" };
+        let cold_ctx = RunCtx { repo: repo_path, llm: &*llm, embed: None, output: &output, checkpoint, mode: "cold" };
         let cold = score_holdout(&split.1, &cold_ctx)?;
-        let memory_ctx = RunCtx { llm: &*llm, embed: Some(&*embed), output: &output, checkpoint, mode: "memory" };
+        let memory_ctx = RunCtx { repo: repo_path, llm: &*llm, embed: Some(&*embed), output: &output, checkpoint, mode: "memory" };
         let memory = score_holdout(&split.1, &memory_ctx)?;
         append_csv(&mut csv, checkpoint, "cold", &cold);
         append_csv(&mut csv, checkpoint, "memory", &memory);
@@ -169,6 +172,20 @@ fn extract_commits(repo: &Path) -> EvalResult<Vec<Commit>> {
     Ok(commits)
 }
 
+fn file_tree(repo: &Path, hash: &str) -> String {
+    let parent = format!("{hash}~1");
+    let listing = match git(repo, &["ls-tree", "-r", "--name-only", &parent]) {
+        Ok(text) => text,
+        Err(_) => return String::new(),
+    };
+    let mut files = Vec::new();
+    for line in listing.lines() {
+        let file = line.trim();
+        if !file.is_empty() { files.push(file.to_string()); }
+    }
+    filter_files(files).join("\n")
+}
+
 fn git(repo: &Path, args: &[&str]) -> EvalResult<String> {
     let output = Command::new("git").args(args).current_dir(repo).output()?;
     if !output.status.success() { return Err(String::from_utf8_lossy(&output.stderr).to_string().into()); }
@@ -253,12 +270,13 @@ fn score_holdout(commits: &[Commit], ctx: &RunCtx) -> EvalResult<Score> {
     let mut total = Score { precision: 0.0, recall: 0.0, f1_score: 0.0 };
     for commit in commits {
         let task = sanitize_task(commit);
+        let tree = file_tree(ctx.repo, &commit.hash);
         let claims = match ctx.embed { Some(client) => memory::edges_to_toon(&memory::select_semantic_edges(client, &task)), None => String::new() };
-        let prompt = format!("{PREDICT_PROMPT}{task}\n\nRETRIEVED CLAIMS:\n{claims}");
+        let prompt = format!("{PREDICT_PROMPT}\nREPOSITORY FILES:\n{tree}\n\nTASK:\n{task}\n\nRETRIEVED CLAIMS:\n{claims}");
         let prediction = parse_prediction(&ctx.llm.collect(&prompt)?);
         let score = score_paths(&prediction.paths, &commit.files);
         total.precision += score.precision; total.recall += score.recall; total.f1_score += score.f1_score;
-        write_dump(ctx, &DumpRow { commit, task: &task, claims: &claims, prediction: &prediction, score: &score })?;
+        write_dump(ctx, &DumpRow { commit, task: &task, tree: &tree, claims: &claims, prediction: &prediction, score: &score })?;
     }
     let count = commits.len() as f64;
     Ok(Score { precision: total.precision / count, recall: total.recall / count, f1_score: total.f1_score / count })
@@ -294,14 +312,14 @@ fn score_paths(predicted: &[String], actual: &[String]) -> Score {
 fn write_dump(ctx: &RunCtx, row: &DumpRow) -> EvalResult<()> {
     let commit = row.commit;
     let prediction = row.prediction;
-    let (task, claims, score) = (row.task, row.claims, row.score);
+    let (task, tree, claims, score) = (row.task, row.tree, row.claims, row.score);
     let mode = ctx.mode;
     let name = format!("{}-{mode}-{}.md", ctx.checkpoint, &commit.hash[..commit.hash.len().min(12)]);
     let mut hits = Vec::new();
     for path in &prediction.paths { if commit.files.contains(path) { hits.push(path); } }
     let mut misses = Vec::new();
     for path in &commit.files { if !prediction.paths.contains(path) { misses.push(path); } }
-    let text = format!("# {} ({mode})\n\nTask: {task}\n\nRetrieved claims:\n```toon\n{claims}\n```\n\nPredicted: {:?}\n\nActual: {:?}\n\nHits: {:?}\n\nMisses: {:?}\n\nPrecision: {:.3}\nRecall: {:.3}\nF1: {:.3}\n", commit.hash, prediction.paths, commit.files, hits, misses, score.precision, score.recall, score.f1_score);
+    let text = format!("# {} ({mode})\n\nTask: {task}\n\nRepo files shown:\n```\n{tree}\n```\n\nRetrieved claims:\n```toon\n{claims}\n```\n\nPredicted: {:?}\n\nActual: {:?}\n\nHits: {:?}\n\nMisses: {:?}\n\nPrecision: {:.3}\nRecall: {:.3}\nF1: {:.3}\n", commit.hash, prediction.paths, commit.files, hits, misses, score.precision, score.recall, score.f1_score);
     std::fs::write(ctx.output.join(name), text)?;
     Ok(())
 }
