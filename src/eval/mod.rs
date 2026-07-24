@@ -55,23 +55,15 @@ type EvalResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 pub fn run(repo: &str) -> EvalResult<()> {
     let train_n = cli_usize("--train", env_usize("PREDICT_TRAIN", 20));
     let holdout_n = cli_usize("--holdout", env_usize("PREDICT_HOLDOUT", 10));
+    let skip_n = cli_usize("--skip", env_usize("PREDICT_SKIP", 0));
     let commits = extract_commits(Path::new(repo))?;
-    let split = chronological_split(&commits, train_n, holdout_n);
+    let split = chronological_split(&commits, train_n, holdout_n, skip_n);
     if split.1.is_empty() {
         return Err("not enough qualifying commits for holdout split".into());
     }
     memory::startup_database()?;
     memory::db_init()?;
-    let key = std::env::var("OPENROUTER_API_KEY").unwrap_or_default();
-    let model = std::env::var("MEMORY_MODEL").unwrap_or_else(|_| "openai/gpt-oss-20b".to_string());
-    let llm = api::resolve_model_client(&model, &key);
-    let llm: Arc<dyn LlmClient> = trace::TracingClient::wrap(
-        llm,
-        trace::TraceContext::new("predict-eval"),
-    );
-    let embed_model = std::env::var("EMBED_MODEL")
-        .unwrap_or_else(|_| "openai/text-embedding-3-small".to_string());
-    let embed: Arc<dyn EmbeddingClient> = Arc::new(api::new_embed_client(key, embed_model));
+    let (llm, embed) = build_clients();
     let checkpoints = checkpoints(split.0.len());
     let output = output_dir();
     std::fs::create_dir_all(&output)?;
@@ -93,6 +85,19 @@ pub fn run(repo: &str) -> EvalResult<()> {
     }
     std::fs::write(output.join("curve.csv"), csv)?;
     Ok(())
+}
+
+fn build_clients() -> (Arc<dyn LlmClient>, Arc<dyn EmbeddingClient>) {
+    let key = std::env::var("OPENROUTER_API_KEY").unwrap_or_default();
+    let model = std::env::var("MEMORY_MODEL").unwrap_or_else(|_| "openai/gpt-oss-20b".to_string());
+    let llm: Arc<dyn LlmClient> = trace::TracingClient::wrap(
+        api::resolve_model_client(&model, &key),
+        trace::TraceContext::new("predict-eval"),
+    );
+    let embed_model = std::env::var("EMBED_MODEL")
+        .unwrap_or_else(|_| "openai/text-embedding-3-small".to_string());
+    let embed: Arc<dyn EmbeddingClient> = Arc::new(api::new_embed_client(key, embed_model));
+    (llm, embed)
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
@@ -129,7 +134,13 @@ fn checkpoints(total: usize) -> Vec<usize> {
 /// Takes the most RECENT `train + holdout` qualifying commits, chronologically
 /// ordered, and holds out the latest `holdout` of them. Recent history reflects
 /// the codebase that exists now; the oldest commits describe one that is gone.
-fn chronological_split(commits: &[Commit], train: usize, holdout: usize) -> (Vec<Commit>, Vec<Commit>) {
+///
+/// `skip` drops that many of the NEWEST qualifying commits before windowing —
+/// use it to step over an unrepresentative recent stretch (e.g. a demolition
+/// campaign) and land the holdout on real feature work.
+fn chronological_split(commits: &[Commit], train: usize, holdout: usize, skip: usize) -> (Vec<Commit>, Vec<Commit>) {
+    let kept = commits.len().saturating_sub(skip);
+    let commits = &commits[..kept];
     let window = train.saturating_add(holdout);
     let start = commits.len().saturating_sub(window);
     let recent = &commits[start..];
@@ -320,11 +331,20 @@ mod tests {
     fn split_is_chronological_and_reproducible() {
         let mut commits = Vec::new();
         for index in 0..5 { commits.push(Commit { hash: index.to_string(), timestamp: String::new(), subject: String::new(), body: String::new(), files: Vec::new() }); }
-        let first = chronological_split(&commits, 2, 2);
+        let first = chronological_split(&commits, 2, 2, 0);
         assert_eq!(first.0[0].hash, "1");
         assert_eq!(first.0[1].hash, "2");
         assert_eq!(first.1[1].hash, "4");
-        assert_eq!(first, chronological_split(&commits, 2, 2));
+        assert_eq!(first, chronological_split(&commits, 2, 2, 0));
+    }
+
+    #[test]
+    fn skip_drops_the_newest_commits_before_windowing() {
+        let mut commits = Vec::new();
+        for index in 0..5 { commits.push(Commit { hash: index.to_string(), timestamp: String::new(), subject: String::new(), body: String::new(), files: Vec::new() }); }
+        let skipped = chronological_split(&commits, 2, 2, 1);
+        assert_eq!(skipped.0[0].hash, "0");
+        assert_eq!(skipped.1[1].hash, "3");
     }
 
     #[test]
