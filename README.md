@@ -1,3 +1,109 @@
+<p align="center"><img src="docs/banner.svg" alt="n = 1 — Learn from one game, not a million. An attempt to build a learner like a person: imperfect, but sample-efficient." width="100%"></p>
+
+# kratt-v2 — archived
+
+The second version of [**kratt**](https://github.com/chirbard/kratt), a personal research project. Built June 25 –
+July 24, 2026; kept here as a record. It is not maintained.
+
+**The bet.** Every AI lab is racing to build a perfect system — more
+parameters, more compute, closer to flawless. kratt-v2 went the other way: it
+tried to mimic a human learner — imperfect, but extraordinarily
+sample-efficient. A person learning Go does not play a million games. They play
+once, remember what happened, sleep on it, read a book, play again — and earn a
+kind of wisdom no cold model has.
+
+So kratt kept its experience as a graph of plain-language beliefs, each with a
+confidence, a source and a decay: *edge-first*, readable by a person and
+loadable by any base model without fine-tuning — a "knowledge crystal". Around
+it grew the rest of a learner: it dreamed overnight to consolidate what it had
+seen, explored out of curiosity, studied documents it was handed, and lived as
+a daily chat companion in a terminal and on Telegram.
+
+**The challenge to chat.** A chat model normally answers from its context
+window: the conversation so far, growing until it is truncated or summarised.
+kratt-v2 was *memory-first, not context-first* — every turn's context was
+assembled from memory, with only a short window of recent turns carried
+verbatim. Taken further, it started
+each answer with only a small slice of memories and recalled more mid-answer,
+the way a person suddenly remembers "wait — what camera does he shoot on?"
+halfway through advice about colour grading.
+
+```mermaid
+flowchart LR
+    U([you]) -->|terminal UI or Telegram| T[chat turn]
+    G -->|context built from memory,<br/>recalled mid-answer| T
+    T --> M[memory pass:<br/>extract beliefs]
+    M --> G[(belief graph<br/>confidence · source · decay)]
+    I[study a document] --> G
+    subgraph Night [overnight, on its own]
+        D[dream:<br/>consolidate]
+        S[synthesis]
+        E[curiosity:<br/>explore the web]
+        N[news scan]
+    end
+    G <--> Night
+    G <-->|sync| C[(Turso Cloud)]
+```
+
+It grew fast — and then it was cut down to a fifth of its size in two days:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/code-size-dark.svg">
+  <img alt="Lines of Rust per subsystem at every commit: growth from June 25 to a 36,771-line peak on July 22, dominated by the autonomous subsystem, then a drop to 8,678 lines right after the v2.0 tag." src="docs/code-size-light.svg">
+</picture>
+
+**Built mostly by coding agents, under rules they could check.** `CLAUDE.md`
+fixed the architecture — the core knows nothing of the interfaces, and the
+interfaces know nothing of memory internals — and `cargo modules` made the
+module graph visible enough to police it. Each chart is the source tree —
+which module contains which — with the dependencies that break that rule drawn
+on top in red:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/modules-v2.0-dark.svg">
+  <img alt="Module tree at v2.0: 62 modules, mostly the autonomous mind under memory, plus the terminal UI and Telegram interfaces. Of 257 dependencies between modules, two break the boundary rule: telegram night and ping reaching into the database inbox and findings." src="docs/modules-v2.0-light.svg">
+</picture>
+
+At its peak — 62 modules, 257 dependencies, almost all written by agents — the
+boundary held everywhere but two edges, both in the Telegram nightly report
+reaching straight into the database. After the slim-down:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/modules-slimmed-dark.svg">
+  <img alt="Module tree after the slim-down: 25 modules, only storage, the API and tracing, and the eval harness; 68 dependencies, none breaking the boundary rule." src="docs/modules-slimmed-light.svg">
+</picture>
+
+**Why it was cut:** the traces showed the foundation was bad. Extraction
+produced junk — empty links, duplicate nodes, a cluster of confabulated beliefs
+that fed itself — and dreaming *reinforced* it. Consolidating bad raw material
+only turns noise into confident noise. So everything was tagged `v2.0` and the
+autonomous layers were deleted, to rebuild extraction against objective tests.
+
+**The test that ended it.** Sample efficiency, measured: could kratt learn how
+change propagates in a codebase — *"remember the recipe, not the code"* — from
+a few examples? Given a past commit's task in this repository's own history, it
+predicted which files the commit touched: once from the task and the file tree
+alone, once also with the memory it had built from earlier commits.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/predict-f1-dark.svg">
+  <img alt="F1 of predicted versus actual files after 0, 10, 20 and 40 training commits. Without memory: 0.32, 0.26, 0.32, 0.27. With kratt's memory: 0.35, 0.25, 0.23, 0.33. No upward trend." src="docs/predict-f1-light.svg">
+</picture>
+
+The memory brought no measurable improvement over the plain file tree, and more
+experience did not help. Together with
+[published work](https://arxiv.org/abs/2606.29914) finding plain retrieval on
+par with elaborate memory systems at a fraction of the cost, that closed the
+thesis. The successor stopped trying to build a mind and became a reader over
+notes a person writes — one that never writes to them.
+
+**Browsing it:** the tag [`v2.0`](../../tree/v2.0) is the full system at its
+peak; `main` is the slimmed core plus the eval harness. Charts are drawn from
+the git history by `docs/charts.py` and `docs/modules.py`. The notes below are the original README
+and describe the system at `v2.0`.
+
+---
+
 # kratt-v2
 
 ## Turso Cloud sync (backup + multi-machine)

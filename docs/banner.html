@@ -1,0 +1,91 @@
+<!doctype html>
+<!-- The README banner. Render with:
+     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --headless --hide-scrollbars \
+       --window-size=1600,640 --force-device-scale-factor=2 --virtual-time-budget=6000 \
+       --screenshot=docs/banner.png docs/banner.html
+     Style taken from the hero of an earlier kratt landing-page mock-up. -->
+<html>
+<head>
+<meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400&family=Inter:wght@300&display=block" rel="stylesheet">
+<style>
+:root {
+  --bg: #0a0a0c; --fg: #ece8e1; --muted: #6b6b70; --muted-2: #9a9a9f;
+  --accent: #ff5e1a; --accent-glow: rgba(255, 94, 26, 0.45);
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 1600px; height: 640px; background: var(--bg); overflow: hidden; position: relative;
+  -webkit-font-smoothing: antialiased; }
+canvas { position: absolute; inset: 0; }
+.content { position: absolute; inset: 0; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; text-align: center; }
+.formula { font-family: 'Instrument Serif', serif; font-size: 300px; line-height: 0.88;
+  letter-spacing: -0.04em; display: flex; align-items: baseline; margin-bottom: 18px; color: var(--fg); }
+.n { font-style: italic; color: var(--muted-2); }
+.equals { margin: 0 0.3em; font-style: italic; color: var(--muted-2); font-size: 0.85em; }
+.one { color: var(--accent); font-style: italic; position: relative; display: inline-block; }
+.one::before { content: ''; position: absolute; bottom: 12%; left: -20%; right: -20%; height: 30%;
+  background: radial-gradient(ellipse at center, var(--accent-glow) 0%, transparent 70%);
+  filter: blur(30px); z-index: -1; }
+.tagline { font-family: 'Instrument Serif', serif; font-style: italic; font-size: 44px;
+  color: var(--fg); letter-spacing: -0.01em; margin-bottom: 14px; }
+.sub { font-family: 'Inter', sans-serif; font-weight: 300; font-size: 19px; line-height: 1.6;
+  color: var(--muted-2); max-width: 760px; }
+.sub em { font-family: 'Instrument Serif', serif; color: var(--fg); font-size: 1.15em; }
+.corner { position: absolute; font-family: 'JetBrains Mono', monospace; font-size: 13px;
+  letter-spacing: 0.18em; color: var(--muted); text-transform: uppercase; line-height: 1.7; }
+.tl { top: 34px; left: 40px; } .tr { top: 34px; right: 40px; text-align: right; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1600" height="640"></canvas>
+<div class="corner tl">kratt-v2<br>research record</div>
+<div class="corner tr">June – July 2026<br>archived</div>
+<div class="content">
+  <div class="formula"><span class="n">n</span><span class="equals">=</span><span class="one">1</span></div>
+  <div class="tagline">Learn from one game, not a million.</div>
+  <div class="sub">An attempt to build a learner like a person — imperfect, but <em>sample-efficient</em>.</div>
+</div>
+<script>
+// A static take on the mock-up's animated canvas: grid, warm glow, and points
+// joined to their near neighbours -- a faint belief graph. Seeded, so every
+// render is the same picture.
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const W = 1600, H = 640;
+let seed = 7;
+function random() { seed = (seed * 16807) % 2147483647; return (seed - 1) / 2147483646; }
+
+ctx.strokeStyle = 'rgba(236, 232, 225, 0.03)';
+ctx.lineWidth = 1;
+for (let x = 0; x < W; x += 80) { ctx.beginPath(); ctx.moveTo(x + 0.5, 0); ctx.lineTo(x + 0.5, H); ctx.stroke(); }
+for (let y = 0; y < H; y += 80) { ctx.beginPath(); ctx.moveTo(0, y + 0.5); ctx.lineTo(W, y + 0.5); ctx.stroke(); }
+
+const glow = ctx.createRadialGradient(W / 2, H / 2, 0, W / 2, H / 2, W * 0.55);
+glow.addColorStop(0, 'rgba(255, 94, 26, 0.07)');
+glow.addColorStop(0.5, 'rgba(255, 94, 26, 0.015)');
+glow.addColorStop(1, 'rgba(0, 0, 0, 0)');
+ctx.fillStyle = glow;
+ctx.fillRect(0, 0, W, H);
+
+const points = [];
+for (let index = 0; index < 85; index++) {
+  points.push({ x: random() * W, y: random() * H, size: random() * 1.6 + 0.4, alpha: random() * 0.4 + 0.12 });
+}
+for (let first = 0; first < points.length; first++) {
+  for (let second = first + 1; second < points.length; second++) {
+    const dx = points[first].x - points[second].x, dy = points[first].y - points[second].y;
+    const distance = Math.sqrt(dx * dx + dy * dy);
+    if (distance < 120) {
+      ctx.strokeStyle = `rgba(236, 232, 225, ${0.06 * (1 - distance / 120)})`;
+      ctx.beginPath(); ctx.moveTo(points[first].x, points[first].y); ctx.lineTo(points[second].x, points[second].y); ctx.stroke();
+    }
+  }
+}
+for (const point of points) {
+  ctx.fillStyle = `rgba(236, 232, 225, ${point.alpha})`;
+  ctx.beginPath(); ctx.arc(point.x, point.y, point.size, 0, Math.PI * 2); ctx.fill();
+}
+</script>
+</body>
+</html>

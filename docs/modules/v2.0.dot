@@ -1,0 +1,414 @@
+digraph {
+
+    graph [
+        label="kratt_v2",
+        labelloc=t,
+
+        pad=0.4,
+
+        // Consider rendering the graph using a different layout algorithm, such as:
+        // [dot, neato, twopi, circo, fdp, sfdp]
+        layout=neato,
+        overlap=false,
+        splines="line",
+        rankdir=LR,
+
+        fontname="Helvetica", 
+        fontsize="36",
+    ];
+
+    node [
+        fontname="monospace",
+        fontsize="10",
+        shape="record",
+        style="filled",
+    ];
+
+    edge [
+        fontname="monospace",
+        fontsize="10",
+    ];
+
+    "kratt_v2" [label="crate|kratt_v2", fillcolor="#5397c8"]; // "crate" node
+    "kratt_v2::api" [label="pub(crate) mod|api", fillcolor="#f8c04c"]; // "mod" node
+    "kratt_v2::api::client" [label="pub(self) mod|api::client", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::api::embed" [label="pub(self) mod|api::embed", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::memory" [label="pub(crate) mod|memory", fillcolor="#f8c04c"]; // "mod" node
+    "kratt_v2::memory::agent" [label="pub(self) mod|memory::agent", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::memory::db" [label="pub(self) mod|memory::db", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::memory::db::core" [label="pub(self) mod|memory::db::core", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::memory::db::decay_store" [label="pub(self) mod|memory::db::decay_store", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::memory::db::findings" [label="pub(self) mod|memory::db::findings", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::memory::db::graph_store" [label="pub(self) mod|memory::db::graph_store", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::memory::db::inbox" [label="pub(self) mod|memory::db::inbox", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::memory::db::migrations" [label="pub(self) mod|memory::db::migrations", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::memory::db::pass_runs" [label="pub(self) mod|memory::db::pass_runs", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::memory::db::retrieval" [label="pub(self) mod|memory::db::retrieval", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::memory::db::schema" [label="pub(self) mod|memory::db::schema", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::memory::db::sessions" [label="pub(self) mod|memory::db::sessions", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::memory::db::task_store" [label="pub(self) mod|memory::db::task_store", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::memory::db::values" [label="pub(self) mod|memory::db::values", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::memory::decay" [label="pub(self) mod|memory::decay", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::memory::decay_curve" [label="pub mod|memory::decay_curve", fillcolor="#81c169"]; // "mod" node
+    "kratt_v2::memory::decay_simulator" [label="pub(self) mod|memory::decay_simulator", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::memory::dream" [label="pub(self) mod|memory::dream", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::memory::embed" [label="pub(self) mod|memory::embed", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::memory::explore" [label="pub(self) mod|memory::explore", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::memory::graph" [label="pub(self) mod|memory::graph", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::memory::heavy" [label="pub(self) mod|memory::heavy", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::memory::hygiene" [label="pub(self) mod|memory::hygiene", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::memory::ingest" [label="pub(self) mod|memory::ingest", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::memory::ledger" [label="pub(self) mod|memory::ledger", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::memory::loops" [label="pub(self) mod|memory::loops", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::memory::news" [label="pub(self) mod|memory::news", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::memory::reinforce" [label="pub(self) mod|memory::reinforce", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::memory::routing" [label="pub(self) mod|memory::routing", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::memory::scheduler" [label="pub mod|memory::scheduler", fillcolor="#81c169"]; // "mod" node
+    "kratt_v2::memory::sequence" [label="pub(self) mod|memory::sequence", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::memory::synthesis" [label="pub(self) mod|memory::synthesis", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::memory::task_chain" [label="pub(self) mod|memory::task_chain", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::memory::toon_display" [label="pub(self) mod|memory::toon_display", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::paths" [label="pub(crate) mod|paths", fillcolor="#f8c04c"]; // "mod" node
+    "kratt_v2::prompts" [label="pub(crate) mod|prompts", fillcolor="#f8c04c"]; // "mod" node
+    "kratt_v2::runlog" [label="pub(crate) mod|runlog", fillcolor="#f8c04c"]; // "mod" node
+    "kratt_v2::seat_replay" [label="pub(crate) mod|seat_replay", fillcolor="#f8c04c"]; // "mod" node
+    "kratt_v2::session" [label="pub(crate) mod|session", fillcolor="#f8c04c"]; // "mod" node
+    "kratt_v2::session::history" [label="pub(self) mod|session::history", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::session::log" [label="pub(self) mod|session::log", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::telegram" [label="pub(crate) mod|telegram", fillcolor="#f8c04c"]; // "mod" node
+    "kratt_v2::telegram::bot" [label="pub(self) mod|telegram::bot", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::telegram::night" [label="pub(self) mod|telegram::night", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::telegram::ping" [label="pub(self) mod|telegram::ping", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::telegram::render" [label="pub(self) mod|telegram::render", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::telegram::report" [label="pub(self) mod|telegram::report", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::timeutil" [label="pub(crate) mod|timeutil", fillcolor="#f8c04c"]; // "mod" node
+    "kratt_v2::trace" [label="pub(crate) mod|trace", fillcolor="#f8c04c"]; // "mod" node
+    "kratt_v2::tui" [label="pub(crate) mod|tui", fillcolor="#f8c04c"]; // "mod" node
+    "kratt_v2::tui::app" [label="pub(self) mod|tui::app", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::tui::input" [label="pub(self) mod|tui::input", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::tui::render" [label="pub(self) mod|tui::render", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::tui::stream" [label="pub(self) mod|tui::stream", fillcolor="#db5367"]; // "mod" node
+    "kratt_v2::turn" [label="pub(crate) mod|turn", fillcolor="#f8c04c"]; // "mod" node
+    "kratt_v2::web" [label="pub(crate) mod|web", fillcolor="#f8c04c"]; // "mod" node
+    "kratt_v2::web::client" [label="pub(self) mod|web::client", fillcolor="#db5367"]; // "mod" node
+
+    "kratt_v2" -> "kratt_v2::api" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2" -> "kratt_v2::memory" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2" -> "kratt_v2::memory::agent" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2" -> "kratt_v2::paths" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2" -> "kratt_v2::prompts" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2" -> "kratt_v2::runlog" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2" -> "kratt_v2::seat_replay" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2" -> "kratt_v2::session" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2" -> "kratt_v2::telegram" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2" -> "kratt_v2::timeutil" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2" -> "kratt_v2::trace" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2" -> "kratt_v2::tui" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2" -> "kratt_v2::turn" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2" -> "kratt_v2::web" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::api" -> "kratt_v2::api::client" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::api" -> "kratt_v2::api::embed" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::api::client" -> "kratt_v2::api" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::api::client" -> "kratt_v2::trace" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::api::embed" -> "kratt_v2::api" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::agent" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::agent" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::db" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::db::core" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::db::findings" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::db::graph_store" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::db::inbox" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::db::pass_runs" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::db::retrieval" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::db::sessions" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::decay" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::decay_curve" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::decay_simulator" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::decay_simulator" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::dream" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::dream" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::embed" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::embed" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::explore" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::explore" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::graph" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::heavy" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::hygiene" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::ingest" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::ingest" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::ledger" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::ledger" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::loops" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::loops" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::news" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::news" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::reinforce" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::reinforce" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::routing" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::routing" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::scheduler" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::scheduler" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::sequence" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::sequence" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::synthesis" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::task_chain" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::task_chain" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory" -> "kratt_v2::memory::toon_display" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory::agent" -> "kratt_v2::api" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::agent" -> "kratt_v2::memory::db" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::agent" -> "kratt_v2::memory::decay" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::agent" -> "kratt_v2::memory::graph" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::agent" -> "kratt_v2::memory::heavy" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::agent" -> "kratt_v2::memory::ledger" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::agent" -> "kratt_v2::prompts" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::agent" -> "kratt_v2::runlog" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db" -> "kratt_v2::memory::db::core" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory::db" -> "kratt_v2::memory::db::core" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db" -> "kratt_v2::memory::db::decay_store" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory::db" -> "kratt_v2::memory::db::decay_store" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db" -> "kratt_v2::memory::db::findings" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory::db" -> "kratt_v2::memory::db::findings" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db" -> "kratt_v2::memory::db::graph_store" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory::db" -> "kratt_v2::memory::db::graph_store" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db" -> "kratt_v2::memory::db::inbox" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory::db" -> "kratt_v2::memory::db::inbox" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db" -> "kratt_v2::memory::db::migrations" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory::db" -> "kratt_v2::memory::db::migrations" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db" -> "kratt_v2::memory::db::pass_runs" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory::db" -> "kratt_v2::memory::db::pass_runs" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db" -> "kratt_v2::memory::db::retrieval" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory::db" -> "kratt_v2::memory::db::retrieval" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db" -> "kratt_v2::memory::db::schema" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory::db" -> "kratt_v2::memory::db::schema" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db" -> "kratt_v2::memory::db::sessions" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory::db" -> "kratt_v2::memory::db::sessions" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db" -> "kratt_v2::memory::db::task_store" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory::db" -> "kratt_v2::memory::db::task_store" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db" -> "kratt_v2::memory::db::values" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::memory::db" -> "kratt_v2::memory::db::values" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::core" -> "kratt_v2::memory::db::graph_store" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::core" -> "kratt_v2::memory::db::migrations" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::core" -> "kratt_v2::memory::db::schema" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::core" -> "kratt_v2::paths" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::decay_store" -> "kratt_v2::memory::db::core" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::decay_store" -> "kratt_v2::memory::db::values" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::findings" -> "kratt_v2::memory::db::core" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::findings" -> "kratt_v2::memory::db::graph_store" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::findings" -> "kratt_v2::web" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::graph_store" -> "kratt_v2::memory::db::core" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::graph_store" -> "kratt_v2::memory::db::migrations" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::graph_store" -> "kratt_v2::memory::db::retrieval" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::graph_store" -> "kratt_v2::memory::db::values" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::graph_store" -> "kratt_v2::memory::graph" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::inbox" -> "kratt_v2::memory::db::core" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::migrations" -> "kratt_v2::memory::db::graph_store" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::migrations" -> "kratt_v2::memory::db::values" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::migrations" -> "kratt_v2::memory::graph" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::migrations" -> "kratt_v2::paths" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::pass_runs" -> "kratt_v2::memory::db::core" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::pass_runs" -> "kratt_v2::memory::db::values" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::retrieval" -> "kratt_v2::memory::db::core" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::retrieval" -> "kratt_v2::memory::db::graph_store" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::retrieval" -> "kratt_v2::memory::db::migrations" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::retrieval" -> "kratt_v2::memory::db::values" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::retrieval" -> "kratt_v2::memory::graph" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::retrieval" -> "kratt_v2::memory::loops" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::retrieval" -> "kratt_v2::web" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::schema" -> "kratt_v2::memory::db::migrations" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::sessions" -> "kratt_v2::memory::db::core" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::sessions" -> "kratt_v2::memory::db::values" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::sessions" -> "kratt_v2::memory::graph" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::task_store" -> "kratt_v2::memory::db::core" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::task_store" -> "kratt_v2::memory::db::graph_store" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::task_store" -> "kratt_v2::memory::db::values" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::db::task_store" -> "kratt_v2::memory::graph" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::decay" -> "kratt_v2::memory::db" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::decay" -> "kratt_v2::memory::decay_curve" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::decay" -> "kratt_v2::memory::graph" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::decay" -> "kratt_v2::prompts" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::decay_simulator" -> "kratt_v2::memory::decay_curve" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::decay_simulator" -> "kratt_v2::memory::embed" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::decay_simulator" -> "kratt_v2::memory::graph" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::dream" -> "kratt_v2::api" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::dream" -> "kratt_v2::memory::agent" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::dream" -> "kratt_v2::memory::db" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::dream" -> "kratt_v2::memory::embed" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::dream" -> "kratt_v2::memory::graph" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::dream" -> "kratt_v2::memory::hygiene" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::dream" -> "kratt_v2::memory::ledger" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::dream" -> "kratt_v2::memory::synthesis" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::dream" -> "kratt_v2::memory::toon_display" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::dream" -> "kratt_v2::prompts" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::dream" -> "kratt_v2::runlog" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::embed" -> "kratt_v2::api" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::embed" -> "kratt_v2::memory::agent" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::embed" -> "kratt_v2::memory::db" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::embed" -> "kratt_v2::memory::db::retrieval" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::embed" -> "kratt_v2::memory::graph" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::embed" -> "kratt_v2::memory::ledger" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::embed" -> "kratt_v2::memory::routing" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::embed" -> "kratt_v2::memory::toon_display" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::embed" -> "kratt_v2::runlog" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::embed" -> "kratt_v2::timeutil" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::explore" -> "kratt_v2::api" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::explore" -> "kratt_v2::memory::agent" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::explore" -> "kratt_v2::memory::db" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::explore" -> "kratt_v2::memory::dream" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::explore" -> "kratt_v2::memory::embed" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::explore" -> "kratt_v2::memory::graph" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::explore" -> "kratt_v2::memory::ledger" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::explore" -> "kratt_v2::prompts" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::explore" -> "kratt_v2::runlog" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::explore" -> "kratt_v2::web" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::heavy" -> "kratt_v2::api" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::heavy" -> "kratt_v2::memory::embed" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::heavy" -> "kratt_v2::memory::graph" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::hygiene" -> "kratt_v2::memory::db" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::hygiene" -> "kratt_v2::memory::graph" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::hygiene" -> "kratt_v2::memory::ledger" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::ingest" -> "kratt_v2::api" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::ingest" -> "kratt_v2::memory::agent" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::ingest" -> "kratt_v2::memory::db" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::ingest" -> "kratt_v2::memory::embed" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::ingest" -> "kratt_v2::memory::graph" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::ingest" -> "kratt_v2::memory::ledger" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::ingest" -> "kratt_v2::prompts" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::ingest" -> "kratt_v2::runlog" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::ingest" -> "kratt_v2::timeutil" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::ingest" -> "kratt_v2::web" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::ledger" -> "kratt_v2::memory::db" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::ledger" -> "kratt_v2::memory::db::pass_runs" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::ledger" -> "kratt_v2::memory::graph" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::loops" -> "kratt_v2::memory::db" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::loops" -> "kratt_v2::memory::ledger" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::news" -> "kratt_v2::api" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::news" -> "kratt_v2::memory::db" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::news" -> "kratt_v2::memory::db::retrieval" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::news" -> "kratt_v2::memory::embed" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::news" -> "kratt_v2::runlog" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::news" -> "kratt_v2::web" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::reinforce" -> "kratt_v2::memory::db" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::reinforce" -> "kratt_v2::memory::ledger" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::routing" -> "kratt_v2::memory::ledger" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::scheduler" -> "kratt_v2::memory::db" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::scheduler" -> "kratt_v2::memory::ledger" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::scheduler" -> "kratt_v2::timeutil" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::sequence" -> "kratt_v2::memory::db" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::sequence" -> "kratt_v2::memory::db::retrieval" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::sequence" -> "kratt_v2::memory::ledger" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::synthesis" -> "kratt_v2::api" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::synthesis" -> "kratt_v2::memory::agent" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::synthesis" -> "kratt_v2::memory::db" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::synthesis" -> "kratt_v2::memory::graph" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::synthesis" -> "kratt_v2::memory::toon_display" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::synthesis" -> "kratt_v2::prompts" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::task_chain" -> "kratt_v2::memory::db" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::task_chain" -> "kratt_v2::memory::graph" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::memory::task_chain" -> "kratt_v2::memory::ledger" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::prompts" -> "kratt_v2::session::log" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::runlog" -> "kratt_v2::paths" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::runlog" -> "kratt_v2::timeutil" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::seat_replay" -> "kratt_v2::api" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::seat_replay" -> "kratt_v2::memory" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::seat_replay" -> "kratt_v2::memory::agent" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::seat_replay" -> "kratt_v2::prompts" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::session" -> "kratt_v2::session::history" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::session" -> "kratt_v2::session::history" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::session" -> "kratt_v2::session::log" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::session" -> "kratt_v2::session::log" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::session::history" -> "kratt_v2::memory" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::session::log" -> "kratt_v2::memory" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::session::log" -> "kratt_v2::timeutil" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram" -> "kratt_v2::api" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram" -> "kratt_v2::memory" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram" -> "kratt_v2::memory::agent" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram" -> "kratt_v2::runlog" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram" -> "kratt_v2::session" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram" -> "kratt_v2::telegram::bot" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::telegram" -> "kratt_v2::telegram::bot" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram" -> "kratt_v2::telegram::night" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::telegram" -> "kratt_v2::telegram::night" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram" -> "kratt_v2::telegram::ping" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::telegram" -> "kratt_v2::telegram::ping" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram" -> "kratt_v2::telegram::render" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::telegram" -> "kratt_v2::telegram::report" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::telegram" -> "kratt_v2::telegram::report" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram" -> "kratt_v2::timeutil" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram" -> "kratt_v2::trace" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram" -> "kratt_v2::turn" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram" -> "kratt_v2::web" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram::night" -> "kratt_v2::api" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram::night" -> "kratt_v2::memory" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram::night" -> "kratt_v2::memory::db::inbox" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram::night" -> "kratt_v2::memory::dream" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram::night" -> "kratt_v2::memory::explore" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram::night" -> "kratt_v2::memory::ingest" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram::night" -> "kratt_v2::memory::scheduler" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram::night" -> "kratt_v2::runlog" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram::night" -> "kratt_v2::timeutil" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram::night" -> "kratt_v2::web" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram::ping" -> "kratt_v2::memory" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram::ping" -> "kratt_v2::memory::db::findings" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram::ping" -> "kratt_v2::runlog" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram::ping" -> "kratt_v2::session" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram::ping" -> "kratt_v2::telegram::bot" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram::ping" -> "kratt_v2::timeutil" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram::report" -> "kratt_v2::api" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram::report" -> "kratt_v2::memory" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram::report" -> "kratt_v2::memory::ledger" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram::report" -> "kratt_v2::prompts" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram::report" -> "kratt_v2::runlog" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram::report" -> "kratt_v2::session" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram::report" -> "kratt_v2::telegram::bot" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::telegram::report" -> "kratt_v2::timeutil" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::trace" -> "kratt_v2::api" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::trace" -> "kratt_v2::paths" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::trace" -> "kratt_v2::runlog" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::trace" -> "kratt_v2::timeutil" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::tui" -> "kratt_v2::api" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::tui" -> "kratt_v2::memory::agent" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::tui" -> "kratt_v2::runlog" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::tui" -> "kratt_v2::tui::app" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::tui" -> "kratt_v2::tui::app" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::tui" -> "kratt_v2::tui::input" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::tui" -> "kratt_v2::tui::render" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::tui" -> "kratt_v2::tui::stream" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::tui" -> "kratt_v2::web" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::tui::app" -> "kratt_v2::api" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::tui::app" -> "kratt_v2::memory" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::tui::app" -> "kratt_v2::memory::agent" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::tui::app" -> "kratt_v2::memory::dream" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::tui::app" -> "kratt_v2::memory::explore" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::tui::app" -> "kratt_v2::memory::ingest" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::tui::app" -> "kratt_v2::memory::scheduler" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::tui::app" -> "kratt_v2::session" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::tui::app" -> "kratt_v2::web" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::tui::input" -> "kratt_v2::tui::app" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::tui::input" -> "kratt_v2::tui::stream" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::tui::render" -> "kratt_v2::tui::app" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::tui::stream" -> "kratt_v2::api" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::tui::stream" -> "kratt_v2::memory" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::tui::stream" -> "kratt_v2::runlog" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::tui::stream" -> "kratt_v2::session" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::tui::stream" -> "kratt_v2::trace" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::tui::stream" -> "kratt_v2::tui::app" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::tui::stream" -> "kratt_v2::turn" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::tui::stream" -> "kratt_v2::web" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::turn" -> "kratt_v2::api" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::turn" -> "kratt_v2::memory" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::turn" -> "kratt_v2::memory::db::findings" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::turn" -> "kratt_v2::memory::db::retrieval" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::turn" -> "kratt_v2::memory::embed" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::turn" -> "kratt_v2::memory::ledger" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::turn" -> "kratt_v2::memory::loops" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::turn" -> "kratt_v2::memory::routing" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::turn" -> "kratt_v2::memory::task_chain" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::turn" -> "kratt_v2::prompts" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::turn" -> "kratt_v2::runlog" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::turn" -> "kratt_v2::session" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::turn" -> "kratt_v2::trace" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::turn" -> "kratt_v2::web" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+    "kratt_v2::web" -> "kratt_v2::web::client" [label="owns", color="#000000", style="solid"] [constraint=true]; // "owns" edge
+    "kratt_v2::web::client" -> "kratt_v2::web" [label="uses", color="#7f7f7f", style="dashed"] [constraint=false]; // "uses" edge
+
+}
